@@ -13,6 +13,7 @@ from reachy_mini_conversation_app.config import (
     get_default_voice,
     list_tool_module_names,
 )
+from reachy_mini_conversation_app.local_mcp import read_installed_local_mcp
 from reachy_mini_conversation_app.tool_spaces import read_installed_tool_spaces
 from reachy_mini_conversation_app.profile_store import (
     DEFAULT_PROFILE_NAME,
@@ -39,7 +40,7 @@ class AvailableTool(TypedDict):
     """Tool metadata used by personality configuration surfaces."""
 
     id: str
-    kind: Literal["shared", "external", "tool_space"]
+    kind: Literal["shared", "external", "tool_space", "local_mcp"]
     source: str
     description: str
 
@@ -105,6 +106,18 @@ def available_tool_catalog() -> list[AvailableTool]:
                 }
     except (RuntimeError, ValueError) as exc:
         logger.warning("Failed to list installed Tool Space tools: %s", exc)
+
+    try:
+        for server in read_installed_local_mcp(config.INSTANCE_PATH).servers:
+            for local_tool in server.tools:
+                catalog[local_tool.local_name] = {
+                    "id": local_tool.local_name,
+                    "kind": "local_mcp",
+                    "source": f"local:{server.alias}",
+                    "description": local_tool.description,
+                }
+    except (RuntimeError, ValueError) as exc:
+        logger.warning("Failed to list local MCP tools: %s", exc)
     return [catalog[tool_id] for tool_id in sorted(catalog)]
 
 

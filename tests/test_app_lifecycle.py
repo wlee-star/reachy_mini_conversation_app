@@ -48,6 +48,29 @@ def test_wake_up_if_sleeping_enables_motors_before_wake_up() -> None:
     ]
 
 
+def test_prepare_robot_for_conversation_retries_enable_motors() -> None:
+    """Wireless power-on often rejects enable_motors until the daemon is ready."""
+    robot = MagicMock()
+    robot.get_current_head_pose.return_value = np.eye(4)
+    robot.enable_motors.side_effect = [RuntimeError("not ready"), None]
+
+    assert app_lifecycle.prepare_robot_for_conversation(robot, MagicMock(), attempts=2, delay_s=0)
+
+    assert robot.enable_motors.call_count == 2
+    robot.wake_up.assert_not_called()
+
+
+def test_wake_up_if_sleeping_wakes_when_pose_unreadable() -> None:
+    """After power-off the pose read can fail even though the robot is asleep."""
+    robot = MagicMock()
+    robot.get_current_head_pose.side_effect = RuntimeError("motors disabled")
+
+    assert app_lifecycle.wake_up_if_sleeping(robot, MagicMock())
+
+    robot.enable_motors.assert_called_once()
+    robot.wake_up.assert_called_once()
+
+
 def test_wake_up_if_sleeping_skips_non_sleep_head_pose() -> None:
     """Startup should leave an already-awake robot alone."""
     robot = MagicMock()

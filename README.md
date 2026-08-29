@@ -25,6 +25,7 @@ Conversational app for the Reachy Mini robot combining realtime voice, vision, p
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Running the app](#running-the-app)
+- [Local AI control dashboard](#local-ai-control-dashboard)
 - [LLM tools](#llm-tools-exposed-to-the-assistant)
 - [Creating and adding tools](#creating-and-adding-tools)
 - [Advanced features](#advanced-features)
@@ -96,27 +97,53 @@ pip install -e .[dev]                   # Development tools
 
 ## Configuration
 
-The default setup uses the Hugging Face backend and does not require an API key.
+This checkout is intended to run conversation against a **local** Hugging Face [speech-to-speech](https://github.com/huggingface/speech-to-speech) server on your AI PC. `deployed` mode still exists as a rollback, but it sends audio and transcripts to Hugging Face cloud inference.
 
-Copy `.env.example` to `.env` when you want to point Hugging Face at your own local endpoint.
+Copy `.env.example` to `.env`. The example file selects local mode and `ws://127.0.0.1:8765/v1/realtime`.
 
 | Variable | Description |
 |----------|-------------|
 | `REALTIME_TRANSCRIPTION_LANGUAGE` | Optional input transcription language for the realtime backend. Defaults to `en`; set to a backend-supported code such as `zh` for Chinese. |
-| `HF_REALTIME_CONNECTION_MODE` | Hugging Face connection selector: `deployed` uses the built-in Hugging Face server; `local` uses `HF_REALTIME_WS_URL`. Defaults to `deployed`. |
-| `HF_REALTIME_WS_URL` | Direct websocket endpoint for your own Hugging Face backend. Accepts either a base URL like `ws://127.0.0.1:8765/v1` or the full websocket URL `ws://127.0.0.1:8765/v1/realtime`. Used when `HF_REALTIME_CONNECTION_MODE=local`. |
-| `HF_TOKEN` | Optional token for Hugging Face access. Local endpoints receive only this explicitly configured token. |
+| `HF_REALTIME_CONNECTION_MODE` | `local` uses `HF_REALTIME_WS_URL` on your AI PC. `deployed` uses the built-in Hugging Face cloud server. Application default remains `deployed` if unset; this project's `.env.example` sets `local`. |
+| `HF_REALTIME_WS_URL` | Direct websocket endpoint for speech-to-speech. Accepts `ws://127.0.0.1:8765/v1` or `ws://127.0.0.1:8765/v1/realtime`. Used when `HF_REALTIME_CONNECTION_MODE=local`. |
+| `HF_TOKEN` | Optional token for Hugging Face Hub downloads and private Space tools. Local realtime endpoints receive only this explicitly configured token. Not used for cloud conversation when mode is `local`. |
+| `HERMES_CONFIG_PATH` | Optional path to a Hermes Agent `config.yaml` / `mcp_servers.yaml`. HTTP MCP servers listed there can be imported into `installed_local_mcp.json`. |
+| `HERMES_GATEWAY_URL` | Optional Hermes Agent API base for advanced delegated tasks. For a local Hermes gateway this is `http://127.0.0.1:8642/v1/chat/completions`. When set with `HERMES_API_KEY`, the `ask_hermes` tool POSTs OpenAI chat-completions (`{"model","messages"}`) and reads `choices[0].message.content`. Session continuity uses header `X-Hermes-Session-Id`. The client waits 180s. A second `ask_hermes` while one is in flight returns immediately so Reachy can say he is still checking, instead of queueing another 180s wait. |
+| `HERMES_API_KEY` | Bearer token sent as `Authorization: Bearer …`. Must match Hermes `API_SERVER_KEY`. Do not commit a real key. |
+| `HA_URL` | Optional local Home Assistant base URL, for example `http://homeassistant.local:8123`. Used by the local `home_assistant` tool for simple state reads, light on/off, and scene activation without Hermes. |
+| `HA_TOKEN` | Home Assistant long-lived access token for the local `home_assistant` tool. Do not commit a real token. |
+| `HA_BUS_ENTITY_ID` | Optional Home Assistant entity for bus arrivals. Defaults to `sensor.route_311_at_rockwall_cres`. |
+| `APEX_STATUS_URL` | Optional Neptune Apex Fusion status URL, for example `http://192.168.0.143:8080/status`. Used by the local `apex` and `reef_status` tools. If unset or unreachable, they fall back to `~/reef-monitor/reef_cache.json`. |
 | `REACHY_MINI_APP_TIMEOUT_MINUTES` | Minutes of inactivity before Reachy goes to sleep and the app stops. Defaults to `1440` (one day); set to `0` to disable. |
 
 ### Hugging Face Connection Modes
 
-Use the built-in Hugging Face server through the app-managed Space proxy. This is the default for a new install; set it explicitly only when you want to switch back from a saved local endpoint:
+Use the built-in Hugging Face server through the app-managed Space proxy only as a rollback. It is cloud inference:
 
 ```env
 HF_REALTIME_CONNECTION_MODE=deployed
 ```
 
 Deployed session allocation falls back to cached `hf auth login` credentials and reports the daemon-provided hardware ID when available. Cached credentials and the hardware ID are not sent to local endpoints.
+
+### Local AI PC (RTX 3090 / later Mac mini)
+
+Run inference **outside** this app's virtualenv. On Windows, prefer WSL2 Ubuntu or Docker so Qwen3-TTS CUDA wheels match the speech-to-speech docs. Keep the Reachy daemon and this conversation app on native Windows.
+
+Start llama.cpp on port `8080`, then speech-to-speech on port `8765`, pointing the LLM at loopback only:
+
+```bash
+llama-server -hf ggml-org/gemma-4-E4B-it-GGUF -np 2 -c 65536 -fa on --swa-full --host 127.0.0.1 --port 8080
+speech-to-speech --mode realtime --stt parakeet-tdt --tts qwen3 --llm_backend responses-api --model_name "ggml-org/gemma-4-E4B-it-GGUF" --responses_api_base_url "http://127.0.0.1:8080/v1" --responses_api_api_key "" --ws_host 127.0.0.1 --ws_port 8765 --qwen3_tts_backend torch --qwen3_tts_device cuda
+```
+
+Never leave speech-to-speech on its default hosted OpenAI model. For Wireless Reachy, bind speech-to-speech with `--host 0.0.0.0` and allow inbound TCP 8765 on the LAN firewall only. Do not publish port 8080.
+
+Speech-to-speech accepts **one** realtime websocket by default (`--num_pipelines` is 1). A second conversation app, or a reconnect while the previous session is still draining, is rejected with `All session slots are in use`. Stop extra clients and wait a few seconds, or restart speech-to-speech if `http://127.0.0.1:8765/v1/pool` shows a stuck unit.
+
+Companion start/stop scripts live in the sibling `reachy-mini-local-ai` folder next to this checkout. Apple Silicon later uses the same `HF_REALTIME_WS_URL` and `speech-to-speech serve --mac-optimal-settings`.
+
+`docs/scheme.mmd` now mentions local MCP. Regenerate `docs/assets/conversation_app_arch.svg` from that source before publishing docs.
 
 Run your own realtime voice backend using [speech-to-speech](https://github.com/huggingface/speech-to-speech) on the same machine as the conversation app:
 
@@ -158,9 +185,41 @@ reachy-mini-conversation-app
 ```
 
 > [!TIP]
-> Make sure the Reachy Mini daemon is running before launching the app. If you see a `TimeoutError`, it means the daemon isn't started. See [Reachy Mini's SDK](https://github.com/pollen-robotics/reachy_mini/) for setup instructions.
+> Starting the app launches `reachy-mini-daemon --sim` only when nothing is already answering on `localhost:8000`. If you start from the control dashboard, leave the Reachy Mini card running and start only the conversation app — do not start a second simulator. Pass `--no-sim` to skip launch, or set `REACHY_DAEMON_HOST` to a physical robot's Wi-Fi IP.
 
 The app runs in console mode. Add `--ui` to serve the web interface at http://127.0.0.1:7860/.
+
+### Local AI control dashboard
+
+To see whether llama.cpp, speech-to-speech, Hermes, Home Assistant, Apex, and this app are actually healthy — and to start or stop the **managed** pieces without asking Cursor each time — run:
+
+```bash
+python -m control_dashboard
+```
+
+Then open http://127.0.0.1:8788/. The dashboard is a separate orchestration layer. It does not rewrite this conversation app, move motors, or send device-control commands during health checks.
+
+| Service | Purpose | Startup | Port | Dependencies | Health check | Stop |
+|---------|---------|---------|------|--------------|--------------|------|
+| llama.cpp | Local LLM for speech-to-speech | `llama-server` (model from `control_dashboard/services.json`, default Gemma GGUF) | 8080 | — | TCP + `/health` + `/v1/models` | Only a whitelisted `llama-server` on that port |
+| Speech-to-speech | Realtime STT/TTS websocket | Companion `reachy-mini-local-ai` venv (`python -m speech_to_speech.s2s_pipeline`) | 8765 | llama.cpp | TCP + process match + `/v1/pool` | Whitelisted `speech-to-speech` / `speech_to_speech` |
+| Qwen TTS | Bundled `--tts qwen3` | Not a separate process | — | speech | Speech running with `--tts qwen3` | Stop speech |
+| Hermes | Delegated agent API | `hermes gateway start` | 8642 | `HERMES_GATEWAY_URL` + `HERMES_API_KEY` | TCP + `/v1/models` | `hermes gateway stop` |
+| Conversation app | This application | `python -m reachy_mini_conversation_app.main --no-camera --no-sim --ui` | 7860 | llama, speech, Reachy daemon | HTTP `/` | Whitelisted conversation process |
+| Reachy Mini daemon | Virtual SDK daemon for local testing | `reachy-mini-daemon --sim` (MuJoCo window) | 8000 | — | GET `/api/daemon/status` (no motion); also mDNS and optional `REACHY_DAEMON_HOST` | Whitelisted `reachy-mini-daemon` |
+| Home Assistant | Lights, scenes, bus sensor | External | from `HA_URL` | `HA_URL` + `HA_TOKEN` | GET `/api/` only | Not stopped here |
+| Neptune Apex | Reef status | External | from `APEX_STATUS_URL` | URL | GET status JSON | Not stopped here |
+| Bus API | Bus arrivals | HA entity from `HA_BUS_ENTITY_ID` or `sensor.route_311_at_rockwall_cres` | via HA | Home Assistant | GET entity state | Not stopped here |
+
+**Start all** starts only missing managed services, in dependency order, and skips anything already healthy. It waits until a service is up, not merely starting, before launching dependents. Auto-restart gives up after three failed recoveries and does not keep retrying or flooding the event log. **Stop all** stops only those managed whitelist matches. External boxes (HA, Apex) are monitored, not launched. Reachy Mini is started as the SDK **simulator** (`--sim`, with the MuJoCo window and media), not a USB/wireless robot.
+
+On Windows, `reachy-mini.local` often does not resolve. If you want the physical robot instead of the simulator, set `REACHY_DAEMON_HOST` in `.env` to its Wi-Fi IP and leave the sim stopped.
+
+Service definitions: `control_dashboard/services.json`. Machine-specific overrides: gitignored `control_dashboard/services.local.json`. Add a service by appending a registry object and, if needed, a probe in `control_dashboard/checks.py`.
+
+Do not enable Windows logon auto-start yet. The start-all path is reusable for a later Scheduled Task after wake. For a future Mac mini, keep bind addresses in the registry instead of hard-coding `C:\` or a GPU name.
+
+Assumptions: the default llama command matches this README (`ggml-org/gemma-4-E4B-it-GGUF`); companion `start-local-ai.ps1` still uses a local Qwen3 GGUF if you override `start.args`. Bus data is the HA sensor, not a direct Transport for NSW client. MCP stubs on 8760/8751/8752/8740 are unused by the current local tools and are not shown.
 
 ### CLI options
 
@@ -168,6 +227,7 @@ The app runs in console mode. Add `--ui` to serve the web interface at http://12
 |--------|---------|-------------|
 | `--no-camera` | `False` | Run without camera capture. |
 | `--ui` | `False` | Serve the web UI at http://127.0.0.1:7860/, in addition to console mode. |
+| `--no-sim` | `False` | Do not launch the MuJoCo simulator. Use this to connect to an existing daemon or a physical robot. |
 | `--robot-name` | `None` | Optional. Connect to a specific robot by name when running multiple daemons on the same subnet. See [Multiple robots on the same subnet](#advanced-features). |
 | `--debug` | `False` | Enable verbose logging for troubleshooting. |
 
@@ -179,6 +239,9 @@ reachy-mini-conversation-app --no-camera
 
 # Launch with the minimal web UI for personality/mic/settings control
 reachy-mini-conversation-app --ui
+
+# Connect to a physical robot (do not start the MuJoCo simulator)
+reachy-mini-conversation-app --no-sim
 ```
 
 ## LLM tools exposed to the assistant
@@ -200,16 +263,19 @@ Every bundled profile enables `head_tracking` by default; users can still disabl
 | `sweep_look` | Sweep Reachy's head left, right, and back to center. | Shared tool, enabled by default in the default profile. |
 | `remember` | Save one short, stable fact about the user for future sessions. | Core install only. Stored in the app instance data directory. |
 | `forget` | Remove a saved memory fact by matching a short query. | Core install only. |
-| `pollen_robotics_reachy_mini_search_tool__search_web` | Search the web and return a short list of results. | Preinstalled MCP Space: `pollen-robotics/reachy-mini-search-tool`. |
-| `pollen_robotics_reachy_mini_weather_tool__get_weather` | Report today's weather for a place: current conditions, high and low temperature, and rain chance. | Preinstalled MCP Space: `pollen-robotics/reachy-mini-weather-tool`. |
-| `pollen_robotics_reachy_mini_time_tool__get_time` | Report the current time for a timezone or the user's local time, or the difference between two timezones. | Preinstalled MCP Space: `pollen-robotics/reachy-mini-time-tool`. |
+| `home_assistant` | Read Home Assistant entity state, turn lights on/off, activate scenes, and read bus arrivals directly over the local LAN. | Set `HA_URL` and `HA_TOKEN`; optionally set `HA_BUS_ENTITY_ID`. |
+| `apex` | Read current Neptune Apex / reef status from `APEX_STATUS_URL` (`/status` JSON) for water parameters, equipment, alarms, and alerts. | Set `APEX_STATUS_URL`. Falls back to `~/reef-monitor/reef_cache.json`. |
+| `reef_status` | Legacy fast-path reef status reader; same live `/status` URL or cache as `apex`. | Set `APEX_STATUS_URL`, or keep the reef cache producer. |
+| `ask_hermes` | Forward advanced delegated tasks to the Hermes Gateway, such as buses/trains, research, multi-step household tasks, or deeper reef analysis. Direct `apex__*` / `home_assistant__*` MCP tools are not registered while this tool is on. | Set `HERMES_GATEWAY_URL` and `HERMES_API_KEY`. |
+
+Weather, web search, and time are no longer enabled on the default profile. The bundled Hugging Face Tool Spaces remain installable from Tools if you accept cloud MCP calls. For other local HTTP MCP servers (time, weather), register them in `external_content/installed_local_mcp.json` and enable the `{alias}__{tool}` IDs per personality. Simple Apex and Home Assistant operations use local Python tools; Hermes remains available through `ask_hermes` for advanced delegation.
 
 > [!NOTE]
 > `remember`/`forget` facts are stored in `memory.v1.json` inside the app's instance data directory (`~/.local/share/reachy_mini_conversation_app/` by default, or the instance path used by the desktop launcher). `forget` only removes facts matched by query. To reset all remembered facts, delete this file.
 
 ## Creating and adding tools
 
-Tools can run locally as Python code or remotely in an MCP-compatible Hugging Face Space. Keep robot, camera, and local-data operations in local tools. A Space is a better fit for shareable, stateless services such as search and external API lookups.
+Tools can run locally as Python code, as a LAN/local HTTP MCP server, or remotely in an MCP-compatible Hugging Face Space. Keep robot, camera, and deterministic local-data operations in local tools. Simple Apex and Home Assistant requests use the bundled local Python tools; reserve `ask_hermes` for advanced reasoning, research, buses/trains, and multi-step tasks. A Space is a fallback for shareable cloud services and is not used for normal local conversation.
 
 ### Local tools
 

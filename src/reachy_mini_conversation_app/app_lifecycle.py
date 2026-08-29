@@ -1,5 +1,6 @@
 """Helpers for app startup and shutdown lifecycle behavior."""
 
+import time
 import asyncio
 import logging
 import urllib.error
@@ -103,13 +104,43 @@ def _is_sleep_head_pose(head_pose: npt.ArrayLike) -> bool:
     )
 
 
+def prepare_robot_for_conversation(
+    robot: ReachyMini,
+    logger: logging.Logger,
+    *,
+    attempts: int = 8,
+    delay_s: float = 1.0,
+) -> bool:
+    """Enable motors after power-off, then wake if the head is in the sleep pose."""
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            robot.enable_motors()
+            last_error = None
+            break
+        except Exception as e:
+            last_error = e
+            logger.warning("Failed to enable motors (attempt %s/%s): %s", attempt, attempts, e)
+            if attempt < attempts:
+                time.sleep(delay_s)
+    if last_error is not None:
+        logger.error("Could not enable motors before conversation start: %s", last_error)
+    return wake_up_if_sleeping(robot, logger) or last_error is None
+
+
 def wake_up_if_sleeping(robot: ReachyMini, logger: logging.Logger) -> bool:
     """Run the SDK wake-up movement when Reachy starts from the sleep pose."""
     try:
         head_pose = robot.get_current_head_pose()
     except Exception as e:
         logger.warning("Could not read robot pose before startup wake-up check: %s", e)
-        return False
+        try:
+            robot.enable_motors()
+            robot.wake_up()
+        except Exception as wake_error:
+            logger.error("Failed to wake Reachy after an unreadable pose: %s", wake_error)
+            return False
+        return True
 
     if not _is_sleep_head_pose(head_pose):
         return False

@@ -17,6 +17,12 @@ def parse_args() -> tuple[argparse.Namespace, list]:  # type: ignore
     )
     parser.add_argument("--debug", default=False, action="store_true", help="Enable debug logging")
     parser.add_argument(
+        "--no-sim",
+        default=False,
+        action="store_true",
+        help="Do not launch the Reachy Mini MuJoCo simulator; connect to an existing daemon",
+    )
+    parser.add_argument(
         "--robot-name",
         type=str,
         default=None,

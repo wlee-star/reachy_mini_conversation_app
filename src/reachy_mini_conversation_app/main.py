@@ -20,6 +20,7 @@ from reachy_mini_conversation_app.utils import (
     setup_logger,
     log_connection_troubleshooting,
 )
+from reachy_mini_conversation_app.simulator import ensure_simulator_running
 
 
 if TYPE_CHECKING:
@@ -131,6 +132,7 @@ def run(
 
     if robot is None:
         try:
+            ensure_simulator_running(logger, no_sim=args.no_sim)
             robot_kwargs = {}
             if args.robot_name is not None:
                 robot_kwargs["robot_name"] = args.robot_name
@@ -153,7 +155,7 @@ def run(
             logger.error("Please check your configuration and try again.")
             sys.exit(1)
 
-    app_lifecycle.wake_up_if_sleeping(robot, logger)
+    app_lifecycle.prepare_robot_for_conversation(robot, logger)
 
     movement_manager = MovementManager(current_robot=robot)
 
@@ -288,7 +290,10 @@ def run(
     # Audio-reactive head motion is driven by the daemon's wobbler, which
     # taps the media pipeline at push_audio_sample. The console stream pushes
     # assistant audio through that pipeline directly.
-    robot.enable_wobbling()
+    try:
+        robot.enable_wobbling()
+    except Exception as e:
+        logger.warning("Could not enable wobbling at startup: %s", e)
 
     timeout_minutes = resolve_app_timeout_minutes()
     if timeout_minutes is not None:
@@ -369,8 +374,4 @@ class ReachyMiniConversationApp(ReachyMiniApp):  # type: ignore[misc]
 
 
 if __name__ == "__main__":
-    app = ReachyMiniConversationApp()
-    try:
-        app.wrapped_run()
-    except KeyboardInterrupt:
-        app.stop()
+    main()

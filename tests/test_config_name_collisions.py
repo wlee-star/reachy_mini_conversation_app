@@ -115,6 +115,45 @@ def test_refresh_runtime_config_reloads_hf_runtime_fields(monkeypatch: pytest.Mo
     assert config_mod.config.HF_TOKEN == "hf-runtime-token"
 
 
+def test_refresh_runtime_config_reloads_hermes_gateway_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Instance-local .env reloads should pick up Hermes Gateway URL and API key."""
+    monkeypatch.setenv("HERMES_GATEWAY_URL", "http://127.0.0.1:8642/v1/chat")
+    monkeypatch.setenv("HERMES_API_KEY", "hermes-runtime-key")
+    monkeypatch.setattr(config_mod.config, "HERMES_GATEWAY_URL", None)
+    monkeypatch.setattr(config_mod.config, "HERMES_API_KEY", None)
+
+    config_mod.refresh_runtime_config_from_env()
+
+    assert config_mod.config.HERMES_GATEWAY_URL == "http://127.0.0.1:8642/v1/chat"
+    assert config_mod.config.HERMES_API_KEY == "hermes-runtime-key"
+
+
+def test_refresh_runtime_config_reloads_home_assistant_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Instance-local .env reloads should pick up Home Assistant URL and token."""
+    monkeypatch.setenv("HA_URL", "http://homeassistant.local:8123")
+    monkeypatch.setenv("HA_TOKEN", "ha-runtime-token")
+    monkeypatch.setenv("HA_BUS_ENTITY_ID", "sensor.my_bus")
+    monkeypatch.setattr(config_mod.config, "HA_URL", None)
+    monkeypatch.setattr(config_mod.config, "HA_TOKEN", None)
+    monkeypatch.setattr(config_mod.config, "HA_BUS_ENTITY_ID", None)
+
+    config_mod.refresh_runtime_config_from_env()
+
+    assert config_mod.config.HA_URL == "http://homeassistant.local:8123"
+    assert config_mod.config.HA_TOKEN == "ha-runtime-token"
+    assert config_mod.config.HA_BUS_ENTITY_ID == "sensor.my_bus"
+
+
+def test_refresh_runtime_config_reloads_apex_status_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Instance-local .env reloads should pick up the Apex status URL."""
+    monkeypatch.setenv("APEX_STATUS_URL", "http://192.168.0.143:8080/status")
+    monkeypatch.setattr(config_mod.config, "APEX_STATUS_URL", None)
+
+    config_mod.refresh_runtime_config_from_env()
+
+    assert config_mod.config.APEX_STATUS_URL == "http://192.168.0.143:8080/status"
+
+
 @pytest.mark.parametrize(
     ("configured_mode", "session_url", "direct_ws_url", "expected_mode", "expected_has_target"),
     [

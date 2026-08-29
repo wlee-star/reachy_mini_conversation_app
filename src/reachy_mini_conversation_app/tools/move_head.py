@@ -15,7 +15,10 @@ class MoveHead(Tool):
     """Move head in a given direction."""
 
     name = "move_head"
-    description = "Move your head in a given direction: left, right, up, down or front."
+    description = (
+        "Move only the robot's head in a given direction: left, right, up, down or front. "
+        "Never use this for a screen, blind, shade, cover, or other Home Assistant device."
+    )
     needs_response = False
     parameters_schema = {
         "type": "object",

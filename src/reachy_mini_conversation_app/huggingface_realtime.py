@@ -49,6 +49,7 @@ from reachy_mini_conversation_app.tools.core_tools import (
     get_tool_specs,
 )
 from reachy_mini_conversation_app.conversation_handler import ConversationHandler
+from reachy_mini_conversation_app.tools.home_assistant import HomeAssistant, match_fast_ha_commands
 from reachy_mini_conversation_app.tools.background_tool_manager import (
     ToolCallRoutine,
     ToolNotification,
@@ -63,7 +64,94 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _RESPONSE_DONE_TIMEOUT: Final[float] = 30.0
+_RESPONSE_STARTED_TIMEOUT: Final[float] = 3.0
 _RESPONSE_REJECTION_RETRY_DELAY: Final[float] = 0.5
+_SESSION_SLOT_WAIT_S: Final[float] = 15.0
+_SESSION_SLOT_POLL_S: Final[float] = 0.5
+_SESSION_LIMIT_MARKERS: Final[tuple[str, ...]] = (
+    "session slots are in use",
+    "session_limit_reached",
+)
+_LONG_RUNNING_TOOLS: Final[frozenset[str]] = frozenset({"ask_hermes"})
+_LONG_TOOL_HOLD_PROMPT: Final[str] = (
+    "The long check already started. Speak one short sentence that you are on it. This is not a new user request."
+)
+# Per-response, not session.update: a session tool_choice flip forces the local LLM to re-prefill.
+_TOOL_FOLLOWUP_CREATE_KWARGS: Final[dict[str, dict[str, str]]] = {"response": {"tool_choice": "none"}}
+_HERMES_SPEECH_FALLBACK: Final[str] = "I've got the reef result ready, but I couldn't play the response."
+_HERMES_DELIVER_PROMPT: Final[str] = (
+    "A previous check finished. Speak this result now in one or two short sentences, then stop. "
+    "Do not mention tools, files, waiting, or that this was delayed: {text}"
+)
+_HERMES_RETRY_PROMPT: Final[str] = (
+    "Speak the previous check result now in one or two short sentences. Do not mention tools or files."
+)
+_HERMES_SPEECH_REASONS: Final[frozenset[str]] = frozenset(
+    {
+        "tool_result:ask_hermes",
+        "hermes_buffered_result",
+        "hermes_speech_retry",
+        "hermes_speech_fallback",
+    }
+)
+
+
+class RealtimeSessionSlotsBusy(RuntimeError):
+    """Speech-to-speech rejected the websocket because its pipeline pool is full."""
+
+
+class _HermesPendingResult:
+    """One Hermes tool result waiting to be spoken at most once."""
+
+    def __init__(self, request_id: str, originating_turn_id: int, text: str, status: str) -> None:
+        self.request_id = request_id
+        self.originating_turn_id = originating_turn_id
+        self.text = text
+        self.completed_at = time.monotonic()
+        self.status = status
+        self.speech_attempts = 0
+
+
+def _hermes_result_text(tool_result: object) -> str:
+    """Return the spoken Hermes payload, or empty if there is nothing to deliver."""
+    if isinstance(tool_result, dict):
+        if tool_result.get("status") == "already_running":
+            return ""
+        reply = tool_result.get("reply")
+        if isinstance(reply, str) and reply.strip():
+            return reply.strip()
+        error = tool_result.get("error")
+        if isinstance(error, str) and error.strip():
+            return error.strip()
+    if isinstance(tool_result, str) and tool_result.strip():
+        return tool_result.strip()
+    return ""
+
+
+def _is_session_limit_error(exc: BaseException) -> bool:
+    """Return whether a realtime close is the local one-session pool limit."""
+    text = str(exc).lower()
+    return any(marker in text for marker in _SESSION_LIMIT_MARKERS)
+
+
+def _realtime_pool_has_idle_slot(payload: dict[str, Any]) -> bool:
+    """Return whether speech-to-speech `/v1/pool` has a claimable unit."""
+    units = payload.get("units")
+    if isinstance(units, list) and units:
+        return any(isinstance(unit, dict) and unit.get("state") == "idle" for unit in units)
+    in_use = payload.get("in_use")
+    size = payload.get("size")
+    if isinstance(in_use, int) and isinstance(size, int):
+        return in_use < size
+    return False
+
+
+def _realtime_pool_is_stuck(payload: dict[str, Any]) -> bool:
+    """Return whether any pipeline unit is quarantined and unclaimable."""
+    units = payload.get("units")
+    if not isinstance(units, list):
+        return False
+    return any(isinstance(unit, dict) and unit.get("state") == "stuck" for unit in units)
 
 
 class InputTranscriptChunksByItem(BaseModel):
@@ -152,17 +240,31 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         # Response-in-progress guard: the Realtime API only allows one active
         # response per conversation at a time.  A dedicated worker task
         # (_response_sender_loop) dequeues and sends one request at a time
-        self._pending_responses: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._pending_responses: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue()
         self._response_done_event: asyncio.Event = asyncio.Event()
         self._response_done_event.set()
         self._response_started_or_rejected_event: asyncio.Event = asyncio.Event()
         self._last_response_rejected: bool = False
+        self._active_response_reason: str | None = None
+        self._active_response_started_at: float | None = None
+        self._active_response_audio_delta_count = 0
+        self._active_response_audio_bytes = 0
+        self._active_response_transcript_seen = False
         self._turn_user_done_at: float | None = None
         self._turn_response_created_at: float | None = None
         self._turn_first_audio_at: float | None = None
+        self._turn_speech_started_at: float | None = None
+        self._turn_speech_stopped_at: float | None = None
+        self._turn_tool_received_at: float | None = None
+        self._turn_generation = 0
+        self._tool_call_generation: dict[str, int] = {}
         self._startup_greeting_sent = False
         self._in_flight_tool_calls: set[str] = set()
         self._tool_batch_needs_response = False
+        self._tool_followup_tools_disabled = False
+        self._fast_ha_task: asyncio.Task[None] | None = None
+        self._user_speech_in_progress = False
+        self._pending_hermes_result: _HermesPendingResult | None = None
 
     @staticmethod
     def _sanitize_tool_result_for_model(tool_name: str, tool_result: dict[str, Any]) -> dict[str, Any]:
@@ -191,6 +293,226 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             return True
         except asyncio.TimeoutError:
             return False
+
+    def _reset_active_response_audio_state(self) -> None:
+        """Clear leftover audio/transcript flags so a silent tool turn is detectable."""
+        self._active_response_audio_delta_count = 0
+        self._active_response_audio_bytes = 0
+        self._active_response_transcript_seen = False
+
+    def _start_fast_ha_command(self, transcript: str) -> None:
+        commands = match_fast_ha_commands(transcript)
+        if not commands:
+            return
+        self._fast_ha_task = asyncio.create_task(
+            self._run_fast_ha_commands(commands),
+            name="ha-fast-path",
+        )
+
+    async def _run_fast_ha_commands(self, commands: list[dict[str, Any]]) -> None:
+        for command in commands:
+            logger.info("[HA] fast-path executing %s", command)
+            started = time.perf_counter()
+            try:
+                result = await HomeAssistant()(self.deps, **command)
+            except Exception as exc:
+                logger.warning("Fast-path Home Assistant command failed: %s", exc)
+                continue
+            logger.info(
+                "[HA] fast-path finished in %.0f ms: %s",
+                (time.perf_counter() - started) * 1000,
+                result,
+            )
+            await self.output_queue.put(AdditionalOutputs({"role": "assistant", "content": json.dumps(result)}))
+
+    async def _acknowledge_long_running_tool(self, tool_name: str, call_id: str, turn_generation: int) -> None:
+        """Speak a short hold-on line when a long tool starts with no audio."""
+        if tool_name not in _LONG_RUNNING_TOOLS:
+            return
+        await self._wait_for_response_done_before_tool_result()
+        if not self.connection:
+            return
+        if self._turn_generation != turn_generation:
+            return
+        if self._user_speech_in_progress:
+            return
+        if call_id not in self._in_flight_tool_calls:
+            return
+        if self._active_response_transcript_seen or self._active_response_audio_delta_count > 0:
+            return
+        try:
+            await self.connection.conversation.item.create(
+                item={
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": _LONG_TOOL_HOLD_PROMPT}],
+                },
+            )
+            await self._safe_response_create(reason=f"tool_hold:{tool_name}", **_TOOL_FOLLOWUP_CREATE_KWARGS)
+        except ConnectionClosedError:
+            logger.warning("Connection closed while acknowledging long-running tool %s", tool_name)
+        except Exception as exc:
+            logger.warning("Failed to acknowledge long-running tool %s: %s", tool_name, exc)
+
+    def _conversation_idle_for_buffered_hermes(self) -> bool:
+        """Return whether a buffered Hermes result can be spoken without interrupting the user."""
+        if self._user_speech_in_progress:
+            return False
+        if not self._response_done_event.is_set():
+            return False
+        if self._in_flight_tool_calls:
+            return False
+        return True
+
+    def _track_hermes_result(self, request_id: str, originating_turn_id: int, text: str, status: str) -> None:
+        """Remember one Hermes result so it can be spoken once, including after a newer turn."""
+        existing = self._pending_hermes_result
+        if (
+            existing is not None
+            and existing.request_id == request_id
+            and existing.status in {"delivering", "delivered"}
+        ):
+            logger.info(
+                "Hermes result already %s request_id=%s; skipping duplicate",
+                existing.status,
+                request_id,
+            )
+            return
+        if (
+            existing is not None
+            and existing.request_id != request_id
+            and existing.status in {"buffered", "delivering"}
+        ):
+            logger.info(
+                "Keeping in-flight Hermes result request_id=%s; not replacing with request_id=%s",
+                existing.request_id,
+                request_id,
+            )
+            return
+        self._pending_hermes_result = _HermesPendingResult(request_id, originating_turn_id, text, status)
+        logger.info(
+            "Hermes request completed request_id=%s originating_turn=%s status=%s",
+            request_id,
+            originating_turn_id,
+            status,
+        )
+
+    def _buffer_hermes_result(self, request_id: str, originating_turn_id: int, text: str) -> None:
+        """Hold a completed Hermes result until the newer user turn is idle."""
+        self._track_hermes_result(request_id, originating_turn_id, text, "buffered")
+        logger.info(
+            "Hermes request buffered because newer turn is active request_id=%s originating_turn=%s current_turn=%s",
+            request_id,
+            originating_turn_id,
+            self._turn_generation,
+        )
+
+    async def _queue_hermes_prompt(self, text: str, reason: str) -> None:
+        """Ask the existing realtime session to speak one Hermes follow-up."""
+        pending = self._pending_hermes_result
+        if pending is not None and pending.status == "delivered":
+            return
+        if not self.connection:
+            return
+        try:
+            await self.connection.conversation.item.create(
+                item={
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": text}],
+                },
+            )
+            await self._safe_response_create(reason=reason, **_TOOL_FOLLOWUP_CREATE_KWARGS)
+        except ConnectionClosedError:
+            logger.warning("Connection closed while queuing Hermes speech reason=%s", reason)
+        except Exception as exc:
+            logger.warning("Failed to queue Hermes speech reason=%s: %s", reason, exc)
+
+    async def _deliver_buffered_hermes_result(self) -> None:
+        """Speak a buffered Hermes result after the interrupting turn has finished."""
+        pending = self._pending_hermes_result
+        if pending is None or pending.status != "buffered":
+            return
+        if not self._conversation_idle_for_buffered_hermes():
+            return
+        pending.status = "delivering"
+        logger.info(
+            "Hermes result delivered after user interaction became idle request_id=%s originating_turn=%s",
+            pending.request_id,
+            pending.originating_turn_id,
+        )
+        await self._queue_hermes_prompt(
+            _HERMES_DELIVER_PROMPT.format(text=pending.text),
+            "hermes_buffered_result",
+        )
+
+    async def _handle_hermes_speech_outcome(self) -> None:
+        """Retry once, then fall back, when a Hermes follow-up produced no audio."""
+        pending = self._pending_hermes_result
+        reason = self._active_response_reason
+        if pending is None:
+            return
+        if reason not in _HERMES_SPEECH_REASONS:
+            if pending.status == "buffered":
+                await self._deliver_buffered_hermes_result()
+            return
+        if self._active_response_audio_delta_count > 0:
+            logger.info(
+                "Hermes speech response produced audio request_id=%s turn=%s reason=%s deltas=%d",
+                pending.request_id,
+                pending.originating_turn_id,
+                reason,
+                self._active_response_audio_delta_count,
+            )
+            pending.status = "delivered"
+            logger.info(
+                "Hermes result delivered request_id=%s originating_turn=%s",
+                pending.request_id,
+                pending.originating_turn_id,
+            )
+            return
+        logger.warning(
+            "Hermes speech response produced zero audio request_id=%s reason=%s transcript_seen=%s",
+            pending.request_id,
+            reason,
+            self._active_response_transcript_seen,
+        )
+        if reason == "hermes_speech_fallback":
+            pending.status = "delivered"
+            logger.info(
+                "Hermes speech fallback finished without audio request_id=%s",
+                pending.request_id,
+            )
+            return
+        if pending.speech_attempts == 0:
+            pending.speech_attempts = 1
+            pending.status = "delivering"
+            logger.info("Hermes speech retry request_id=%s", pending.request_id)
+            await self._queue_hermes_prompt(_HERMES_RETRY_PROMPT, "hermes_speech_retry")
+            return
+        pending.speech_attempts = 2
+        pending.status = "delivering"
+        logger.info("Hermes speech fallback request_id=%s", pending.request_id)
+        await self._queue_hermes_prompt(
+            f"Say exactly this, then stop: {_HERMES_SPEECH_FALLBACK}",
+            "hermes_speech_fallback",
+        )
+
+    async def _set_tool_followup_choice(self, tool_choice: Literal["auto", "none"]) -> bool:
+        if self.connection is None:
+            return False
+        try:
+            await self.connection.session.update(
+                session=RealtimeSessionCreateRequestParam(
+                    type="realtime",
+                    tool_choice=tool_choice,
+                )
+            )
+        except Exception as exc:
+            logger.warning("Failed to set tool follow-up choice to %s: %s", tool_choice, exc)
+            return False
+        self._tool_followup_tools_disabled = tool_choice == "none"
+        return True
 
     def _resolve_backend_voice(
         self,
@@ -367,6 +689,22 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 await self._run_realtime_session()
                 # Normal exit from the session, stop retrying
                 return
+            except RealtimeSessionSlotsBusy:
+                logger.warning(
+                    "Realtime websocket rejected (attempt %d/%d): speech-to-speech has no free session slot",
+                    attempt,
+                    max_attempts,
+                )
+                if attempt < max_attempts:
+                    freed = await self._wait_for_idle_realtime_slot()
+                    if not freed:
+                        logger.warning(
+                            "Speech-to-speech session slot still occupied. "
+                            "Stop extra conversation clients or restart speech-to-speech."
+                        )
+                    self.client = await self._build_realtime_client()
+                    continue
+                raise
             except ConnectionClosedError as e:
                 # Abrupt close (e.g., "no close frame received or sent") → retry
                 logger.warning("Realtime websocket closed unexpectedly (attempt %d/%d): %s", attempt, max_attempts, e)
@@ -385,49 +723,30 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self.connection = None
                 try:
                     self._connected_event.clear()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Failed to clear connected event after session exit: %s", exc)
 
     async def _restart_session(self) -> None:
-        """Force-close the current session and start a fresh one in background.
-
-        Does not block the caller while the new session is establishing.
-        """
+        """Close the current websocket so the startup loop reconnects once."""
+        if self.connection is not None:
+            try:
+                await self.connection.close()
+            except Exception as exc:
+                logger.warning("Failed to close realtime session for restart: %s", exc)
+            finally:
+                self.connection = None
         try:
-            if self.connection is not None:
-                try:
-                    await self.connection.close()
-                except Exception:
-                    pass
-                finally:
-                    self.connection = None
+            self._connected_event.clear()
+        except Exception as exc:
+            logger.debug("Failed to clear connected event: %s", exc)
 
-            # Ensure we have a client (start_up must have run once)
-            if getattr(self, "client", None) is None:
-                logger.warning("Cannot restart: realtime client not initialized yet.")
-                return
-
-            # Fire-and-forget new session and wait briefly for connection
-            try:
-                self._connected_event.clear()
-            except Exception:
-                pass
-            self.client = await self._build_realtime_client()
-            asyncio.create_task(self._run_realtime_session(), name="realtime-session-restart")
-            try:
-                await asyncio.wait_for(self._connected_event.wait(), timeout=5.0)
-                logger.info("Realtime session restarted and connected.")
-            except asyncio.TimeoutError:
-                logger.warning("Realtime session restart timed out; continuing in background.")
-        except Exception as e:
-            logger.warning("_restart_session failed: %s", e)
-
-    async def _safe_response_create(self, **kwargs: Any) -> None:
+    async def _safe_response_create(self, *, reason: str = "response", **kwargs: Any) -> None:
         """Enqueue a response.create() kwargs for the sender worker _response_sender_loop().
 
         This method never blocks the caller.
         """
-        await self._pending_responses.put(kwargs)
+        logger.info("Queued response.create reason=%s", reason)
+        await self._pending_responses.put((reason, kwargs))
 
     async def say(self, text: str) -> None:
         """Inject ``text`` as a turn and have the model voice it now.
@@ -449,7 +768,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             },
         )
         self._mark_activity("say")
-        await self._safe_response_create()
+        await self._safe_response_create(reason="say")
 
     async def _send_startup_greeting_prompt(self) -> None:
         """Prompt the model to open the conversation once the session is ready."""
@@ -476,7 +795,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             )
             self._startup_greeting_sent = True
             self._mark_activity("startup_greeting_prompt")
-            await self._safe_response_create()
+            await self._safe_response_create(reason="startup_greeting")
             logger.info("Queued startup greeting prompt")
         except Exception as e:
             logger.warning("Failed to queue startup greeting prompt: %s", e)
@@ -496,14 +815,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """
         while self.connection:
             try:
-                kwargs = await self._pending_responses.get()
+                reason, kwargs = await self._pending_responses.get()
             except asyncio.CancelledError:
                 return
 
             # Parallel tool calls enqueue duplicate empty requests; coalesce to one.
             while not kwargs and not self._pending_responses.empty():
                 try:
-                    self._pending_responses.get_nowait()
+                    reason, kwargs = self._pending_responses.get_nowait()
                 except asyncio.QueueEmpty:
                     break
 
@@ -525,28 +844,45 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                 self._last_response_rejected = False
                 self._response_started_or_rejected_event.clear()
+                self._response_done_event.clear()
+                self._active_response_reason = reason
+                self._active_response_started_at = time.perf_counter()
+                self._reset_active_response_audio_state()
                 try:
+                    logger.info("Sending response.create reason=%s", reason)
                     await self.connection.response.create(**kwargs)
                 except Exception as e:
-                    logger.debug("_response_sender_loop: send failed: %s", e)
+                    logger.debug("_response_sender_loop: send failed reason=%s: %s", reason, e)
+                    self._active_response_reason = None
                     self._response_done_event.set()
                     break
 
                 try:
                     await asyncio.wait_for(
                         self._response_started_or_rejected_event.wait(),
-                        timeout=_RESPONSE_DONE_TIMEOUT,
+                        timeout=_RESPONSE_STARTED_TIMEOUT,
                     )
                 except asyncio.TimeoutError:
-                    logger.debug("Timed out waiting for response.created or response rejection")
+                    attempts += 1
+                    logger.warning(
+                        "No acknowledgement for response.create; retrying (%d/%d) reason=%s",
+                        attempts,
+                        max_retries,
+                        reason,
+                    )
+                    self._response_done_event.set()
+                    continue
 
                 # Check if the receiver loop observed an asynchronous rejection.
                 if self._last_response_rejected:
                     attempts += 1
                     if attempts >= max_retries:
-                        logger.debug("response.create rejected %d times; giving up", attempts)
+                        logger.debug("response.create rejected %d times; giving up reason=%s", attempts, reason)
+                        self._active_response_reason = None
                         break
-                    logger.debug("response.create was rejected; retrying (%d/%d)", attempts, max_retries)
+                    logger.debug(
+                        "response.create was rejected; retrying (%d/%d) reason=%s", attempts, max_retries, reason
+                    )
                     await asyncio.sleep(_RESPONSE_REJECTION_RETRY_DELAY)
                     continue
 
@@ -556,7 +892,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         timeout=_RESPONSE_DONE_TIMEOUT,
                     )
                 except asyncio.TimeoutError:
-                    logger.debug("Timed out waiting for response.done; assuming response completed")
+                    logger.debug("Timed out waiting for response.done; assuming response completed reason=%s", reason)
                     self._response_done_event.set()
                     break
 
@@ -606,32 +942,62 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             send_result_to_model = not completed_tool.is_idle_tool_call
             if send_result_to_model:
                 self._mark_activity("tool_result_ready")
+            if self._turn_tool_received_at is not None:
+                logger.info(
+                    "Turn latency: tool %s finished %.0f ms after function call",
+                    completed_tool.tool_name,
+                    (time.perf_counter() - self._turn_tool_received_at) * 1000,
+                )
             model_result_submitted = False
+            tool_generation = (
+                self._tool_call_generation.pop(completed_tool.id, None) if isinstance(completed_tool.id, str) else None
+            )
+            result_is_stale = tool_generation is not None and tool_generation != self._turn_generation
+            hermes_text = (
+                _hermes_result_text(tool_result_for_model) if completed_tool.tool_name == "ask_hermes" else ""
+            )
+            hermes_request_id = completed_tool.id if isinstance(completed_tool.id, str) else str(uuid.uuid4())
+            hermes_originating_turn = tool_generation if tool_generation is not None else self._turn_generation
+            hermes_should_buffer = (
+                send_result_to_model
+                and completed_tool.tool_name == "ask_hermes"
+                and bool(hermes_text)
+                and (result_is_stale or self._user_speech_in_progress)
+            )
+            if send_result_to_model and result_is_stale and not hermes_should_buffer:
+                logger.warning(
+                    "Ignoring stale tool result for '%s' (id=%s); a newer turn is active",
+                    completed_tool.tool_name,
+                    completed_tool.id,
+                )
+                send_result_to_model = False
+            elif hermes_should_buffer:
+                self._buffer_hermes_result(hermes_request_id, hermes_originating_turn, hermes_text)
+                send_result_to_model = False
+            elif send_result_to_model and completed_tool.tool_name == "ask_hermes" and hermes_text:
+                self._track_hermes_result(hermes_request_id, hermes_originating_turn, hermes_text, "delivering")
             if send_result_to_model and isinstance(completed_tool.id, str):
                 if not await self._wait_for_response_done_before_tool_result():
-                    send_result_to_model = False
-                if not send_result_to_model:
                     logger.warning(
-                        "Dropping realtime model result for tool '%s' (id=%s) because response.done was not observed",
+                        "response.done missing for tool '%s' (id=%s); sending result anyway",
                         completed_tool.tool_name,
                         completed_tool.id,
                     )
-                elif not self.connection:
+                if not self.connection:
                     logger.warning(
                         "Connection closed before sending tool '%s' (id=%s) result back",
                         completed_tool.tool_name,
                         completed_tool.id,
                     )
                     return
-                else:
-                    await self.connection.conversation.item.create(
-                        item={
-                            "type": "function_call_output",
-                            "call_id": completed_tool.id,
-                            "output": json.dumps(tool_result_for_model),
-                        },
-                    )
-                    model_result_submitted = True
+                await self.connection.conversation.item.create(
+                    item={
+                        "type": "function_call_output",
+                        "call_id": completed_tool.id,
+                        "output": json.dumps(tool_result_for_model),
+                    },
+                )
+                model_result_submitted = True
 
             await self.output_queue.put(
                 AdditionalOutputs(
@@ -681,14 +1047,23 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self._in_flight_tool_calls.discard(completed_tool.id)
 
             tool = core_tools.get_tools().get(completed_tool.tool_name)
+
             # Always surface errors, skip the spoken follow-up for tools that opt out.
-            if model_result_submitted and (completed_tool.error is not None or tool is None or tool.needs_response):
+            if model_result_submitted and (
+                tool is None or tool.wants_spoken_followup(completed_tool.result, completed_tool.error)
+            ):
                 self._tool_batch_needs_response = True
 
             # Parallel tool calls in one turn: respond once every result is in, not per tool.
             if self._tool_batch_needs_response and not self._in_flight_tool_calls:
                 self._tool_batch_needs_response = False
-                await self._safe_response_create()
+                await self._safe_response_create(
+                    reason=f"tool_result:{completed_tool.tool_name}",
+                    **_TOOL_FOLLOWUP_CREATE_KWARGS,
+                )
+
+            if self._pending_hermes_result is not None and self._pending_hermes_result.status == "buffered":
+                await self._deliver_buffered_hermes_result()
 
         except ConnectionClosedError:
             logger.warning("Connection closed while sending tool result")
@@ -714,7 +1089,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     getattr(config, "REACHY_MINI_CUSTOM_PROFILE", None),
                     self.get_current_voice(),
                 )
-            except Exception:
+            except Exception as exc:
+                if _is_session_limit_error(exc):
+                    raise RealtimeSessionSlotsBusy(str(exc)) from exc
                 logger.exception("Realtime session.update failed; aborting startup")
                 raise
 
@@ -743,22 +1120,39 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     logger.debug("Realtime event: %s", event.type)
                     if event.type == "input_audio_buffer.speech_started":
                         self._mark_activity("user_speech_started")
+                        self._user_speech_in_progress = True
+                        self._turn_speech_started_at = time.perf_counter()
+                        self._turn_speech_stopped_at = None
                         self._turn_user_done_at = None
                         self._turn_response_created_at = None
                         self._turn_first_audio_at = None
-                        if self._clear_queue:
+                        self._turn_tool_received_at = None
+                        if self._clear_queue and (
+                            not self._response_done_event.is_set() or not self.output_queue.empty()
+                        ):
                             self._clear_queue()
                         self.deps.movement_manager.set_listening(True)
                         logger.debug("User speech started")
 
                     if event.type == "input_audio_buffer.speech_stopped":
                         self._mark_activity("user_speech_stopped")
+                        self._turn_speech_stopped_at = time.perf_counter()
+                        if self._turn_speech_started_at is not None:
+                            logger.info(
+                                "Turn latency: VAD %.0f ms",
+                                (self._turn_speech_stopped_at - self._turn_speech_started_at) * 1000,
+                            )
                         self.deps.movement_manager.set_listening(False)
                         logger.debug("User speech stopped - server will auto-commit with VAD")
 
                     if event.type == "response.output_audio.done":
                         self.deps.movement_manager.set_speaking(False)
-                        logger.debug("response completed")
+                        logger.info(
+                            "Response audio done reason=%s audio_deltas=%d audio_bytes=%d",
+                            self._active_response_reason,
+                            self._active_response_audio_delta_count,
+                            self._active_response_audio_bytes,
+                        )
 
                     if event.type == "response.output_text.delta":
                         logger.debug("response text delta")
@@ -775,7 +1169,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             self._turn_response_created_at = time.perf_counter()
                             delta_ms = (self._turn_response_created_at - self._turn_user_done_at) * 1000
                             logger.info("Turn latency: response.created %.0f ms after user transcript", delta_ms)
-                        logger.debug("Response created (active)")
+                        logger.info("Response created reason=%s", self._active_response_reason)
 
                     if event.type == "response.done":
                         # Doesn't mean the audio is done playing
@@ -783,7 +1177,33 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self.deps.movement_manager.set_speaking(False)
                         self._response_done_event.set()
                         self._response_started_or_rejected_event.set()
-                        logger.debug("Response done")
+                        elapsed_ms = (
+                            (time.perf_counter() - self._active_response_started_at) * 1000
+                            if self._active_response_started_at is not None
+                            else None
+                        )
+                        logger.info(
+                            "Response done reason=%s elapsed_ms=%s audio_deltas=%d transcript_seen=%s",
+                            self._active_response_reason,
+                            f"{elapsed_ms:.0f}" if elapsed_ms is not None else "unknown",
+                            self._active_response_audio_delta_count,
+                            self._active_response_transcript_seen,
+                        )
+                        if (
+                            self._active_response_reason is not None
+                            and self._active_response_reason.startswith("tool_result:")
+                            and self._active_response_audio_delta_count == 0
+                        ):
+                            logger.warning(
+                                "Tool follow-up response completed without audio deltas reason=%s transcript_seen=%s",
+                                self._active_response_reason,
+                                self._active_response_transcript_seen,
+                            )
+                        await self._handle_hermes_speech_outcome()
+                        if self._tool_followup_tools_disabled:
+                            await self._set_tool_followup_choice("auto")
+                        self._active_response_reason = None
+                        self._active_response_started_at = None
 
                     if event.type == "conversation.item.input_audio_transcription.delta":
                         self._mark_activity("user_transcription_delta")
@@ -817,13 +1237,24 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                         if not transcript:
                             logger.debug("Ignoring empty user transcript")
+                            self._user_speech_in_progress = False
                             continue
 
+                        self._user_speech_in_progress = False
                         self._turn_user_done_at = time.perf_counter()
                         self._turn_response_created_at = None
                         self._turn_first_audio_at = None
+                        self._turn_tool_received_at = None
+                        if self._turn_speech_stopped_at is not None:
+                            logger.info(
+                                "Turn latency: STT %.0f ms after speech_stopped",
+                                (self._turn_user_done_at - self._turn_speech_stopped_at) * 1000,
+                            )
+                        self._turn_generation += 1
                         self._in_flight_tool_calls.clear()
                         self._tool_batch_needs_response = False
+                        self._reset_active_response_audio_state()
+                        self._start_fast_ha_command(transcript)
 
                         await self.output_queue.put(AdditionalOutputs({"role": "user", "content": transcript}))
                         self._emit_transcript("user", transcript, True)
@@ -831,7 +1262,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     # Handle assistant transcription
                     if event.type == "response.output_audio_transcript.done":
                         self._mark_activity("assistant_transcript_done")
-                        logger.debug(f"Assistant transcript: {event.transcript}")
+                        self._active_response_transcript_seen = bool(event.transcript)
+                        logger.info(
+                            "Assistant transcript done reason=%s transcript=%s",
+                            self._active_response_reason,
+                            event.transcript,
+                        )
                         await self.output_queue.put(
                             AdditionalOutputs({"role": "assistant", "content": event.transcript})
                         )
@@ -842,6 +1278,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         decoded_pcm_bytes = base64.b64decode(event.delta)
                         decoded_pcm = np.frombuffer(decoded_pcm_bytes, dtype=np.int16).reshape(1, -1)
                         self._mark_activity("assistant_audio_delta")
+                        self._active_response_audio_delta_count += 1
+                        self._active_response_audio_bytes += len(decoded_pcm_bytes)
                         if self._turn_user_done_at is not None and self._turn_first_audio_at is None:
                             self._turn_first_audio_at = time.perf_counter()
                             delta_ms = (self._turn_first_audio_at - self._turn_user_done_at) * 1000
@@ -875,8 +1313,19 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 type(args_json_str).__name__,
                                 call_id,
                             )
+                            if self.connection:
+                                await self.connection.conversation.item.create(
+                                    item={
+                                        "type": "function_call_output",
+                                        "call_id": call_id,
+                                        "output": json.dumps({"error": "invalid tool call"}),
+                                    },
+                                )
+                                await self._safe_response_create(reason="invalid_tool_call")
                             continue
 
+                        self._turn_tool_received_at = time.perf_counter()
+                        self._tool_call_generation[call_id] = self._turn_generation
                         self._in_flight_tool_calls.add(call_id)
                         background_tool = await self.tool_manager.start_tool(
                             call_id=call_id,
@@ -902,6 +1351,19 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             background_tool.tool_id,
                             call_id,
                         )
+                        if tool_name == "ask_hermes":
+                            logger.info(
+                                "Hermes request started request_id=%s turn=%s",
+                                call_id,
+                                self._turn_generation,
+                            )
+                        if tool_name in _LONG_RUNNING_TOOLS:
+                            asyncio.create_task(
+                                self._acknowledge_long_running_tool(
+                                    tool_name, call_id, self._tool_call_generation[call_id]
+                                ),
+                                name=f"tool-hold-{call_id}",
+                            )
 
                     # server error
                     if event.type == "error":
@@ -980,6 +1442,39 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         except Exception as e:
             logger.debug("Dropping audio frame: connection not ready (%s)", e)
             return
+
+    async def _wait_for_idle_realtime_slot(self) -> bool:
+        """Poll speech-to-speech `/v1/pool` until a unit is idle, or give up."""
+        direct_realtime_url = get_hf_direct_ws_url()
+        if not direct_realtime_url:
+            await asyncio.sleep(_SESSION_SLOT_WAIT_S)
+            return False
+        pool_url = f"{parse_hf_realtime_url(direct_realtime_url).base_url.rstrip('/')}/pool"
+        deadline = time.monotonic() + _SESSION_SLOT_WAIT_S
+        logged_wait = False
+        while time.monotonic() < deadline:
+            try:
+                async with httpx.AsyncClient(timeout=2.0) as http_client:
+                    response = await http_client.get(pool_url)
+                    response.raise_for_status()
+                    payload = response.json()
+            except Exception as exc:
+                logger.debug("Could not read realtime pool status: %s", exc)
+                await asyncio.sleep(_SESSION_SLOT_POLL_S)
+                continue
+            if not isinstance(payload, dict):
+                await asyncio.sleep(_SESSION_SLOT_POLL_S)
+                continue
+            if _realtime_pool_is_stuck(payload):
+                logger.warning("Speech-to-speech realtime slot is stuck; restart speech-to-speech to free it")
+                return False
+            if _realtime_pool_has_idle_slot(payload):
+                return True
+            if not logged_wait:
+                logger.info("Waiting for a free speech-to-speech realtime session slot")
+                logged_wait = True
+            await asyncio.sleep(_SESSION_SLOT_POLL_S)
+        return False
 
     async def shutdown(self) -> None:
         """Shutdown the handler."""

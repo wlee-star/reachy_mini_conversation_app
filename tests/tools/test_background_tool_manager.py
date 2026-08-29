@@ -517,6 +517,21 @@ class TestStartUp:
         assert cb1.call_count == 1
         assert cb2.call_count == 1
 
+    @pytest.mark.asyncio
+    async def test_startup_replaces_previous_listener(self, manager: BackgroundToolManager) -> None:
+        """A second start_up must not leave two listeners delivering the same result."""
+        first = AsyncMock()
+        second = AsyncMock()
+        manager.start_up(tool_callbacks=[first])
+        manager.start_up(tool_callbacks=[second])
+
+        routine = _make_routine("once")
+        await manager.start_tool("c1", routine, is_idle_tool_call=False)
+        await asyncio.sleep(0.1)
+
+        assert first.call_count == 0
+        assert second.call_count == 1
+
 
 class TestNotificationQueue:
     """Verify notifications are enqueued on tool completion or failure."""

@@ -136,6 +136,7 @@ export function buildProfileToolsSection({ signal, initialProfile = null, onProf
         let title = `Tool Space · ${sourceName}`;
         if (tool.kind === "shared") title = "Built-in tools";
         if (tool.kind === "external") title = "External tools";
+        if (tool.kind === "local_mcp") title = `Local MCP · ${sourceName}`;
         groups.set(key, {
           title,
           tools: [],

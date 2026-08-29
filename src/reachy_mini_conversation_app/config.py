@@ -64,6 +64,12 @@ HF_BACKEND = "huggingface"
 HF_REALTIME_CONNECTION_MODE_ENV = "HF_REALTIME_CONNECTION_MODE"
 HF_REALTIME_WS_URL_ENV = "HF_REALTIME_WS_URL"
 REALTIME_TRANSCRIPTION_LANGUAGE_ENV = "REALTIME_TRANSCRIPTION_LANGUAGE"
+HERMES_GATEWAY_URL_ENV = "HERMES_GATEWAY_URL"
+HERMES_API_KEY_ENV = "HERMES_API_KEY"
+HA_URL_ENV = "HA_URL"
+HA_TOKEN_ENV = "HA_TOKEN"
+HA_BUS_ENTITY_ID_ENV = "HA_BUS_ENTITY_ID"
+APEX_STATUS_URL_ENV = "APEX_STATUS_URL"
 HF_LOCAL_CONNECTION_MODE = "local"
 HF_DEPLOYED_CONNECTION_MODE = "deployed"
 HF_REALTIME_SESSION_PROXY_URL = "https://pollen-robotics-reachy-mini-realtime-url.hf.space/session"
@@ -318,6 +324,12 @@ class Config:
     HF_REALTIME_WS_URL = os.getenv(HF_REALTIME_WS_URL_ENV)
     REALTIME_TRANSCRIPTION_LANGUAGE = _normalize_transcription_language(os.getenv(REALTIME_TRANSCRIPTION_LANGUAGE_ENV))
     HF_TOKEN = os.getenv("HF_TOKEN")  # Optional, falls back to hf auth login if not set
+    HERMES_GATEWAY_URL = os.getenv(HERMES_GATEWAY_URL_ENV)
+    HERMES_API_KEY = os.getenv(HERMES_API_KEY_ENV)
+    HA_URL = os.getenv(HA_URL_ENV)
+    HA_TOKEN = os.getenv(HA_TOKEN_ENV)
+    HA_BUS_ENTITY_ID = os.getenv(HA_BUS_ENTITY_ID_ENV)
+    APEX_STATUS_URL = os.getenv(APEX_STATUS_URL_ENV)
 
     logger.debug(
         "HF mode: %s, HF session URL set: %s, HF direct URL set: %s",
@@ -430,6 +442,12 @@ def refresh_runtime_config_from_env() -> None:
         os.getenv(REALTIME_TRANSCRIPTION_LANGUAGE_ENV)
     )
     config.HF_TOKEN = os.getenv("HF_TOKEN")
+    config.HERMES_GATEWAY_URL = os.getenv(HERMES_GATEWAY_URL_ENV)
+    config.HERMES_API_KEY = os.getenv(HERMES_API_KEY_ENV)
+    config.HA_URL = os.getenv(HA_URL_ENV)
+    config.HA_TOKEN = os.getenv(HA_TOKEN_ENV)
+    config.HA_BUS_ENTITY_ID = os.getenv(HA_BUS_ENTITY_ID_ENV)
+    config.APEX_STATUS_URL = os.getenv(APEX_STATUS_URL_ENV)
     config.REACHY_MINI_CUSTOM_PROFILE = LOCKED_PROFILE or os.getenv("REACHY_MINI_CUSTOM_PROFILE")
 
 

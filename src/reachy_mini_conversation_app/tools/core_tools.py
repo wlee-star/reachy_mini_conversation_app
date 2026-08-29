@@ -14,6 +14,7 @@ from dataclasses import dataclass
 
 from reachy_mini import ReachyMini
 from reachy_mini_conversation_app.config import config, list_tool_module_names
+from reachy_mini_conversation_app.local_mcp import iter_enabled_local_mcp_tools
 from reachy_mini_conversation_app.mcp_client import McpToolTimeoutError, McpToolInvocationError
 from reachy_mini_conversation_app.tool_spaces import build_remote_client, read_installed_tool_spaces
 from reachy_mini_conversation_app.profile_store import DEFAULT_PROFILE_NAME
@@ -73,6 +74,12 @@ class Tool(abc.ABC):
     name: str
     description: str
     parameters_schema: Dict[str, Any]
+
+    def wants_spoken_followup(self, result: dict[str, Any] | None, error: str | None) -> bool:
+        """Return whether the realtime loop should speak after this tool result."""
+        if error is not None:
+            return True
+        return self.needs_response
 
     def spec(self) -> ToolSpec:
         """Return the function spec for LLM consumption."""
@@ -362,6 +369,21 @@ def _resolve_remote_tools(tool_names: list[str], instance_path: str | Path | Non
                 _LOADED_REMOTE_TOOL_CACHE[cache_key] = cached_tool
             remote_tools.append(cached_tool)
 
+    for server, local_tool, client in iter_enabled_local_mcp_tools(tool_names, instance_path):
+        cache_key = ("local", f"{server.alias}:{local_tool.local_name}:{local_tool.client_tool_name}")
+        cached_tool = _LOADED_REMOTE_TOOL_CACHE.get(cache_key)
+        if cached_tool is None:
+            cached_tool = RemoteMcpTool(
+                slug=f"local:{server.alias}",
+                name=local_tool.local_name,
+                description=local_tool.description,
+                parameters_schema=local_tool.parameters_schema,
+                client_tool_name=local_tool.client_tool_name,
+                client=client,
+            )
+            _LOADED_REMOTE_TOOL_CACHE[cache_key] = cached_tool
+        remote_tools.append(cached_tool)
+
     return remote_tools
 
 
@@ -462,11 +484,12 @@ def _safe_load_obj(args_json: str) -> Dict[str, Any]:
 
 
 async def _dispatch_tool_call(tool_name: str, args: Dict[str, Any], deps: ToolDependencies) -> Dict[str, Any]:
-    tool = get_tools().get(tool_name)
+    registry = get_tools()
+    tool = registry.get(tool_name)
     if not tool:
         return {"error": f"unknown tool: {tool_name}"}
     try:
-        return await tool(deps, **args)
+        result = await tool(deps, **args)
     except asyncio.CancelledError:
         logger.info("Tool cancelled: %s", tool_name)
         return {"error": "Tool cancelled"}
@@ -474,6 +497,7 @@ async def _dispatch_tool_call(tool_name: str, args: Dict[str, Any], deps: ToolDe
         msg = f"{type(e).__name__}: {e}"
         logger.exception("Tool error in %s: %s", tool_name, msg)
         return {"error": msg}
+    return result
 
 
 async def dispatch_tool_call(tool_name: str, args_json: str, deps: ToolDependencies) -> Dict[str, Any]:

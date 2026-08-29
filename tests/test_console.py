@@ -768,6 +768,37 @@ def test_local_stream_launch_waits_for_missing_hf_target_without_starting_media(
     media.start_playing.assert_not_called()
 
 
+def test_start_media_pipelines_retries_after_power_on_failure() -> None:
+    """Wireless audio cards are often busy for a few seconds after power-on."""
+    media = SimpleNamespace(
+        start_recording=MagicMock(side_effect=[RuntimeError("device busy"), None]),
+        start_playing=MagicMock(),
+        stop_recording=MagicMock(),
+    )
+    stream = LocalStream(MagicMock(), SimpleNamespace(media=media))
+
+    stream._start_media_pipelines(attempts=2, delay_s=0)
+
+    assert media.start_recording.call_count == 2
+    media.start_playing.assert_called_once()
+    media.stop_recording.assert_not_called()
+
+
+def test_start_media_pipelines_stops_recording_if_playback_fails() -> None:
+    """A half-open recorder must not leak across retries."""
+    media = SimpleNamespace(
+        start_recording=MagicMock(),
+        start_playing=MagicMock(side_effect=RuntimeError("no sink")),
+        stop_recording=MagicMock(),
+    )
+    stream = LocalStream(MagicMock(), SimpleNamespace(media=media))
+
+    with pytest.raises(RuntimeError, match="no sink"):
+        stream._start_media_pipelines(attempts=1, delay_s=0)
+
+    media.stop_recording.assert_called_once()
+
+
 def _rpc_robot() -> SimpleNamespace:
     """Return a robot mock whose audio pipeline supports clear_audio_queue()."""
     audio = SimpleNamespace(clear_player=MagicMock(), clear_output_buffer=MagicMock())

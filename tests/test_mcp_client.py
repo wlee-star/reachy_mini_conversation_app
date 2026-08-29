@@ -22,9 +22,31 @@ def test_validate_http_mcp_url_rejects_non_http_scheme() -> None:
 
 
 def test_validate_http_mcp_url_rejects_non_local_plain_http() -> None:
-    """Remote servers must use HTTPS unless they are local development endpoints."""
+    """Public remote servers must use HTTPS."""
     with pytest.raises(ValueError, match="must use HTTPS"):
         validate_http_mcp_url("http://example.com/mcp")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1:8751/mcp",
+        "http://localhost:8751/mcp",
+        "http://192.168.1.20:8751/mcp",
+        "http://10.0.0.8:8751/mcp",
+        "http://172.16.0.4:8751/mcp",
+        "http://169.254.1.2:8751/mcp",
+    ],
+)
+def test_validate_http_mcp_url_allows_loopback_and_private_lan_http(url: str) -> None:
+    """Wireless Reachy can reach a PC MCP server over private HTTP."""
+    assert validate_http_mcp_url(url) == url
+
+
+def test_validate_http_mcp_url_rejects_public_hostname_over_http() -> None:
+    """DNS hostnames are not treated as LAN just because they resolve later."""
+    with pytest.raises(ValueError, match="must use HTTPS"):
+        validate_http_mcp_url("http://reachy-ai.example/mcp")
 
 
 def test_build_namespaced_tool_name_normalizes_tool_segment() -> None:

@@ -1,0 +1,12 @@
+src\reachy_mini_conversation_app\huggingface_realtime.py -> C:\Users\Walter Lee\Workspace\Reachy mini local\_backups\2026-08-29-2045-hermes-reliability\src__reachy_mini_conversation_app__huggingface_realtime.py
+src\reachy_mini_conversation_app\hermes_client.py -> C:\Users\Walter Lee\Workspace\Reachy mini local\_backups\2026-08-29-2045-hermes-reliability\src__reachy_mini_conversation_app__hermes_client.py
+src\reachy_mini_conversation_app\tools\ask_hermes.py -> C:\Users\Walter Lee\Workspace\Reachy mini local\_backups\2026-08-29-2045-hermes-reliability\src__reachy_mini_conversation_app__tools__ask_hermes.py
+src\reachy_mini_conversation_app\tools\core_tools.py -> C:\Users\Walter Lee\Workspace\Reachy mini local\_backups\2026-08-29-2045-hermes-reliability\src__reachy_mini_conversation_app__tools__core_tools.py
+src\reachy_mini_conversation_app\tools\home_assistant.py -> C:\Users\Walter Lee\Workspace\Reachy mini local\_backups\2026-08-29-2045-hermes-reliability\src__reachy_mini_conversation_app__tools__home_assistant.py
+src\reachy_mini_conversation_app\moves.py -> C:\Users\Walter Lee\Workspace\Reachy mini local\_backups\2026-08-29-2045-hermes-reliability\src__reachy_mini_conversation_app__moves.py
+profiles\default\profile.md -> C:\Users\Walter Lee\Workspace\Reachy mini local\_backups\2026-08-29-2045-hermes-reliability\profiles__default__profile.md
+tests\test_huggingface_realtime.py -> C:\Users\Walter Lee\Workspace\Reachy mini local\_backups\2026-08-29-2045-hermes-reliability\tests__test_huggingface_realtime.py
+tests\tools\test_ask_hermes.py -> C:\Users\Walter Lee\Workspace\Reachy mini local\_backups\2026-08-29-2045-hermes-reliability\tests__tools__test_ask_hermes.py
+tests\test_hermes_client.py -> C:\Users\Walter Lee\Workspace\Reachy mini local\_backups\2026-08-29-2045-hermes-reliability\tests__test_hermes_client.py
+tests\test_default_profile_tools.py -> C:\Users\Walter Lee\Workspace\Reachy mini local\_backups\2026-08-29-2045-hermes-reliability\tests__test_default_profile_tools.py
+tests\test_control_dashboard.py -> C:\Users\Walter Lee\Workspace\Reachy mini local\_backups\2026-08-29-2045-hermes-reliability\tests__test_control_dashboard.py

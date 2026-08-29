@@ -20,8 +20,10 @@ const DEFAULT_HF_HOST = "localhost";
 const DEFAULT_HF_PORT = 8765;
 
 const HF_MODE_HINTS = Object.freeze({
-  [HF_CONNECTION_MODES.DEPLOYED]: "Uses the hosted Hugging Face backend. No API key required.",
-  [HF_CONNECTION_MODES.LOCAL]: "Connects directly to the host and port below.",
+  [HF_CONNECTION_MODES.DEPLOYED]:
+    "Hosted Hugging Face cloud inference. Audio and transcripts leave your LAN.",
+  [HF_CONNECTION_MODES.LOCAL]:
+    "Your local AI PC running speech-to-speech (default port 8765). Not the hosted Hugging Face server.",
 });
 
 export async function mountSettingsView({ outlet, signal }) {

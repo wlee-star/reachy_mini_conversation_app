@@ -96,6 +96,7 @@ LEGACY_STARTUP_ENV_NAMES = (
     "REACHY_MINI_VOICE_OVERRIDE",
 )
 BACKEND_RETRY_DELAY_SECONDS = 5.0
+SESSION_SLOT_RETRY_DELAY_SECONDS = 15.0
 
 
 class LocalStream:
@@ -713,12 +714,24 @@ class LocalStream:
                 raise
             except Exception as e:
                 self._set_backend_connection_state("disconnected", e)
-                logger.warning(
-                    "Backend failed to start: %s. Settings UI remains available; retrying in %.1f seconds.",
-                    e,
-                    self._backend_retry_delay,
-                    exc_info=logger.isEnabledFor(logging.DEBUG),
-                )
+                delay = self._backend_retry_delay
+                if "session slots are in use" in str(e).lower():
+                    delay = SESSION_SLOT_RETRY_DELAY_SECONDS
+                    logger.warning(
+                        "Backend failed to start: speech-to-speech has no free realtime session. "
+                        "Stop extra conversation apps, or restart speech-to-speech if the slot is stuck. "
+                        "Retrying in %.1f seconds.",
+                        delay,
+                    )
+                else:
+                    logger.warning(
+                        "Backend failed to start: %s. Settings UI remains available; retrying in %.1f seconds.",
+                        e,
+                        delay,
+                        exc_info=logger.isEnabledFor(logging.DEBUG),
+                    )
+                await self._sleep_or_restart_requested(delay)
+                continue
             else:
                 if self._stop_event.is_set():
                     return
@@ -732,6 +745,28 @@ class LocalStream:
                 )
 
             await self._sleep_or_restart_requested(self._backend_retry_delay)
+
+    def _start_media_pipelines(self, attempts: int = 8, delay_s: float = 1.0) -> None:
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                self._robot.media.start_recording()
+                try:
+                    self._robot.media.start_playing()
+                except Exception:
+                    try:
+                        self._robot.media.stop_recording()
+                    except Exception as stop_error:
+                        logger.debug("Failed to stop recording after play start failure: %s", stop_error)
+                    raise
+                return
+            except Exception as e:
+                last_error = e
+                logger.warning("Robot media start failed (attempt %s/%s): %s", attempt, attempts, e)
+                if attempt < attempts:
+                    time.sleep(delay_s)
+        if last_error is not None:
+            raise last_error
 
     def launch(self) -> None:
         """Start the recorder/player and run the async processing loops.
@@ -779,9 +814,9 @@ class LocalStream:
                 return
             self._set_backend_connection_state("not_started")
 
-        # Start media after key is set/available
-        self._robot.media.start_recording()
-        self._robot.media.start_playing()
+        # Start media after key is set/available. Wireless units often need a
+        # few seconds after power-on before GStreamer can claim the cards.
+        self._start_media_pipelines()
 
         async def runner() -> None:
             # Capture loop for cross-thread personality actions
@@ -881,7 +916,9 @@ class LocalStream:
             if audio_frame is not None and not self._mic_muted:
                 await self.handler.receive((input_sample_rate, audio_frame))
                 self._emit_level("user", audio_frame)
-            await asyncio.sleep(0)  # avoid busy loop
+                await asyncio.sleep(0)
+            else:
+                await asyncio.sleep(0.01)
 
     async def play_loop(self) -> None:
         """Fetch outputs from the handler: log text and play audio frames."""

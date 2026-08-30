@@ -263,7 +263,7 @@ Every bundled profile enables `head_tracking` by default; users can still disabl
 | `sweep_look` | Sweep Reachy's head left, right, and back to center. | Shared tool, enabled by default in the default profile. |
 | `remember` | Save one short, stable fact about the user for future sessions. | Core install only. Stored in the app instance data directory. |
 | `forget` | Remove a saved memory fact by matching a short query. | Core install only. |
-| `home_assistant` | Read Home Assistant entity state, turn lights on/off, activate scenes, and read bus arrivals directly over the local LAN. | Set `HA_URL` and `HA_TOKEN`; optionally set `HA_BUS_ENTITY_ID`. |
+| `home_assistant` | Read Home Assistant entity state, turn lights on/off, activate scenes, and read bus arrivals directly over the local LAN. A confirmed control result plays the existing `success` emotion and a short spoken confirmation. | Set `HA_URL` and `HA_TOKEN`; optionally set `HA_BUS_ENTITY_ID`. |
 | `apex` | Read current Neptune Apex / reef status from `APEX_STATUS_URL` (`/status` JSON) for water parameters, equipment, alarms, and alerts. | Set `APEX_STATUS_URL`. Falls back to `~/reef-monitor/reef_cache.json`. |
 | `reef_status` | Legacy fast-path reef status reader; same live `/status` URL or cache as `apex`. | Set `APEX_STATUS_URL`, or keep the reef cache producer. |
 | `ask_hermes` | Forward advanced delegated tasks to the Hermes Gateway, such as buses/trains, research, multi-step household tasks, or deeper reef analysis. Direct `apex__*` / `home_assistant__*` MCP tools are not registered while this tool is on. | Set `HERMES_GATEWAY_URL` and `HERMES_API_KEY`. |

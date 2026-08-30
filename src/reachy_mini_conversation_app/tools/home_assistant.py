@@ -333,6 +333,18 @@ def _cached_control_result(action: str, entity_id: str | None) -> dict[str, Any]
     return result
 
 
+def is_control_action(action: object) -> bool:
+    """Return whether this Home Assistant action changes a device."""
+    return isinstance(action, str) and action in _CONTROL_ACTIONS
+
+
+def is_device_control_success(result: dict[str, Any] | None, error: str | None) -> bool:
+    """Return whether a Home Assistant result is a confirmed control completion."""
+    if error is not None or not isinstance(result, dict) or "error" in result:
+        return False
+    return result.get("status") == "success" and bool(result.get("service"))
+
+
 def _remember_control_result(action: str, entity_id: str, result: dict[str, Any]) -> None:
     _recent_control_results[(action, entity_id)] = (time.monotonic(), result)
     opposite = _OPPOSITE_CONTROL_ACTION.get(action)
@@ -401,12 +413,6 @@ class HomeAssistant(Tool):
         },
         "required": ["action"],
     }
-
-    def wants_spoken_followup(self, result: dict[str, Any] | None, error: str | None) -> bool:
-        """Skip speech when a local control action already happened; still speak reads and errors."""
-        if error is not None or not isinstance(result, dict) or "error" in result:
-            return True
-        return not (result.get("status") == "success" and result.get("service"))
 
     async def __call__(self, deps: ToolDependencies, **kwargs: Any) -> dict[str, Any]:
         """Execute one narrow Home Assistant operation over the local REST API."""

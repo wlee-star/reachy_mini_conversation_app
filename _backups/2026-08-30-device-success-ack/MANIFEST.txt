@@ -1,0 +1,11 @@
+Backup set: 2026-08-30-device-success-ack
+Files modified for device-control success emotion + spoken acknowledgement:
+- src/reachy_mini_conversation_app/huggingface_realtime.py
+- src/reachy_mini_conversation_app/tools/home_assistant.py
+- src/reachy_mini_conversation_app/tools/play_emotion.py
+- profiles/default/profile.md
+- tests/test_huggingface_realtime.py
+- tests/tools/test_home_assistant.py
+- tests/tools/test_play_emotion.py
+- tests/test_default_profile_tools.py
+- README.md

@@ -40,3 +40,5 @@ def test_default_profile_sends_live_tank_status_to_apex() -> None:
     assert "use **apex** immediately" in instructions.lower()
     assert "call **home_assistant** immediately" in instructions.lower()
     assert "button.screen_down" in instructions
+    assert "do not call play_emotion for that success" in instructions.lower()
+    assert "done, lamp three is on" in instructions.lower()

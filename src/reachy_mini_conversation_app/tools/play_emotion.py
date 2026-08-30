@@ -168,6 +168,7 @@ _INTENT_TO_MOVES: dict[str, tuple[str, ...]] = {
 }
 
 _ALLOWED_MOVE_NAMES: frozenset[str] = frozenset(_CURATED_DEFAULT_MOVES).union(*_INTENT_TO_MOVES.values())
+_SUCCESS_EMOTION_KEYS: frozenset[str] = frozenset({"success", "success1", "success2"})
 
 _KEYWORD_INTENTS: tuple[tuple[tuple[str, ...], str], ...] = (
     (("no", "sad"), "no_sad"),
@@ -190,6 +191,11 @@ def _keyword_intent(normalized_key: str) -> str | None:
         if all(keyword in tokens for keyword in keywords):
             return intent
     return None
+
+
+def is_success_emotion_request(requested_emotion: object) -> bool:
+    """Return whether a play_emotion request is the curated success intent or move."""
+    return _normalize_emotion_key(str(requested_emotion or "")) in _SUCCESS_EMOTION_KEYS
 
 
 def resolve_emotion_name(requested_emotion: object, available_emotions: list[str]) -> str | None:
@@ -274,6 +280,8 @@ class PlayEmotion(Tool):
 
             emotion_name = resolve_emotion_name(requested_emotion, emotion_names)
             if not emotion_name:
+                if kwargs.get("allow_random") is False:
+                    return {"error": f"Emotion {requested_emotion!r} is not available"}
                 logger.info("play_emotion: %r did not resolve; using random curated", requested_emotion)
                 emotion_name = random_curated_emotion(emotion_names)
 

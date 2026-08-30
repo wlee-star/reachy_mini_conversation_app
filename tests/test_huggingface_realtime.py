@@ -317,15 +317,17 @@ async def test_stale_short_tool_result_does_not_trigger_response(monkeypatch: An
 
 
 @pytest.mark.asyncio
-async def test_home_assistant_control_skips_spoken_followup(monkeypatch: Any) -> None:
-    """Successful local HA control should not start a slow spoken follow-up."""
+async def test_home_assistant_control_speaks_and_plays_success(monkeypatch: Any) -> None:
+    """Successful local HA control plays success once, then starts a spoken follow-up."""
     monkeypatch.setattr(hf_mod.core_tools, "get_tools", lambda: {"home_assistant": HomeAssistant()})
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler.connection = AsyncMock()
     handler.output_queue = asyncio.Queue()
     monkeypatch.setattr(handler, "_wait_for_response_done_before_tool_result", AsyncMock(return_value=True))
     create = AsyncMock()
+    play = AsyncMock()
     monkeypatch.setattr(handler, "_safe_response_create", create)
+    monkeypatch.setattr(handler, "_play_device_success_emotion", play)
     handler._in_flight_tool_calls = {"call_1"}
 
     await handler._handle_tool_result(
@@ -338,8 +340,81 @@ async def test_home_assistant_control_skips_spoken_followup(monkeypatch: Any) ->
         )
     )
 
-    handler.connection.conversation.item.create.assert_awaited_once()
-    assert create.await_count == 0
+    created_item = handler.connection.conversation.item.create.await_args.kwargs["item"]
+    assert created_item["type"] == "function_call_output"
+    assert created_item["output"] == json.dumps(
+        {"status": "success", "service": "switch.turn_off", "entity_id": "switch.lamp_3"}
+    )
+    play.assert_awaited_once()
+    create.assert_awaited_once_with(reason="tool_result:home_assistant", response={"tool_choice": "none"})
+
+
+@pytest.mark.asyncio
+async def test_home_assistant_control_failure_does_not_play_success(monkeypatch: Any) -> None:
+    """A failed device action must not play success or claim the device changed."""
+    monkeypatch.setattr(hf_mod.core_tools, "get_tools", lambda: {"home_assistant": HomeAssistant()})
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler.output_queue = asyncio.Queue()
+    monkeypatch.setattr(handler, "_wait_for_response_done_before_tool_result", AsyncMock(return_value=True))
+    create = AsyncMock()
+    play = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", create)
+    monkeypatch.setattr(handler, "_play_device_success_emotion", play)
+    handler._in_flight_tool_calls = {"call_1"}
+
+    await handler._handle_tool_result(
+        ToolNotification(
+            id="call_1",
+            tool_name="home_assistant",
+            is_idle_tool_call=False,
+            status=ToolState.COMPLETED,
+            result={"error": "Home Assistant could not find that entity or service."},
+        )
+    )
+
+    play.assert_not_awaited()
+    create.assert_awaited_once_with(reason="tool_result:home_assistant", response={"tool_choice": "none"})
+
+
+@pytest.mark.asyncio
+async def test_play_device_success_emotion_queues_success_once(monkeypatch: Any) -> None:
+    """The existing play_emotion tool is used, and a second call in the same turn is ignored."""
+    play_calls: list[dict[str, Any]] = []
+
+    class FakePlayEmotion:
+        async def __call__(self, deps: ToolDependencies, **kwargs: Any) -> dict[str, Any]:
+            play_calls.append(kwargs)
+            return {"status": "queued", "emotion": "success1"}
+
+    monkeypatch.setattr(hf_mod, "PlayEmotion", FakePlayEmotion)
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+
+    await handler._play_device_success_emotion()
+    await handler._play_device_success_emotion()
+
+    assert play_calls == [{"emotion": "success", "allow_random": False}]
+
+
+@pytest.mark.asyncio
+async def test_success_emotion_tool_skipped_when_device_control_owns_turn(monkeypatch: Any) -> None:
+    """LLM play_emotion(success) must not add a second success animation after device control."""
+    monkeypatch.setattr(hf_mod.core_tools, "get_tools", lambda: {"play_emotion": hf_mod.PlayEmotion()})
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler.output_queue = asyncio.Queue()
+    monkeypatch.setattr(handler, "_wait_for_response_done_before_tool_result", AsyncMock(return_value=True))
+    start_tool = AsyncMock()
+    monkeypatch.setattr(type(handler.tool_manager), "start_tool", start_tool)
+    handler._turn_generation = 1
+    handler._in_flight_tool_calls = {"call_emotion"}
+    handler._turn_device_control_call_ids = {"call_lamp"}
+
+    await handler._start_or_skip_success_emotion_tool("call_emotion", '{"emotion": "success"}', 1)
+
+    start_tool.assert_not_awaited()
+    created_item = handler.connection.conversation.item.create.await_args.kwargs["item"]
+    assert created_item["output"] == json.dumps({"status": "skipped", "emotion": "success"})
 
 
 @pytest.mark.asyncio
@@ -352,6 +427,7 @@ async def test_home_assistant_query_still_speaks(monkeypatch: Any) -> None:
     monkeypatch.setattr(handler, "_wait_for_response_done_before_tool_result", AsyncMock(return_value=True))
     create = AsyncMock()
     monkeypatch.setattr(handler, "_safe_response_create", create)
+    monkeypatch.setattr(handler, "_play_device_success_emotion", AsyncMock())
     handler._in_flight_tool_calls = {"call_1"}
 
     await handler._handle_tool_result(
@@ -364,6 +440,7 @@ async def test_home_assistant_query_still_speaks(monkeypatch: Any) -> None:
         )
     )
 
+    handler._play_device_success_emotion.assert_not_awaited()
     create.assert_awaited_once_with(reason="tool_result:home_assistant", response={"tool_choice": "none"})
 
 
@@ -411,6 +488,44 @@ async def test_start_fast_ha_command_ignores_unrelated_speech(monkeypatch: Any) 
 
     assert handler._fast_ha_task is None
     run.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fast_ha_success_plays_emotion(monkeypatch: Any) -> None:
+    """Fast-path device success plays the existing success emotion immediately."""
+
+    class FakeHomeAssistant:
+        async def __call__(self, deps: ToolDependencies, **kwargs: Any) -> dict[str, Any]:
+            return {"status": "success", "service": "switch.turn_on", "entity_id": "switch.lamp_3"}
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.output_queue = asyncio.Queue()
+    play = AsyncMock()
+    monkeypatch.setattr(hf_mod, "HomeAssistant", FakeHomeAssistant)
+    monkeypatch.setattr(handler, "_play_device_success_emotion", play)
+
+    await handler._run_fast_ha_commands([{"action": "turn_switch_on", "entity_id": "switch.lamp_3"}])
+
+    play.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_fast_ha_failure_does_not_play_emotion(monkeypatch: Any) -> None:
+    """Fast-path device failure must not play the success emotion."""
+
+    class FakeHomeAssistant:
+        async def __call__(self, deps: ToolDependencies, **kwargs: Any) -> dict[str, Any]:
+            return {"error": "Home Assistant could not find that entity or service."}
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.output_queue = asyncio.Queue()
+    play = AsyncMock()
+    monkeypatch.setattr(hf_mod, "HomeAssistant", FakeHomeAssistant)
+    monkeypatch.setattr(handler, "_play_device_success_emotion", play)
+
+    await handler._run_fast_ha_commands([{"action": "turn_switch_on", "entity_id": "switch.missing"}])
+
+    play.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -495,6 +610,7 @@ async def test_stale_hermes_result_does_not_contaminate_lamp_turn(monkeypatch: A
     monkeypatch.setattr(handler, "_wait_for_response_done_before_tool_result", AsyncMock(return_value=True))
     create = AsyncMock()
     monkeypatch.setattr(handler, "_safe_response_create", create)
+    monkeypatch.setattr(handler, "_play_device_success_emotion", AsyncMock())
     handler._turn_generation = 2
     handler._tool_call_generation = {"call_old": 1, "call_lamp": 2}
     handler._in_flight_tool_calls = {"call_lamp"}
@@ -527,14 +643,15 @@ async def test_stale_hermes_result_does_not_contaminate_lamp_turn(monkeypatch: A
             "output": json.dumps({"status": "success", "service": "switch.turn_on", "entity_id": "switch.lamp_3"}),
         }
     ]
-    assert create.await_count == 0
+    create.assert_awaited_once_with(reason="tool_result:home_assistant", response={"tool_choice": "none"})
     assert handler._pending_hermes_result is not None
     assert handler._pending_hermes_result.status == "buffered"
 
     handler._response_done_event.set()
     handler._active_response_reason = "tool_result:home_assistant"
     await handler._handle_hermes_speech_outcome()
-    create.assert_awaited_once_with(reason="hermes_buffered_result", response={"tool_choice": "none"})
+    assert create.await_count == 2
+    create.assert_awaited_with(reason="hermes_buffered_result", response={"tool_choice": "none"})
     deliver_item = handler.connection.conversation.item.create.await_args.kwargs["item"]
     assert deliver_item["type"] == "message"
     assert "Nitrate has been falling" in deliver_item["content"][0]["text"]

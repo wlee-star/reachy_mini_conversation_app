@@ -10,6 +10,7 @@ from reachy_mini_conversation_app.tools.play_emotion import (
     PlayEmotion,
     resolve_emotion_name,
     random_curated_emotion,
+    is_success_emotion_request,
 )
 
 
@@ -54,6 +55,20 @@ def test_play_emotion_schema_uses_compact_intents() -> None:
 def test_resolve_emotion_name_accepts_ids_intents_and_yes_no_phrases(requested: str, expected: str) -> None:
     """Resolve exact IDs, compact intents, and exposed yes/no phrase variants."""
     assert resolve_emotion_name(requested, AVAILABLE_EMOTIONS) == expected
+
+
+def test_is_success_emotion_request() -> None:
+    """Only the curated success intent and move IDs count as a success request."""
+    assert is_success_emotion_request("success") is True
+    assert is_success_emotion_request("success1") is True
+    assert is_success_emotion_request("success2") is True
+    assert is_success_emotion_request("happy") is False
+    assert is_success_emotion_request("random") is False
+
+
+def test_resolve_emotion_name_maps_success_intent() -> None:
+    """The existing emotions library already exposes success1/success2."""
+    assert resolve_emotion_name("success", ["success1", "success2", "confused1"]) == "success1"
 
 
 def test_resolve_emotion_name_returns_none_for_random_or_unknown() -> None:
@@ -228,3 +243,23 @@ async def test_play_emotion_queues_random_for_unknown_emotion(
     assert "play_emotion: 'contento' did not resolve; using random curated" in caplog.text
     queued_move = movement_manager.queue_move.call_args.args[0]
     assert queued_move.emotion_name == "confused1"
+
+
+@pytest.mark.asyncio
+async def test_play_emotion_allow_random_false_returns_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Device-control success must not fall back to a random emotion."""
+
+    class FakeRecordedMoves:
+        def list_moves(self) -> list[str]:
+            return AVAILABLE_EMOTIONS
+
+    monkeypatch.setattr(play_emotion_module, "EMOTION_AVAILABLE", True)
+    movement_manager = MagicMock()
+    deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=movement_manager)
+    tool = PlayEmotion()
+    monkeypatch.setattr(tool, "_library", FakeRecordedMoves())
+
+    result = await tool(deps, emotion="success", allow_random=False)
+
+    assert result == {"error": "Emotion 'success' is not available"}
+    movement_manager.queue_move.assert_not_called()

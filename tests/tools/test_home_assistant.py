@@ -5,7 +5,12 @@ import pytest
 
 from reachy_mini_conversation_app.tools import home_assistant as home_assistant_mod
 from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
-from reachy_mini_conversation_app.tools.home_assistant import HomeAssistant, match_fast_ha_commands
+from reachy_mini_conversation_app.tools.home_assistant import (
+    HomeAssistant,
+    is_control_action,
+    match_fast_ha_commands,
+    is_device_control_success,
+)
 
 
 def _deps() -> ToolDependencies:
@@ -263,16 +268,32 @@ def test_match_fast_ha_commands(transcript: str, expected: list[dict[str, str]])
     assert match_fast_ha_commands(transcript) == expected
 
 
-def test_control_success_skips_spoken_followup() -> None:
-    """A completed lamp toggle should not wait for a spoken model follow-up."""
+def test_control_success_wants_spoken_followup() -> None:
+    """A completed lamp toggle still needs a short spoken confirmation."""
     tool = HomeAssistant()
     assert (
         tool.wants_spoken_followup(
             {"status": "success", "service": "switch.turn_off", "entity_id": "switch.lamp_3"},
             None,
         )
-        is False
+        is True
     )
+
+
+def test_device_control_success_requires_confirmed_service_result() -> None:
+    """Queued-looking payloads and errors are not treated as completed control."""
+    assert is_control_action("turn_switch_on") is True
+    assert is_control_action("get_entity_state") is False
+    assert (
+        is_device_control_success(
+            {"status": "success", "service": "switch.turn_on", "entity_id": "switch.lamp_3"},
+            None,
+        )
+        is True
+    )
+    assert is_device_control_success({"status": "accepted", "entity_id": "switch.lamp_3"}, None) is False
+    assert is_device_control_success({"error": "Home Assistant could not find that entity or service."}, None) is False
+    assert is_device_control_success({"minutes": 4, "route": "311"}, None) is False
 
 
 def test_query_and_error_still_need_spoken_followup() -> None:

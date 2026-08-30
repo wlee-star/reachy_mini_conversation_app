@@ -48,8 +48,15 @@ from reachy_mini_conversation_app.tools.core_tools import (
     ToolDependencies,
     get_tool_specs,
 )
+from reachy_mini_conversation_app.tools.play_emotion import PlayEmotion, is_success_emotion_request
 from reachy_mini_conversation_app.conversation_handler import ConversationHandler
-from reachy_mini_conversation_app.tools.home_assistant import HomeAssistant, match_fast_ha_commands
+from reachy_mini_conversation_app.tools.home_assistant import (
+    HomeAssistant,
+    is_control_action,
+    match_fast_ha_commands,
+    is_device_control_success,
+)
+from reachy_mini_conversation_app.tools.tool_constants import ToolState
 from reachy_mini_conversation_app.tools.background_tool_manager import (
     ToolCallRoutine,
     ToolNotification,
@@ -265,6 +272,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._fast_ha_task: asyncio.Task[None] | None = None
         self._user_speech_in_progress = False
         self._pending_hermes_result: _HermesPendingResult | None = None
+        self._turn_device_control_call_ids: set[str] = set()
+        self._device_success_emotion_played = False
 
     @staticmethod
     def _sanitize_tool_result_for_model(tool_name: str, tool_result: dict[str, Any]) -> dict[str, Any]:
@@ -324,6 +333,79 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 result,
             )
             await self.output_queue.put(AdditionalOutputs({"role": "assistant", "content": json.dumps(result)}))
+            if is_device_control_success(result if isinstance(result, dict) else None, None):
+                await self._play_device_success_emotion()
+
+    def _reset_device_success_turn_state(self) -> None:
+        """Clear per-turn device-control success tracking."""
+        self._turn_device_control_call_ids.clear()
+        self._device_success_emotion_played = False
+
+    def _value_from_tool_args(self, args_json: str, key: str) -> object:
+        try:
+            parsed = json.loads(args_json)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        return parsed.get(key)
+
+    async def _play_device_success_emotion(self) -> None:
+        """Queue the existing success emotion once after a confirmed device action."""
+        if self._device_success_emotion_played:
+            return
+        self._device_success_emotion_played = True
+        try:
+            result = await PlayEmotion()(self.deps, emotion="success", allow_random=False)
+        except Exception as exc:
+            logger.warning("Device success emotion failed: %s", exc)
+            return
+        if result.get("error"):
+            logger.warning("Device success emotion failed: %s", result["error"])
+            return
+        logger.info("Played device success emotion: %s", result.get("emotion"))
+
+    async def _complete_skipped_success_emotion(self, call_id: str) -> None:
+        """Finish a play_emotion(success) call without queuing a second animation."""
+        await self._handle_tool_result(
+            ToolNotification(
+                id=call_id,
+                tool_name="play_emotion",
+                is_idle_tool_call=False,
+                status=ToolState.COMPLETED,
+                result={"status": "skipped", "emotion": "success"},
+            )
+        )
+
+    async def _start_or_skip_success_emotion_tool(
+        self,
+        call_id: str,
+        args_json_str: str,
+        turn_generation: int,
+    ) -> None:
+        """Play success only when this turn has no device-control tool owning the emotion."""
+        await self._wait_for_response_done_before_tool_result()
+        if self._turn_generation != turn_generation:
+            await self._complete_skipped_success_emotion(call_id)
+            return
+        if self._device_success_emotion_played or self._turn_device_control_call_ids:
+            logger.info("Skipping play_emotion success; device-control result owns this turn")
+            await self._complete_skipped_success_emotion(call_id)
+            return
+        background_tool = await self.tool_manager.start_tool(
+            call_id=call_id,
+            tool_call_routine=ToolCallRoutine(
+                tool_name="play_emotion",
+                args_json_str=args_json_str,
+                deps=self.deps,
+            ),
+            is_idle_tool_call=False,
+        )
+        logger.info(
+            "Started background tool: play_emotion (id=%s, call_id=%s)",
+            background_tool.tool_id,
+            call_id,
+        )
 
     async def _acknowledge_long_running_tool(self, tool_name: str, call_id: str, turn_generation: int) -> None:
         """Speak a short hold-on line when a long tool starts with no audio."""
@@ -1045,6 +1127,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
             if isinstance(completed_tool.id, str):
                 self._in_flight_tool_calls.discard(completed_tool.id)
+                self._turn_device_control_call_ids.discard(completed_tool.id)
+
+            if (
+                not result_is_stale
+                and completed_tool.tool_name == "home_assistant"
+                and is_device_control_success(completed_tool.result, completed_tool.error)
+            ):
+                await self._play_device_success_emotion()
 
             tool = core_tools.get_tools().get(completed_tool.tool_name)
 
@@ -1253,6 +1343,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._turn_generation += 1
                         self._in_flight_tool_calls.clear()
                         self._tool_batch_needs_response = False
+                        self._reset_device_success_turn_state()
                         self._reset_active_response_audio_state()
                         self._start_fast_ha_command(transcript)
 
@@ -1327,6 +1418,31 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._turn_tool_received_at = time.perf_counter()
                         self._tool_call_generation[call_id] = self._turn_generation
                         self._in_flight_tool_calls.add(call_id)
+                        if tool_name == "home_assistant" and is_control_action(
+                            self._value_from_tool_args(args_json_str, "action")
+                        ):
+                            self._turn_device_control_call_ids.add(call_id)
+                        if tool_name == "play_emotion" and is_success_emotion_request(
+                            self._value_from_tool_args(args_json_str, "emotion")
+                        ):
+                            asyncio.create_task(
+                                self._start_or_skip_success_emotion_tool(
+                                    call_id, args_json_str, self._tool_call_generation[call_id]
+                                ),
+                                name=f"success-emotion-{call_id}",
+                            )
+                            await self.output_queue.put(
+                                AdditionalOutputs(
+                                    {
+                                        "role": "assistant",
+                                        "content": (
+                                            f"🛠️ Used tool {tool_name} with args {args_json_str}. "
+                                            f"The tool is now running. Tool ID: {call_id}"
+                                        ),
+                                    },
+                                ),
+                            )
+                            continue
                         background_tool = await self.tool_manager.start_tool(
                             call_id=call_id,
                             tool_call_routine=ToolCallRoutine(

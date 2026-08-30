@@ -1,0 +1,11 @@
+Backup created: 2026-08-30-2018-bus-terminal
+Reason: 311 monitor 0-minute / service-transition fix
+
+BACKED UP: src\reachy_mini_conversation_app\bus_monitor.py -> src__reachy_mini_conversation_app__bus_monitor.py
+BACKED UP: src\reachy_mini_conversation_app\tools\monitor_bus.py -> src__reachy_mini_conversation_app__tools__monitor_bus.py
+BACKED UP: tests\test_bus_monitor.py -> tests__test_bus_monitor.py
+BACKED UP: tests\tools\test_monitor_bus.py -> tests__tools__test_monitor_bus.py
+BACKED UP: README.md -> README.md
+BACKED UP: profiles\default\profile.md -> profiles__default__profile.md
+
+Rollback: copy each BACKED UP file from this folder over the original path.

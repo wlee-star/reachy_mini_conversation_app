@@ -505,22 +505,6 @@ async def test_start_fast_bus_command_queries_live_arrival(monkeypatch: Any) -> 
 
 
 @pytest.mark.asyncio
-async def test_start_fast_bus_command_switches_when_watch_is_active(monkeypatch: Any) -> None:
-    """An explicit 'next one instead' request uses the local switch path."""
-    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
-    run = AsyncMock()
-    monkeypatch.setattr(handler, "_run_fast_bus_command", run)
-    monkeypatch.setattr(hf_mod.get_bus_monitor(), "pending_offer", lambda: False)
-    monkeypatch.setattr(hf_mod.get_bus_monitor(), "monitor_active", lambda: True)
-
-    handler._start_fast_bus_command("Monitor the next one instead.")
-    assert handler._fast_bus_task is not None
-    await handler._fast_bus_task
-
-    run.assert_awaited_once_with("switch", 15)
-
-
-@pytest.mark.asyncio
 async def test_start_fast_bus_command_ignores_unrelated_speech(monkeypatch: Any) -> None:
     """Non-bus speech must not start the bus monitor fast path."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))

@@ -43,7 +43,6 @@ from reachy_mini_conversation_app.prompts import (
     get_session_greeting_prompt,
 )
 from reachy_mini_conversation_app.streaming import AdditionalOutputs, audio_to_int16
-from reachy_mini_conversation_app.bus_monitor import get_bus_monitor, match_bus_intent
 from reachy_mini_conversation_app.tools.core_tools import (
     ToolSpec,
     ToolDependencies,
@@ -93,10 +92,6 @@ _HERMES_DELIVER_PROMPT: Final[str] = (
 )
 _HERMES_RETRY_PROMPT: Final[str] = (
     "Speak the previous check result now in one or two short sentences. Do not mention tools or files."
-)
-_BUS_ALERT_PROMPT: Final[str] = (
-    "Speak this exact bus update to the user now, in one or two short sentences, "
-    "without mentioning tools, Home Assistant, or that this is a reminder: {text}"
 )
 _HERMES_SPEECH_REASONS: Final[frozenset[str]] = frozenset(
     {
@@ -275,9 +270,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._tool_batch_needs_response = False
         self._tool_followup_tools_disabled = False
         self._fast_ha_task: asyncio.Task[None] | None = None
-        self._fast_bus_task: asyncio.Task[None] | None = None
-        self._bus_monitor_start_task: asyncio.Task[None] | None = None
-        self._bus_spoke_turn: int | None = None
         self._user_speech_in_progress = False
         self._pending_hermes_result: _HermesPendingResult | None = None
         self._turn_device_control_call_ids: set[str] = set()
@@ -343,67 +335,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             await self.output_queue.put(AdditionalOutputs({"role": "assistant", "content": json.dumps(result)}))
             if is_device_control_success(result if isinstance(result, dict) else None, None):
                 await self._play_device_success_emotion()
-
-    def _start_fast_bus_command(self, transcript: str) -> None:
-        manager = get_bus_monitor()
-        intent = match_bus_intent(
-            transcript,
-            pending_offer=manager.pending_offer(),
-            monitor_active=manager.monitor_active(),
-        )
-        if intent is None:
-            return
-        self._fast_bus_task = asyncio.create_task(
-            self._run_fast_bus_command(intent.action, intent.preparation_threshold),
-            name="bus-fast-path",
-        )
-
-    async def _speak_bus_alert(self, text: str) -> None:
-        """Speak a deterministic bus update through the existing realtime session."""
-        speech_started = time.perf_counter()
-        try:
-            await self.say(_BUS_ALERT_PROMPT.format(text=text))
-        except Exception as exc:
-            logger.warning("Bus monitor speech failed: %s", exc)
-            return
-        logger.info("SPEECH_START latency=%.2fs", time.perf_counter() - speech_started)
-
-    async def _run_fast_bus_command(self, action: str, preparation_threshold: int) -> None:
-        manager = get_bus_monitor()
-        started = time.perf_counter()
-        try:
-            if action == "query":
-                result = await manager.query(preparation_threshold=preparation_threshold)
-            elif action == "confirm":
-                result = await manager.start(preparation_threshold=preparation_threshold)
-            elif action == "switch":
-                result = await manager.switch()
-            elif action == "continuous":
-                result = await manager.keep_monitoring(preparation_threshold=preparation_threshold)
-            else:
-                result = await manager.cancel()
-        except Exception as exc:
-            logger.warning("Fast-path bus command failed: %s", exc)
-            return
-        spoken = result.get("spoken")
-        if not isinstance(spoken, str) or not spoken:
-            return
-        self._bus_spoke_turn = self._turn_generation
-        manager.mark_query_spoken()
-        await self._speak_bus_alert(spoken)
-        logger.info(
-            "BUS fast-path action=%s finished in %.0f ms",
-            action,
-            (time.perf_counter() - started) * 1000,
-        )
-
-    async def _start_bus_monitor(self) -> None:
-        try:
-            manager = get_bus_monitor()
-            manager.attach(instance_path=self.instance_path, notify=self._speak_bus_alert)
-            await manager.resume_from_disk()
-        except Exception as exc:
-            logger.warning("Bus monitor failed to start: %s", exc)
 
     def _reset_device_success_turn_state(self) -> None:
         """Clear per-turn device-control success tracking."""
@@ -1206,16 +1137,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 await self._play_device_success_emotion()
 
             tool = core_tools.get_tools().get(completed_tool.tool_name)
-            bus_already_spoken = self._bus_spoke_turn == self._turn_generation and completed_tool.tool_name in {
-                "home_assistant",
-                "monitor_bus",
-            }
 
             # Always surface errors, skip the spoken follow-up for tools that opt out.
-            if (
-                model_result_submitted
-                and not bus_already_spoken
-                and (tool is None or tool.wants_spoken_followup(completed_tool.result, completed_tool.error))
+            if model_result_submitted and (
+                tool is None or tool.wants_spoken_followup(completed_tool.result, completed_tool.error)
             ):
                 self._tool_batch_needs_response = True
 
@@ -1276,7 +1201,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             try:
                 # Start the background tool manager
                 self.tool_manager.start_up(tool_callbacks=[self._handle_tool_result])
-                self._bus_monitor_start_task = asyncio.create_task(self._start_bus_monitor(), name="bus-monitor-start")
 
                 # Start the response sender worker
                 response_sender_task = asyncio.create_task(self._response_sender_loop(), name="response-sender")
@@ -1422,7 +1346,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._reset_device_success_turn_state()
                         self._reset_active_response_audio_state()
                         self._start_fast_ha_command(transcript)
-                        self._start_fast_bus_command(transcript)
 
                         await self.output_queue.put(AdditionalOutputs({"role": "user", "content": transcript}))
                         self._emit_transcript("user", transcript, True)
@@ -1676,16 +1599,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
         # Stop background tool manager tasks (listener + cleanup)
         await self.tool_manager.shutdown()
-        try:
-            await get_bus_monitor().detach()
-        except Exception as exc:
-            logger.warning("Bus monitor detach failed: %s", exc)
-        if self._fast_bus_task is not None:
-            self._fast_bus_task.cancel()
-            self._fast_bus_task = None
-        if self._bus_monitor_start_task is not None:
-            self._bus_monitor_start_task.cancel()
-            self._bus_monitor_start_task = None
 
         await self._cancel_partial_transcript_task()
 

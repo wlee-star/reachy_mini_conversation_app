@@ -264,15 +264,14 @@ Every bundled profile enables `head_tracking` by default; users can still disabl
 | `remember` | Save one short, stable fact about the user for future sessions. | Core install only. Stored in the app instance data directory. |
 | `forget` | Remove a saved memory fact by matching a short query. | Core install only. |
 | `home_assistant` | Read Home Assistant entity state, turn lights on/off, activate scenes, and read bus arrivals directly over the local LAN. A confirmed control result plays the existing `success` emotion and a short spoken confirmation. | Set `HA_URL` and `HA_TOKEN`; optionally set `HA_BUS_ENTITY_ID`. |
-| `monitor_bus` | Query the live Home Assistant Route 311 sensor (current and following services), then optionally watch that specific service in the background for 15/10/7/5-minute and arrival alerts. Switching or continuous watches require an explicit user request. Does not add a second bus API. Active watches persist in `bus_monitors.v1.json`. | Same Home Assistant config as `home_assistant`. |
 | `apex` | Read current Neptune Apex / reef status from `APEX_STATUS_URL` (`/status` JSON) for water parameters, equipment, alarms, and alerts. | Set `APEX_STATUS_URL`. Falls back to `~/reef-monitor/reef_cache.json`. |
 | `reef_status` | Legacy fast-path reef status reader; same live `/status` URL or cache as `apex`. | Set `APEX_STATUS_URL`, or keep the reef cache producer. |
-| `ask_hermes` | Forward advanced delegated tasks to the Hermes Gateway, such as other buses/trains (not live Route 311), research, multi-step household tasks, or deeper reef analysis. Direct `apex__*` / `home_assistant__*` MCP tools are not registered while this tool is on. | Set `HERMES_GATEWAY_URL` and `HERMES_API_KEY`. |
+| `ask_hermes` | Forward advanced delegated tasks to the Hermes Gateway, such as buses/trains, research, multi-step household tasks, or deeper reef analysis. Direct `apex__*` / `home_assistant__*` MCP tools are not registered while this tool is on. | Set `HERMES_GATEWAY_URL` and `HERMES_API_KEY`. |
 
 Weather, web search, and time are no longer enabled on the default profile. The bundled Hugging Face Tool Spaces remain installable from Tools if you accept cloud MCP calls. For other local HTTP MCP servers (time, weather), register them in `external_content/installed_local_mcp.json` and enable the `{alias}__{tool}` IDs per personality. Simple Apex and Home Assistant operations use local Python tools; Hermes remains available through `ask_hermes` for advanced delegation.
 
 > [!NOTE]
-> `remember`/`forget` facts are stored in `memory.v1.json` inside the app's instance data directory (`~/.local/share/reachy_mini_conversation_app/` by default, or the instance path used by the desktop launcher). `forget` only removes facts matched by query. To reset all remembered facts, delete this file. Active Route 311 watches persist in `bus_monitors.v1.json` in the same directory.
+> `remember`/`forget` facts are stored in `memory.v1.json` inside the app's instance data directory (`~/.local/share/reachy_mini_conversation_app/` by default, or the instance path used by the desktop launcher). `forget` only removes facts matched by query. To reset all remembered facts, delete this file.
 
 ## Creating and adding tools
 

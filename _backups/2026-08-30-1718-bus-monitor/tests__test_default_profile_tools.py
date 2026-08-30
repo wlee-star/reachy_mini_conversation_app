@@ -17,7 +17,6 @@ def test_default_profile_keeps_local_reachy_tools_without_cloud_spaces() -> None
     assert "camera" in tools
     assert "go_to_sleep" in tools
     assert "home_assistant" in tools
-    assert "monitor_bus" in tools
     assert "apex" in tools
     assert "ask_hermes" in tools
     assert not set(CLOUD_SPACE_TOOLS) & set(tools)
@@ -39,8 +38,7 @@ def test_default_profile_sends_live_tank_status_to_apex() -> None:
     instructions = read_packaged_default_profile().instructions
     assert "reef tank status" in instructions.lower()
     assert "use **apex** immediately" in instructions.lower()
-    assert "call **home_assistant** or **monitor_bus** immediately" in instructions.lower()
-    assert "call **monitor_bus** immediately" in instructions.lower()
+    assert "call **home_assistant** immediately" in instructions.lower()
     assert "button.screen_down" in instructions
     assert "do not call play_emotion for that success" in instructions.lower()
     assert "done, lamp three is on" in instructions.lower()

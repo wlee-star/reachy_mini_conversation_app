@@ -376,10 +376,6 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 result = await manager.query(preparation_threshold=preparation_threshold)
             elif action == "confirm":
                 result = await manager.start(preparation_threshold=preparation_threshold)
-            elif action == "switch":
-                result = await manager.switch()
-            elif action == "continuous":
-                result = await manager.keep_monitoring(preparation_threshold=preparation_threshold)
             else:
                 result = await manager.cancel()
         except Exception as exc:

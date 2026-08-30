@@ -53,7 +53,7 @@ class AskHermes(Tool):
 
     name = "ask_hermes"
     description = (
-        "Ask Hermes for advanced delegated tasks: multi-step household requests, other buses or trains (not live Route 311), research, "
+        "Ask Hermes for advanced delegated tasks: multi-step household requests, buses or trains, research, "
         "and cached reef tank trends, threading/thread summaries, parameter history, and ATO history. "
         "Use this immediately for 'trending', 'treading', 'threading', or 'tank trends' — do not use apex or "
         "reef_status for those. Do not use this for live reef tank status or current Apex numbers; use apex. "

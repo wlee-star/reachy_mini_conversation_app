@@ -22,6 +22,12 @@ _CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 _LOG_HANDLES: dict[str, IO[str]] = {}
 
 
+def invalidate_listen_cache() -> None:
+    """Drop the cached port-to-PID map so the next lookup is live."""
+    global _LISTEN_CACHE
+    _LISTEN_CACHE = None
+
+
 def listening_table() -> dict[int, list[int]]:
     """Return a port-to-PID map of TCP listeners, cached briefly."""
     global _LISTEN_CACHE
@@ -154,6 +160,73 @@ def command_matches(command_line: str | None, pattern: str) -> bool:
     return re.search(pattern, command_line, re.IGNORECASE) is not None
 
 
+def pid_matches_pattern(pid: int, pattern: str) -> bool:
+    """Return whether a live PID's command line matches the whitelist pattern."""
+    if pid <= 0 or not pattern or not pid_is_running(pid):
+        return False
+    return command_matches(process_command_line(pid), pattern)
+
+
+def parent_pid(pid: int) -> int | None:
+    """Return the parent PID for a process, if it can be read."""
+    if pid <= 0:
+        return None
+    if sys.platform == "win32":
+        script = f"(Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}').ParentProcessId"
+        try:
+            output = subprocess.check_output(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                text=True,
+                timeout=8,
+                stderr=subprocess.DEVNULL,
+            )
+        except (subprocess.SubprocessError, FileNotFoundError) as exc:
+            logger.warning("Could not read parent PID for %s: %s", pid, exc)
+            return None
+        text = output.strip()
+        return int(text) if text.isdigit() else None
+    try:
+        output = subprocess.check_output(
+            ["ps", "-p", str(pid), "-o", "ppid="],
+            text=True,
+            timeout=5,
+            stderr=subprocess.DEVNULL,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return None
+    text = output.strip()
+    return int(text) if text.isdigit() else None
+
+
+def pid_in_same_tree(pid: int, other: int) -> bool:
+    """Return whether two PIDs are the same process or in a parent/child lineage."""
+    if pid <= 0 or other <= 0:
+        return False
+    if pid == other:
+        return True
+    seen: set[int] = set()
+    current = pid
+    while current and current not in seen:
+        seen.add(current)
+        if current == other:
+            return True
+        ancestor = parent_pid(current)
+        if ancestor is None or ancestor <= 0:
+            break
+        current = ancestor
+    seen = set()
+    current = other
+    while current and current not in seen:
+        seen.add(current)
+        if current == pid:
+            return True
+        ancestor = parent_pid(current)
+        if ancestor is None or ancestor <= 0:
+            break
+        current = ancestor
+    return False
+
+
 _VENV_LEAK_KEYS = (
     "PYTHONPATH",
     "PYTHONHOME",
@@ -225,8 +298,38 @@ def start_process(
     else:
         kwargs["start_new_session"] = True
     started = subprocess.Popen([executable, *args], **kwargs)
-    logger.info("Started %s pid=%s", service_id, started.pid)
+    logger.info("Started %s pid=%s command=%s", service_id, started.pid, [executable, *args])
     return started.pid
+
+
+def run_logged(
+    executable: str,
+    args: list[str],
+    cwd: Path,
+    log_path: Path,
+    env: dict[str, str] | None = None,
+    *,
+    timeout_s: float = 30.0,
+) -> int:
+    """Run a one-shot command, wait for it, and append output to the service log."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    popen_env = child_env(executable, extra=env)
+    with log_path.open("a", encoding="utf-8") as log_file:
+        try:
+            completed = subprocess.run(
+                [executable, *args],
+                cwd=str(cwd),
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                env=popen_env,
+                timeout=timeout_s,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.warning("Command failed (%s %s): %s", executable, args, exc)
+            return 1
+    return int(completed.returncode)
 
 
 def pids_matching(pattern: str) -> list[int]:
@@ -315,3 +418,15 @@ def stop_pid(pid: int) -> None:
         os.kill(pid, signal.SIGTERM)
     except OSError as exc:
         logger.warning("SIGTERM failed for pid %s: %s", pid, exc)
+
+
+def wait_until_gone(pid: int, timeout_s: float = 8.0) -> bool:
+    """Wait until a PID exits. Return whether it is gone."""
+    if pid <= 0:
+        return True
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if not pid_is_running(pid):
+            return True
+        time.sleep(0.2)
+    return not pid_is_running(pid)

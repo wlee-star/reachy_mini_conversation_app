@@ -23,6 +23,7 @@ dependencies = [
     "reachy_mini_dances_library",
     "reachy-mini>=1.10.0rc5",
     "mcp>=1.27.1,<2",
+    "tzdata",
 ]
 
 [dependency-groups]

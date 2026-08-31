@@ -1,7 +1,9 @@
 import time
 import asyncio
+import logging
 from typing import Any
 from pathlib import Path
+from datetime import tzinfo, datetime, timezone
 
 import pytest
 
@@ -84,6 +86,38 @@ async def _wait_until_idle(manager: BusMonitorManager, *, timeout_s: float = 2.0
         if manager.status()["status"] != "monitoring":
             return
         await asyncio.sleep(0.03)
+
+
+async def _await_helpful1(manager: BusMonitorManager) -> None:
+    task = manager._helpful1_task
+    if task is not None:
+        await task
+
+
+def _crossing_watch(
+    *,
+    previous_eta: int,
+    service_id: str = "trip-a",
+    preparation_threshold: int = 15,
+    preparation_alert_sent: bool = True,
+    ten_minute_alert_sent: bool = False,
+) -> BusMonitorState:
+    return BusMonitorState(
+        monitor_id="m1",
+        entity_id=ENTITY,
+        route="311",
+        stop=None,
+        service_id=service_id,
+        created_at=time.time(),
+        latest_live_eta=previous_eta,
+        preparation_threshold=preparation_threshold,
+        urgent_threshold=5,
+        status="active",
+        last_check=time.time(),
+        preparation_alert_sent=preparation_alert_sent,
+        urgent_alert_sent=False,
+        ten_minute_alert_sent=ten_minute_alert_sent,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -879,6 +913,7 @@ async def test_query_22_minute_bus_offers_monitoring(monkeypatch: pytest.MonkeyP
     assert result["offer"] == "offer_prepare"
     assert "22 minutes away" in result["spoken"]
     assert "Would you like me to monitor it" in result["spoken"]
+    assert result["timezone"] == "Australia/Sydney"
 
 
 @pytest.mark.asyncio
@@ -1115,3 +1150,175 @@ async def test_eta_oscillation_sends_one_preparation_alert(monkeypatch: pytest.M
     assert sum("You have time to get ready" in item for item in alerts) == 1
     assert manager.monitor_active() is True
     await manager.cancel()
+
+
+def test_approx_clock_uses_australia_sydney(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Approximate clock labels are Australia/Sydney civil time, not a fixed UTC offset."""
+
+    class _FrozenDateTime:
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> datetime:
+            moment = datetime(2026, 8, 31, 3, 30, tzinfo=timezone.utc)
+            return moment if tz is None else moment.astimezone(tz)
+
+    monkeypatch.setattr(bus_monitor_mod, "datetime", _FrozenDateTime)
+    assert bus_monitor_mod._approx_clock(7) == "1:37"
+
+
+def test_clock_label_converts_utc_iso_to_sydney() -> None:
+    """ISO arrival timestamps are spoken in Australia/Sydney, not UTC."""
+    arrival = _arrival(22, scheduled_at="2026-08-31T03:22:00Z")
+    assert bus_monitor_mod._clock_label(arrival) == "13:22"
+
+
+def test_format_initial_spoken_uses_sydney_clock_from_utc_iso() -> None:
+    """Spoken 'expected at' times come from the Sydney clock, not the raw UTC string."""
+    snapshot = _snapshot(22, eta_displays=["2026-08-31T03:22:00Z"])
+    spoken = format_initial_spoken(snapshot)
+    assert "03:22" not in spoken
+    assert "expected at 13:22" in spoken
+
+
+@pytest.mark.asyncio
+async def test_ten_minute_alert_plays_helpful1_once(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Crossing 10 minutes speaks the existing notice and queues helpful1 once."""
+    events: list[str] = []
+
+    async def _live() -> LiveBusSnapshot:
+        return _snapshot(10, service_ids=["trip-a"])
+
+    async def _notify(text: str) -> None:
+        events.append(f"notify:{text}")
+
+    async def _play() -> None:
+        events.append("helpful1")
+
+    monkeypatch.setattr(bus_monitor_mod, "fetch_live_snapshot", _live)
+    manager = BusMonitorManager(persist_path=tmp_path / "bus.json")
+    manager.attach(instance_path=tmp_path, notify=_notify, play_helpful1=_play)
+    manager._monitor = _crossing_watch(previous_eta=12)
+    await manager._poll_once()
+    await _await_helpful1(manager)
+    assert any("10 minutes away" in item for item in events)
+    assert events[-1] == "helpful1"
+    assert sum(item == "helpful1" for item in events) == 1
+    assert manager._monitor is not None
+    assert manager._monitor.ten_minute_alert_sent is True
+
+
+@pytest.mark.asyncio
+async def test_ten_minute_helpful1_does_not_replay_while_eta_stays_near_ten(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """helpful1 stays one-shot if the watched 311 remains around 10 minutes."""
+    played: list[str] = []
+    etas = iter([10, 10, 11, 10])
+
+    async def _live() -> LiveBusSnapshot:
+        return _snapshot(next(etas), service_ids=["trip-a"])
+
+    async def _notify(_text: str) -> None:
+        return None
+
+    async def _play() -> None:
+        played.append("helpful1")
+
+    monkeypatch.setattr(bus_monitor_mod, "fetch_live_snapshot", _live)
+    manager = BusMonitorManager(persist_path=tmp_path / "bus.json")
+    manager.attach(instance_path=tmp_path, notify=_notify, play_helpful1=_play)
+    manager._monitor = _crossing_watch(previous_eta=12)
+    with caplog.at_level(logging.INFO, logger="reachy_mini_conversation_app.bus_monitor"):
+        await manager._poll_once()
+        await _await_helpful1(manager)
+        await manager._poll_once()
+        await manager._poll_once()
+        await manager._poll_once()
+        await _await_helpful1(manager)
+    assert played == ["helpful1"]
+    assert "helpful1 already triggered for bus trip-a; skipping duplicate" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_ten_minute_helpful1_plays_again_for_a_new_bus(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A later 311 crossing 10 minutes plays helpful1 again."""
+    played: list[str] = []
+    current = {"minutes": 10, "service_id": "trip-a"}
+
+    async def _live() -> LiveBusSnapshot:
+        return _snapshot(current["minutes"], service_ids=[str(current["service_id"])])
+
+    async def _notify(_text: str) -> None:
+        return None
+
+    async def _play() -> None:
+        played.append(str(current["service_id"]))
+
+    monkeypatch.setattr(bus_monitor_mod, "fetch_live_snapshot", _live)
+    manager = BusMonitorManager(persist_path=tmp_path / "bus.json")
+    manager.attach(instance_path=tmp_path, notify=_notify, play_helpful1=_play)
+    manager._monitor = _crossing_watch(previous_eta=12, service_id="trip-a")
+    await manager._poll_once()
+    await _await_helpful1(manager)
+    current["service_id"] = "trip-b"
+    manager._monitor = _crossing_watch(previous_eta=12, service_id="trip-b")
+    await manager._poll_once()
+    await _await_helpful1(manager)
+    assert played == ["trip-a", "trip-b"]
+
+
+@pytest.mark.asyncio
+async def test_ten_minute_helpful1_failure_does_not_block_notification(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failed helpful1 load still speaks the 10-minute notice and keeps the watch."""
+    alerts: list[str] = []
+
+    async def _live() -> LiveBusSnapshot:
+        return _snapshot(10, service_ids=["trip-a"])
+
+    async def _notify(text: str) -> None:
+        alerts.append(text)
+
+    async def _fail() -> None:
+        raise RuntimeError("dataset missing")
+
+    monkeypatch.setattr(bus_monitor_mod, "fetch_live_snapshot", _live)
+    manager = BusMonitorManager(persist_path=tmp_path / "bus.json")
+    manager.attach(instance_path=tmp_path, notify=_notify, play_helpful1=_fail)
+    manager._monitor = _crossing_watch(previous_eta=12)
+    with caplog.at_level(logging.WARNING, logger="reachy_mini_conversation_app.bus_monitor"):
+        await manager._poll_once()
+        await _await_helpful1(manager)
+    assert any("10 minutes away" in item for item in alerts)
+    assert manager.monitor_active() is True
+    assert "Unable to play helpful1 emotion: dataset missing" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_ten_minute_prep_threshold_also_plays_helpful1(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A 10-minute preparation watch still queues helpful1 with that existing notice."""
+    played: list[str] = []
+    alerts: list[str] = []
+
+    async def _live() -> LiveBusSnapshot:
+        return _snapshot(10, service_ids=["trip-a"])
+
+    async def _notify(text: str) -> None:
+        alerts.append(text)
+
+    async def _play() -> None:
+        played.append("helpful1")
+
+    monkeypatch.setattr(bus_monitor_mod, "fetch_live_snapshot", _live)
+    manager = BusMonitorManager(persist_path=tmp_path / "bus.json")
+    manager.attach(instance_path=tmp_path, notify=_notify, play_helpful1=_play)
+    manager._monitor = _crossing_watch(
+        previous_eta=12,
+        preparation_threshold=10,
+        preparation_alert_sent=False,
+    )
+    await manager._poll_once()
+    await _await_helpful1(manager)
+    assert played == ["helpful1"]
+    assert any("10 minutes away" in item for item in alerts)
+    assert any("You have time to get ready" in item for item in alerts)

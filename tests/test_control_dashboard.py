@@ -72,6 +72,8 @@ def test_registry_discovers_real_project_services() -> None:
     assert reachy is not None and reachy.managed is True
     assert reachy.start is not None
     assert "--sim" in reachy.start.get("args", [])
+    assert reachy.process_match is not None
+    assert "--sim" in reachy.process_match
     assert "--headless" not in reachy.start.get("args", [])
     assert "--no-media" not in reachy.start.get("args", [])
     assert reachy.start.get("gui") is True
@@ -86,6 +88,7 @@ def test_start_skips_healthy_service(monkeypatch: pytest.MonkeyPatch) -> None:
     llama = config.service("llama")
     assert llama is not None
     controller = StackController(config)
+    controller._owned = {}
     monkeypatch.setattr(
         controller,
         "health",
@@ -99,12 +102,14 @@ def test_start_skips_healthy_service(monkeypatch: pytest.MonkeyPatch) -> None:
         "control_dashboard.stack.proc.process_command_line",
         lambda _pid: "llama-server --host 127.0.0.1 --port 8080",
     )
+    monkeypatch.setattr("control_dashboard.stack.proc.pid_is_running", lambda _pid: True)
     monkeypatch.setattr(controller, "_save_owned", lambda: None)
     result = controller.start(llama)
     assert result["ok"] is True
     assert result["already_running"] is True
+    assert result["external"] is True
     started.assert_not_called()
-    assert controller._owned["llama"]["pid"] == 321
+    assert "llama" not in controller._owned
 
 
 def test_stop_refuses_unrelated_process(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -115,9 +120,12 @@ def test_stop_refuses_unrelated_process(monkeypatch: pytest.MonkeyPatch) -> None
     controller = StackController(config)
     controller._owned = {}
     monkeypatch.setattr("control_dashboard.stack.proc.listening_pids", lambda port: [4242])
+    monkeypatch.setattr("control_dashboard.stack.proc.pids_matching", lambda _pattern: [])
     monkeypatch.setattr("control_dashboard.stack.proc.process_command_line", lambda pid: "notepad.exe")
+    monkeypatch.setattr("control_dashboard.stack.proc.pid_is_running", lambda _pid: True)
     killed = MagicMock()
     monkeypatch.setattr("control_dashboard.stack.proc.stop_pid", killed)
+    monkeypatch.setattr(controller, "_save_stopped", lambda: None)
     result = controller.stop(llama)
     assert result["ok"] is False
     killed.assert_not_called()
@@ -128,6 +136,8 @@ def test_start_all_is_dependency_ordered() -> None:
     config = load_config()
     order = [spec.id for spec in topological(config.services) if spec.managed]
     assert order.index("llama") < order.index("speech")
+    assert order.index("speech") < order.index("hermes")
+    assert order.index("hermes") < order.index("reachy_daemon")
     assert order.index("speech") < order.index("conversation")
     assert order.index("reachy_daemon") < order.index("conversation")
 
@@ -161,11 +171,11 @@ def test_system_not_ready_names_offline_required_service() -> None:
 
 
 def test_reachy_offline_explains_missing_daemon(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Reachy offline copy must name localhost, mDNS, and the IP override."""
+    """Reachy offline copy must name the local simulator."""
     config = load_config()
     spec = config.service("reachy_daemon")
     assert spec is not None
-    monkeypatch.setattr("control_dashboard.checks._mdns_daemon_targets", lambda: [])
+    monkeypatch.setattr("control_dashboard.checks._configured_daemon_host", lambda _config: None)
     monkeypatch.setattr(
         "control_dashboard.net.host_resolves",
         lambda host: host not in {"reachy-mini.local"},
@@ -173,7 +183,7 @@ def test_reachy_offline_explains_missing_daemon(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr("control_dashboard.net.port_open", lambda *args, **kwargs: False)
     result = check_reachy_daemon(spec, config, {})
     assert result.status == STATUS_OFFLINE
-    assert "localhost:8000" in result.summary
+    assert "127.0.0.1:8000" in result.summary
     assert "virtual Reachy Mini" in result.summary
     assert "expected on port 8000" not in diagnose(spec, result, config)
 
@@ -259,6 +269,37 @@ def test_recover_does_not_restart_during_ready_window(monkeypatch: pytest.Monkey
     started.assert_not_called()
 
 
+def test_recover_restarts_conversation_inside_ready_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A crashed conversation app must be recovered even shortly after start."""
+    from datetime import datetime, timezone
+
+    from control_dashboard.stack import StackController
+
+    config = load_config()
+    controller = StackController(config)
+    controller._owned = {
+        "conversation": {
+            "pid": 1,
+            "started_by_dashboard": True,
+            "started_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+        }
+    }
+    monkeypatch.setattr("control_dashboard.stack.proc.pid_is_running", lambda _pid: False)
+    monkeypatch.setattr("control_dashboard.stack.proc.listening_pids", lambda _port: [])
+    monkeypatch.setattr("control_dashboard.stack.proc.pids_matching", lambda _pattern: [])
+    monkeypatch.setattr(
+        controller,
+        "health",
+        lambda spec, probe=False: HealthResult(STATUS_OFFLINE, "down"),
+    )
+    monkeypatch.setattr(controller, "_blocked_by", lambda _spec, **_k: [])
+    monkeypatch.setattr(controller, "_save_owned", lambda: None)
+    started = MagicMock(return_value={"ok": True, "status": STATUS_ONLINE})
+    monkeypatch.setattr(controller, "start", started)
+    controller.recover_once()
+    started.assert_called_once()
+
+
 def test_recover_adopts_listening_pid_when_wrapper_exits(monkeypatch: pytest.MonkeyPatch) -> None:
     """Once the daemon is healthy, replace the dead cmd.exe PID with the listener."""
     from control_dashboard.stack import StackController
@@ -266,9 +307,13 @@ def test_recover_adopts_listening_pid_when_wrapper_exits(monkeypatch: pytest.Mon
     config = load_config()
     controller = StackController(config)
     controller._owned = {"reachy_daemon": {"pid": 1, "started_at": "2026-08-29T09:58:34+10:00"}}
-    monkeypatch.setattr("control_dashboard.stack.proc.pid_is_running", lambda _pid: False)
+    monkeypatch.setattr("control_dashboard.stack.proc.pid_is_running", lambda pid: pid != 1)
     monkeypatch.setattr("control_dashboard.stack.proc.listening_pids", lambda _port: [555])
-    monkeypatch.setattr("control_dashboard.stack.proc.pids_matching", lambda _pattern: [])
+    monkeypatch.setattr("control_dashboard.stack.proc.pids_matching", lambda _pattern: [555])
+    monkeypatch.setattr(
+        "control_dashboard.stack.proc.process_command_line",
+        lambda _pid: "reachy-mini-daemon --sim --fastapi-port 8000",
+    )
     monkeypatch.setattr(
         controller,
         "health",
@@ -289,7 +334,7 @@ def test_recover_does_not_relaunch_when_sim_is_already_listening(monkeypatch: py
     config = load_config()
     controller = StackController(config)
     controller._owned = {"reachy_daemon": {"pid": 1, "started_at": "2020-01-01T00:00:00+10:00"}}
-    monkeypatch.setattr("control_dashboard.stack.proc.pid_is_running", lambda _pid: False)
+    monkeypatch.setattr("control_dashboard.stack.proc.pid_is_running", lambda pid: pid != 1)
     monkeypatch.setattr("control_dashboard.stack.proc.listening_pids", lambda _port: [777])
     monkeypatch.setattr("control_dashboard.stack.proc.pids_matching", lambda _pattern: [777])
     monkeypatch.setattr(
@@ -332,6 +377,10 @@ def test_start_adopts_booting_simulator_instead_of_spawning(monkeypatch: pytest.
     monkeypatch.setattr("control_dashboard.stack.proc.listening_pids", lambda _port: [])
     monkeypatch.setattr("control_dashboard.stack.proc.pids_matching", lambda _pattern: [888])
     monkeypatch.setattr("control_dashboard.stack.proc.pid_is_running", lambda _pid: True)
+    monkeypatch.setattr(
+        "control_dashboard.stack.proc.process_command_line",
+        lambda _pid: "reachy-mini-daemon --sim --fastapi-host 127.0.0.1 --fastapi-port 8000",
+    )
     started = MagicMock()
     monkeypatch.setattr("control_dashboard.stack.proc.start_process", started)
     stopped = MagicMock()
@@ -340,7 +389,8 @@ def test_start_adopts_booting_simulator_instead_of_spawning(monkeypatch: pytest.
     assert result["ok"] is True
     started.assert_not_called()
     stopped.assert_not_called()
-    assert controller._owned["reachy_daemon"]["pid"] == 888
+    assert "reachy_daemon" not in controller._owned
+    assert result["external"] is True
 
 
 def test_start_stops_leftover_matching_processes(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -367,6 +417,8 @@ def test_start_stops_leftover_matching_processes(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr("control_dashboard.stack.shutil_which", lambda exe: exe)
     monkeypatch.setattr("control_dashboard.stack.proc.pids_matching", lambda _pattern: [99])
     monkeypatch.setattr("control_dashboard.stack.proc.listening_pids", lambda _port: [])
+    monkeypatch.setattr("control_dashboard.stack.proc.pid_is_running", lambda _pid: True)
+    monkeypatch.setattr("control_dashboard.stack.proc.wait_until_gone", lambda _pid, timeout_s=8.0: True)
     monkeypatch.setattr(
         "control_dashboard.stack.proc.process_command_line",
         lambda _pid: "python -m reachy_mini_conversation_app.main --ui",
@@ -431,6 +483,7 @@ def test_start_waits_for_busy_speech_slot(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr("control_dashboard.stack.shutil_which", lambda exe: exe)
     monkeypatch.setattr("control_dashboard.stack.proc.pids_matching", lambda _pattern: [])
     monkeypatch.setattr("control_dashboard.stack.proc.listening_pids", lambda _port: [])
+    monkeypatch.setattr("control_dashboard.stack.proc.pid_is_running", lambda _pid: True)
     started = MagicMock(return_value=123)
     monkeypatch.setattr("control_dashboard.stack.proc.start_process", started)
     sleeps: list[float] = []
@@ -561,3 +614,387 @@ def test_blocked_by_rechecks_stale_cache_when_fresh(monkeypatch: pytest.MonkeyPa
     )
     assert controller._blocked_by(conversation)
     assert controller._blocked_by(conversation, fresh=True) == []
+
+
+def test_hermes_process_match_ignores_unrelated_commands() -> None:
+    """Hermes leftover detection must not match the conversation app or test files."""
+    from control_dashboard.proc import command_matches
+
+    config = load_config()
+    hermes = config.service("hermes")
+    assert hermes is not None and hermes.process_match
+    assert command_matches(
+        r"C:\Users\me\AppData\Local\hermes\bin\hermes.exe gateway start",
+        hermes.process_match,
+    )
+    assert command_matches(
+        '"C:\\Users\\me\\hermes-agent\\venv\\Scripts\\python.exe" -m hermes_cli.main gateway run',
+        hermes.process_match,
+    )
+    assert command_matches('"C:\\hermes.exe" gateway stop', hermes.process_match)
+    assert command_matches("hermes-gateway --port 8642", hermes.process_match)
+    assert not command_matches(
+        r'"C:\Users\me\AppData\Local\hermes\hermes-agent\apps\desktop\release\win-unpacked\Hermes.exe"',
+        hermes.process_match,
+    )
+    assert not command_matches("python -m hermes_cli.main serve --host 127.0.0.1 --port 0", hermes.process_match)
+    assert not command_matches("python -m reachy_mini_conversation_app.main --ui", hermes.process_match)
+    assert not command_matches("python tests/test_hermes_client.py", hermes.process_match)
+
+
+def test_stop_refuses_stale_owned_pid_reuse(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stored PID must not be killed after it has been reused by another process."""
+    config = load_config()
+    llama = config.service("llama")
+    assert llama is not None
+    controller = StackController(config)
+    controller._owned = {"llama": {"pid": 4242, "started_at": "2020-01-01T00:00:00+10:00"}}
+    monkeypatch.setattr("control_dashboard.stack.proc.listening_pids", lambda _port: [4242])
+    monkeypatch.setattr("control_dashboard.stack.proc.pids_matching", lambda _pattern: [])
+    monkeypatch.setattr("control_dashboard.stack.proc.process_command_line", lambda _pid: "notepad.exe")
+    monkeypatch.setattr("control_dashboard.stack.proc.pid_is_running", lambda _pid: True)
+    killed = MagicMock()
+    monkeypatch.setattr("control_dashboard.stack.proc.stop_pid", killed)
+    monkeypatch.setattr(controller, "_save_stopped", lambda: None)
+    result = controller.stop(llama)
+    assert result["ok"] is False
+    killed.assert_not_called()
+
+
+def test_start_reuses_running_hermes_without_killing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A live Hermes gateway must be adopted, not killed and relaunched."""
+    config = load_config()
+    hermes = config.service("hermes")
+    assert hermes is not None
+    controller = StackController(config)
+    controller._owned = {}
+    states = iter([HealthResult(STATUS_OFFLINE, "down"), HealthResult(STATUS_ONLINE, "up")])
+    monkeypatch.setattr(
+        controller,
+        "health",
+        lambda spec, probe=False: next(states, HealthResult(STATUS_ONLINE, "up")),
+    )
+    monkeypatch.setattr(controller, "_blocked_by", lambda _spec, **_k: [])
+    monkeypatch.setattr(controller, "_save_owned", lambda: None)
+    monkeypatch.setattr("control_dashboard.stack.proc.listening_pids", lambda _port: [555])
+    monkeypatch.setattr("control_dashboard.stack.proc.pids_matching", lambda _pattern: [555])
+    monkeypatch.setattr("control_dashboard.stack.proc.pid_is_running", lambda _pid: True)
+    monkeypatch.setattr(
+        "control_dashboard.stack.proc.process_command_line",
+        lambda _pid: '"C:\\Users\\me\\hermes-agent\\venv\\Scripts\\python.exe" -m hermes_cli.main gateway run',
+    )
+    started = MagicMock()
+    stopped = MagicMock()
+    monkeypatch.setattr("control_dashboard.stack.proc.start_process", started)
+    monkeypatch.setattr("control_dashboard.stack.proc.stop_pid", stopped)
+    monkeypatch.setattr("control_dashboard.stack.proc.run_logged", MagicMock(return_value=0))
+    result = controller.start(hermes)
+    assert result["ok"] is True
+    started.assert_not_called()
+    stopped.assert_not_called()
+    assert "hermes" not in controller._owned
+    assert result["external"] is True
+
+
+def test_recover_does_not_restart_hermes_after_unexpected_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hermes must not be auto-relaunched; unexpected exit is logged instead."""
+    config = load_config()
+    controller = StackController(config)
+    controller._owned = {"hermes": {"pid": 1, "started_at": "2020-01-01T00:00:00+10:00"}}
+    monkeypatch.setattr("control_dashboard.stack.proc.pid_is_running", lambda _pid: False)
+    monkeypatch.setattr("control_dashboard.stack.proc.listening_pids", lambda _port: [])
+    monkeypatch.setattr("control_dashboard.stack.proc.pids_matching", lambda _pattern: [])
+    monkeypatch.setattr(
+        controller,
+        "health",
+        lambda spec, probe=False: HealthResult(STATUS_OFFLINE, "down"),
+    )
+    monkeypatch.setattr(controller, "_blocked_by", lambda _spec, **_k: [])
+    monkeypatch.setattr(controller, "_save_owned", lambda: None)
+    started = MagicMock()
+    monkeypatch.setattr(controller, "start", started)
+    controller.recover_once()
+    started.assert_not_called()
+    unexpected = [item for item in controller._op_log if "UNEXPECTED EXIT" in item["message"]]
+    assert unexpected
+
+
+def test_stop_runs_hermes_stop_command_synchronously(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hermes gateway stop must finish before stop() returns, so it cannot kill a later start."""
+    config = load_config()
+    hermes = config.service("hermes")
+    assert hermes is not None
+    controller = StackController(config)
+    controller._owned = {"hermes": {"pid": 9, "started_at": "2020-01-01T00:00:00+10:00"}}
+    monkeypatch.setattr("control_dashboard.stack.proc.pid_is_running", lambda _pid: False)
+    monkeypatch.setattr("control_dashboard.stack.proc.listening_pids", lambda _port: [])
+    monkeypatch.setattr("control_dashboard.stack.proc.pids_matching", lambda _pattern: [])
+    monkeypatch.setattr("control_dashboard.stack.shutil_which", lambda exe: exe)
+    run_logged = MagicMock(return_value=0)
+    monkeypatch.setattr("control_dashboard.stack.proc.run_logged", run_logged)
+    detached = MagicMock()
+    monkeypatch.setattr("control_dashboard.stack.proc.start_process", detached)
+    monkeypatch.setattr(controller, "_save_owned", lambda: None)
+    monkeypatch.setattr(controller, "_save_stopped", lambda: None)
+    result = controller.stop(hermes)
+    assert result["ok"] is True
+    run_logged.assert_called_once()
+    assert run_logged.call_args.args[1] == ["gateway", "stop"]
+    detached.assert_not_called()
+
+
+def test_reachy_health_ignores_physical_robot_on_lan(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A wireless robot must not make the managed Reachy Mini card look online."""
+    config = load_config()
+    spec = config.service("reachy_daemon")
+    assert spec is not None
+    monkeypatch.setattr("control_dashboard.checks._configured_daemon_host", lambda _config: None)
+    monkeypatch.setattr("control_dashboard.net.host_resolves", lambda _host: True)
+    monkeypatch.setattr(
+        "control_dashboard.net.port_open",
+        lambda host, _port, timeout_s=1.0: host == "192.168.0.50",
+    )
+    monkeypatch.setattr(
+        "control_dashboard.checks.net.http_request",
+        lambda url, **_k: (
+            HttpResult(True, 200, '{"state":"ok"}', 1.0, None)
+            if "192.168.0.50" in url
+            else HttpResult(False, None, "", 1.0, "refused")
+        ),
+    )
+    result = check_reachy_daemon(spec, config, {})
+    assert result.status == STATUS_OFFLINE
+    assert "127.0.0.1:8000" in result.summary
+
+
+def test_start_does_not_adopt_physical_desktop_on_port_8000(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The Reachy Mini desktop app is not the MuJoCo simulator and must not be reused."""
+    config = load_config()
+    reachy = config.service("reachy_daemon")
+    assert reachy is not None
+    controller = StackController(config)
+    controller._owned = {}
+    monkeypatch.setattr(
+        controller,
+        "health",
+        lambda spec, probe=False: HealthResult(STATUS_OFFLINE, "down"),
+    )
+    monkeypatch.setattr(controller, "_blocked_by", lambda _spec, **_k: [])
+    monkeypatch.setattr(controller, "_save_owned", lambda: None)
+    monkeypatch.setattr(controller, "_save_stopped", lambda: None)
+    monkeypatch.setattr("control_dashboard.stack.proc.listening_pids", lambda _port: [999])
+    monkeypatch.setattr("control_dashboard.stack.proc.pids_matching", lambda _pattern: [])
+    monkeypatch.setattr("control_dashboard.stack.proc.pid_is_running", lambda _pid: True)
+    monkeypatch.setattr(
+        "control_dashboard.stack.proc.process_command_line",
+        lambda _pid: r"C:\Program Files\Reachy Mini\Reachy Mini.exe",
+    )
+    monkeypatch.setattr("control_dashboard.stack.shutil_which", lambda exe: exe)
+    started = MagicMock(return_value=123)
+    monkeypatch.setattr("control_dashboard.stack.proc.start_process", started)
+    result = controller.start(reachy)
+    assert result["ok"] is False
+    assert "Port 8000" in str(result.get("error"))
+    started.assert_not_called()
+
+
+def test_start_fails_fast_when_conversation_exits(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A conversation process that dies during connect must not hold Stop all for 90s."""
+    config = load_config()
+    conversation = config.service("conversation")
+    assert conversation is not None
+    controller = StackController(config)
+    monkeypatch.setattr(
+        controller,
+        "health",
+        lambda spec, probe=False: HealthResult(STATUS_OFFLINE, "down"),
+    )
+    monkeypatch.setattr(controller, "_blocked_by", lambda _spec, **_k: [])
+    monkeypatch.setattr(controller, "_save_owned", lambda: None)
+    monkeypatch.setattr(controller, "_save_stopped", lambda: None)
+    monkeypatch.setattr("control_dashboard.stack.shutil_which", lambda exe: exe)
+    monkeypatch.setattr("control_dashboard.stack.proc.pids_matching", lambda _pattern: [])
+    monkeypatch.setattr("control_dashboard.stack.proc.listening_pids", lambda _port: [])
+    monkeypatch.setattr("control_dashboard.stack.proc.pid_is_running", lambda _pid: False)
+    monkeypatch.setattr("control_dashboard.stack.proc.start_process", MagicMock(return_value=99))
+    monkeypatch.setattr(
+        "control_dashboard.stack.net.http_request",
+        lambda *_a, **_k: HttpResult(
+            True, 200, '{"size":1,"in_use":0,"units":[{"index":0,"state":"idle"}]}', 1.0, None
+        ),
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr("control_dashboard.stack.time.sleep", lambda seconds: sleeps.append(seconds))
+    result = controller.start(conversation)
+    assert result["ok"] is False
+    assert "exited before becoming healthy" in str(result.get("error"))
+    assert 2.0 not in sleeps
+
+
+def test_user_stopped_survives_controller_reload(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stop all must still suppress auto-restart after the dashboard process restarts."""
+    from control_dashboard import paths as dashboard_paths
+
+    stopped_path = tmp_path / "stopped.json"
+    monkeypatch.setattr(dashboard_paths, "STOPPED_PATH", stopped_path)
+    config = load_config()
+    first = StackController(config)
+    conversation = config.service("conversation")
+    assert conversation is not None
+    first._mark_user_stopped(conversation)
+    second = StackController(config)
+    assert "conversation" in second._user_stopped
+
+
+def test_reachy_health_rejects_physical_daemon_on_localhost(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A wireless robot answering on 127.0.0.1:8000 is not the managed simulator."""
+    config = load_config()
+    spec = config.service("reachy_daemon")
+    assert spec is not None
+    monkeypatch.setattr("control_dashboard.checks._configured_daemon_host", lambda _config: None)
+    monkeypatch.setattr("control_dashboard.net.host_resolves", lambda _host: True)
+    monkeypatch.setattr("control_dashboard.net.port_open", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        "control_dashboard.checks.net.http_request",
+        lambda _url, **_k: HttpResult(
+            True,
+            200,
+            '{"state":"stopped","wireless_version":true,"simulation_enabled":false,"desktop_app_daemon":false}',
+            1.0,
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        "control_dashboard.checks._process_snapshot",
+        lambda *_a, **_k: {"pids": [9], "command": "Reachy Mini.exe", "name": "Reachy Mini.exe"},
+    )
+    result = check_reachy_daemon(spec, config, {})
+    assert result.status == STATUS_OFFLINE
+    assert "physical" in result.summary.lower()
+
+
+def test_reachy_health_accepts_local_simulator_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    """GET /api/daemon/status with simulation_enabled is the local simulator."""
+    config = load_config()
+    spec = config.service("reachy_daemon")
+    assert spec is not None
+    monkeypatch.setattr("control_dashboard.checks._configured_daemon_host", lambda _config: None)
+    monkeypatch.setattr("control_dashboard.net.host_resolves", lambda _host: True)
+    monkeypatch.setattr("control_dashboard.net.port_open", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        "control_dashboard.checks.net.http_request",
+        lambda _url, **_k: HttpResult(
+            True,
+            200,
+            '{"state":"running","wireless_version":false,"simulation_enabled":true}',
+            1.0,
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        "control_dashboard.checks._process_snapshot",
+        lambda *_a, **_k: {
+            "pids": [8],
+            "command": "reachy-mini-daemon --sim --fastapi-port 8000",
+            "name": "reachy-mini-daemon.exe",
+            "match": True,
+        },
+    )
+    result = check_reachy_daemon(spec, config, {})
+    assert result.status == STATUS_ONLINE
+    assert result.details.get("environment") == "simulator"
+
+
+def test_reachy_health_ignores_mdns_physical_robot(monkeypatch: pytest.MonkeyPatch) -> None:
+    """reachy-mini.local must not make the managed Reachy Mini card look online."""
+    config = load_config()
+    spec = config.service("reachy_daemon")
+    assert spec is not None
+    monkeypatch.setattr("control_dashboard.checks._configured_daemon_host", lambda _config: None)
+    monkeypatch.setattr("control_dashboard.net.host_resolves", lambda _host: True)
+    monkeypatch.setattr(
+        "control_dashboard.net.port_open",
+        lambda host, _port, timeout_s=1.0: host == "reachy-mini.local",
+    )
+    monkeypatch.setattr(
+        "control_dashboard.checks.net.http_request",
+        lambda url, **_k: (
+            HttpResult(
+                True,
+                200,
+                '{"state":"stopped","wireless_version":true,"simulation_enabled":false}',
+                1.0,
+                None,
+            )
+            if "reachy-mini.local" in url
+            else HttpResult(False, None, "", 1.0, "refused")
+        ),
+    )
+    result = check_reachy_daemon(spec, config, {})
+    assert result.status == STATUS_OFFLINE
+    assert "127.0.0.1:8000" in result.summary
+
+
+def test_stop_all_stops_matching_simulator_even_if_external(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stop all must stop a local --sim daemon, including one this dashboard did not start."""
+    config = load_config()
+    reachy = config.service("reachy_daemon")
+    assert reachy is not None
+    controller = StackController(config)
+    controller._owned = {}
+    monkeypatch.setattr("control_dashboard.stack.proc.listening_pids", lambda _port: [777])
+    monkeypatch.setattr("control_dashboard.stack.proc.pids_matching", lambda _pattern: [777])
+    monkeypatch.setattr(
+        "control_dashboard.stack.proc.process_command_line",
+        lambda _pid: "reachy-mini-daemon --sim --fastapi-port 8000",
+    )
+    monkeypatch.setattr("control_dashboard.stack.proc.pid_is_running", lambda _pid: True)
+    monkeypatch.setattr("control_dashboard.stack.proc.wait_until_gone", lambda _pid, timeout_s=8.0: True)
+    killed = MagicMock()
+    monkeypatch.setattr("control_dashboard.stack.proc.stop_pid", killed)
+    monkeypatch.setattr(controller, "_save_owned", lambda: None)
+    monkeypatch.setattr(controller, "_save_stopped", lambda: None)
+    monkeypatch.setattr(controller, "_wait_for_port_free", lambda _spec: None)
+    result = controller.stop(reachy)
+    assert result["ok"] is True
+    killed.assert_called_once_with(777)
+    assert 777 in result.get("stopped_pids", [])
+
+
+def test_conversation_start_surfaces_log_error(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Conversation startup failure must include the captured log error."""
+    from control_dashboard import paths as dashboard_paths
+
+    monkeypatch.setattr(dashboard_paths, "LOG_DIR", tmp_path)
+    log_path = tmp_path / "conversation.log"
+    log_path.write_text(
+        "Connection failed: Reachy Mini simulator is not listening on 127.0.0.1:8000.\n",
+        encoding="utf-8",
+    )
+    config = load_config()
+    conversation = config.service("conversation")
+    assert conversation is not None
+    controller = StackController(config)
+    monkeypatch.setattr(
+        controller,
+        "health",
+        lambda spec, probe=False: HealthResult(STATUS_OFFLINE, "down"),
+    )
+    monkeypatch.setattr(controller, "_blocked_by", lambda _spec, **_k: [])
+    monkeypatch.setattr(controller, "_save_owned", lambda: None)
+    monkeypatch.setattr(controller, "_save_stopped", lambda: None)
+    monkeypatch.setattr("control_dashboard.stack.shutil_which", lambda exe: exe)
+    monkeypatch.setattr("control_dashboard.stack.proc.pids_matching", lambda _pattern: [])
+    monkeypatch.setattr("control_dashboard.stack.proc.listening_pids", lambda _port: [])
+    monkeypatch.setattr("control_dashboard.stack.proc.pid_is_running", lambda _pid: False)
+    monkeypatch.setattr("control_dashboard.stack.proc.start_process", MagicMock(return_value=99))
+    monkeypatch.setattr(
+        "control_dashboard.stack.net.http_request",
+        lambda *_a, **_k: HttpResult(
+            True, 200, '{"size":1,"in_use":0,"units":[{"index":0,"state":"idle"}]}', 1.0, None
+        ),
+    )
+    result = controller.start(conversation)
+    assert result["ok"] is False
+    assert "exited before becoming healthy" in str(result.get("error"))
+    assert "127.0.0.1:8000" in str(result.get("technical"))

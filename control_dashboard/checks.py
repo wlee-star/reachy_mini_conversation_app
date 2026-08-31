@@ -316,9 +316,18 @@ def check_conversation(spec: ServiceSpec, config: DashboardConfig, extra: dict[s
     """Check the conversation app UI port and process."""
     host = spec.host or "127.0.0.1"
     port = spec.port or 7860
-    process = _process_snapshot(spec)
+    process = _process_snapshot(spec, include_command=True)
     ui_up = net.port_open(host, port)
     if ui_up:
+        if process.get("match") is False:
+            occupant = process.get("command") or process.get("name") or f"pid {process.get('pids')}"
+            return HealthResult(
+                STATUS_DEGRADED,
+                f"Port {port} is open, but the listener is not the conversation app.",
+                details={"port": port, "ui": False, "process": process, "occupant": occupant},
+                technical=str(occupant),
+                suggested_action="Stop the process occupying port 7860, then start the conversation app",
+            )
         page = net.http_request(f"http://{host}:{port}/", timeout_s=4.0)
         return HealthResult(
             STATUS_ONLINE if page.ok or page.status_code else STATUS_DEGRADED,
@@ -329,10 +338,6 @@ def check_conversation(spec: ServiceSpec, config: DashboardConfig, extra: dict[s
             latency_ms=round(page.latency_ms, 1),
             technical=None if page.ok or page.status_code else page.error,
         )
-    # Console-only: look for a matching process without the UI port.
-    if spec.process_match:
-        # Port snapshot is empty; we cannot cheaply scan all PIDs. Treat as offline.
-        pass
     return HealthResult(
         STATUS_OFFLINE,
         f"Conversation app UI is not listening on {host}:{port}.",
@@ -342,8 +347,9 @@ def check_conversation(spec: ServiceSpec, config: DashboardConfig, extra: dict[s
     )
 
 
-_MDNS_CACHE: tuple[float, list[tuple[str, int]]] | None = None
-_MDNS_TTL_S = 20.0
+def _is_loopback_host(host: str) -> bool:
+    name = host.strip().strip("[]").lower()
+    return name in {"localhost", "127.0.0.1", "::1", "0.0.0.0"} or name.startswith("127.")
 
 
 def _configured_daemon_host(config: DashboardConfig) -> str | None:
@@ -356,41 +362,34 @@ def _configured_daemon_host(config: DashboardConfig) -> str | None:
     return raw.split(":", 1)[0] or None
 
 
-def _mdns_daemon_targets() -> list[tuple[str, int]]:
-    """Discover wireless/LAN daemons via the Reachy Mini SDK mDNS helper."""
-    global _MDNS_CACHE
-    now = time.time()
-    if _MDNS_CACHE is not None and now - _MDNS_CACHE[0] < _MDNS_TTL_S:
-        return _MDNS_CACHE[1]
-    targets: list[tuple[str, int]] = []
-    try:
-        from reachy_mini.utils.discovery import find_robots
-    except ImportError:
-        _MDNS_CACHE = (now, targets)
-        return targets
-    try:
-        robots = find_robots(timeout=2.0)
-    except Exception as exc:
-        logger.warning("Reachy mDNS discovery failed: %s", exc)
-        _MDNS_CACHE = (now, targets)
-        return targets
-    seen: set[tuple[str, int]] = set()
-    for robot in robots:
-        port = int(getattr(robot, "port", None) or 8000)
-        candidates = [getattr(robot, "host", None), *list(getattr(robot, "addresses", None) or [])]
-        for candidate in candidates:
-            if not isinstance(candidate, str) or not candidate.strip():
-                continue
-            item = (candidate.strip(), port)
-            if item not in seen:
-                seen.add(item)
-                targets.append(item)
-    _MDNS_CACHE = (now, targets)
-    return targets
+def _daemon_environment(payload: dict[str, Any]) -> str:
+    if payload.get("simulation_enabled") is True:
+        return "simulator"
+    if payload.get("wireless_version") is True or payload.get("desktop_app_daemon") is True:
+        return "physical"
+    if payload.get("simulation_enabled") is False:
+        return "physical"
+    return "unknown"
 
 
-def _probe_daemon_http(host: str, port: int) -> HealthResult | None:
-    timeout_s = 0.4 if host in {"127.0.0.1", "localhost"} else 1.2
+def _daemon_state_value(payload: dict[str, Any]) -> str | None:
+    state = payload.get("state") if payload.get("state") is not None else payload.get("status")
+    if state is None:
+        return None
+    return str(state)
+
+
+def _local_sim_listener(spec: ServiceSpec) -> int | None:
+    if spec.port is None or not spec.process_match:
+        return None
+    for pid in proc.listening_pids(spec.port):
+        if proc.pid_matches_pattern(pid, spec.process_match):
+            return pid
+    return None
+
+
+def _probe_daemon_http(host: str, port: int) -> HealthResult:
+    timeout_s = 0.4 if _is_loopback_host(host) else 1.2
     if not net.host_resolves(host):
         return HealthResult(
             STATUS_OFFLINE,
@@ -406,25 +405,30 @@ def _probe_daemon_http(host: str, port: int) -> HealthResult | None:
             technical=f"{host}:{port} refused TCP",
         )
     result = net.http_request(f"http://{host}:{port}/api/daemon/status", timeout_s=4.0)
+    payload = net.json_payload(result) or {}
+    environment = _daemon_environment(payload) if payload else "unknown"
+    details = {
+        "host": host,
+        "port": port,
+        "sdk_daemon": bool(result.ok),
+        "environment": environment,
+        "simulation_enabled": payload.get("simulation_enabled"),
+        "wireless_version": payload.get("wireless_version"),
+        "desktop_app_daemon": payload.get("desktop_app_daemon"),
+        "state": _daemon_state_value(payload),
+    }
     if result.ok:
-        payload = net.json_payload(result) or {}
         return HealthResult(
             STATUS_ONLINE,
             f"Reachy Mini daemon is reachable at {host}:{port}.",
-            details={
-                "host": host,
-                "port": port,
-                "sdk_daemon": True,
-                "robot_reachable": True,
-                "state": payload.get("state") or payload.get("status") or payload,
-            },
+            details={**details, "robot_reachable": True},
             latency_ms=round(result.latency_ms, 1),
         )
     if result.status_code:
         return HealthResult(
             STATUS_DEGRADED,
             f"Daemon HTTP at {host}:{port} responded with {result.status_code}.",
-            details={"host": host, "port": port, "sdk_daemon": True, "robot_reachable": False},
+            details={**details, "sdk_daemon": True, "robot_reachable": False},
             technical=result.error or f"HTTP {result.status_code}",
             latency_ms=round(result.latency_ms, 1),
         )
@@ -436,66 +440,118 @@ def _probe_daemon_http(host: str, port: int) -> HealthResult | None:
     )
 
 
-def check_reachy_daemon(spec: ServiceSpec, config: DashboardConfig, extra: dict[str, Any]) -> HealthResult:
-    """Check the Reachy Mini daemon status endpoint without moving motors."""
-    port = spec.port or 8000
-    hosts: list[str] = []
-    for candidate in (spec.host, "127.0.0.1", "localhost", _configured_daemon_host(config), *spec.fallback_hosts):
-        if candidate and candidate not in hosts:
-            hosts.append(candidate)
-
-    last_error = "no hosts tried"
-    unresolved: list[str] = []
-    refused: list[str] = []
-    tried = list(hosts)
-
-    def consider(host: str, probe_port: int) -> HealthResult | None:
-        nonlocal last_error
-        probed = _probe_daemon_http(host, probe_port)
-        if probed.status in {STATUS_ONLINE, STATUS_DEGRADED}:
-            return probed
-        last_error = probed.technical or probed.summary
-        if probed.details.get("unresolved"):
-            unresolved.append(host)
-        else:
-            refused.append(f"{host}:{probe_port}")
+def _accept_local_simulator(spec: ServiceSpec, probed: HealthResult) -> HealthResult | None:
+    """Return a local-sim health result, or None if this answer is not the simulator."""
+    if probed.status not in {STATUS_ONLINE, STATUS_DEGRADED}:
         return None
+    environment = str(probed.details.get("environment") or "unknown")
+    if environment == "simulator" or (environment == "unknown" and _local_sim_listener(spec) is not None):
+        details = {
+            **probed.details,
+            "environment": "simulator",
+            "sdk_daemon": True,
+            "robot_reachable": True,
+            "process": _process_snapshot(spec, include_command=True),
+        }
+        state = probed.details.get("state")
+        if state is not None and str(state).lower() in {"stopped", "stopping", "error"}:
+            return HealthResult(
+                STATUS_DEGRADED,
+                f"Local Reachy Mini simulator is answering, but daemon state is {state}.",
+                details=details,
+                technical=f"state={state}",
+                latency_ms=probed.latency_ms,
+                suggested_action="Restart Reachy Mini",
+            )
+        return HealthResult(
+            STATUS_ONLINE,
+            "Local Reachy Mini simulator is answering GET /api/daemon/status.",
+            details=details,
+            latency_ms=probed.latency_ms,
+        )
+    if environment == "physical":
+        return HealthResult(
+            STATUS_OFFLINE,
+            "Port 8000 is a physical Reachy Mini daemon, not the local MuJoCo simulator.",
+            details={
+                **probed.details,
+                "sdk_daemon": True,
+                "robot_reachable": False,
+                "process": _process_snapshot(spec, include_command=True),
+            },
+            technical="simulation_enabled=false",
+            suggested_action="Close the Reachy Mini desktop app, then start the simulator from this dashboard.",
+            latency_ms=probed.latency_ms,
+        )
+    if probed.status in {STATUS_ONLINE, STATUS_DEGRADED}:
+        return HealthResult(
+            STATUS_OFFLINE,
+            "Something answered /api/daemon/status on 127.0.0.1:8000, but it is not the MuJoCo simulator.",
+            details={
+                **probed.details,
+                "sdk_daemon": False,
+                "robot_reachable": False,
+                "process": _process_snapshot(spec, include_command=True),
+            },
+            technical=probed.technical,
+            suggested_action="Close the process on port 8000 if it is not reachy-mini-daemon --sim.",
+            latency_ms=probed.latency_ms,
+        )
+    return None
 
-    for host in hosts:
-        matched = consider(host, port)
-        if matched is not None:
-            return matched
 
-    for mdns_host, mdns_port in _mdns_daemon_targets():
-        if mdns_host not in tried:
-            tried.append(mdns_host)
-        matched = consider(mdns_host, mdns_port)
-        if matched is not None:
-            return matched
+def check_reachy_daemon(spec: ServiceSpec, config: DashboardConfig, extra: dict[str, Any]) -> HealthResult:
+    """Check the local Reachy Mini simulator, or an explicit REACHY_DAEMON_HOST."""
+    port = spec.port or 8000
+    configured = _configured_daemon_host(config)
+    if configured and not _is_loopback_host(configured):
+        probed = _probe_daemon_http(configured, port)
+        if probed.status in {STATUS_ONLINE, STATUS_DEGRADED}:
+            details = {**probed.details, "robot_reachable": probed.status == STATUS_ONLINE}
+            return HealthResult(
+                probed.status,
+                probed.summary,
+                details=details,
+                latency_ms=probed.latency_ms,
+                technical=probed.technical,
+            )
+        return HealthResult(
+            STATUS_OFFLINE,
+            (
+                f"No Reachy Mini daemon is answering at {configured}:{port}. "
+                "Check REACHY_DAEMON_HOST, or clear it to use the virtual simulator."
+            ),
+            details={
+                "port": port,
+                "sdk_daemon": False,
+                "robot_reachable": False,
+                "tried_hosts": [configured],
+                "environment": "physical",
+            },
+            technical=probed.technical or probed.summary,
+            suggested_action="Check REACHY_DAEMON_HOST, or clear it to use the virtual simulator",
+        )
 
-    bits = ["No Reachy Mini daemon is answering on this PC or the LAN."]
-    if "127.0.0.1:8000" in refused or "localhost:8000" in refused:
-        bits.append("Nothing is listening on localhost:8000 (Reachy Mini Control / USB daemon is not running).")
-    if "reachy-mini.local" in unresolved:
-        bits.append("Windows could not resolve reachy-mini.local; that is common without working mDNS.")
-    if not _mdns_daemon_targets():
-        bits.append("No robot advertised itself on the LAN via mDNS.")
-    bits.append(
-        "Use Start on this card (or Start all) to launch the virtual Reachy Mini simulator, "
-        "or set REACHY_DAEMON_HOST to a physical robot's Wi-Fi IP."
-    )
+    probed = _probe_daemon_http("127.0.0.1", port)
+    accepted = _accept_local_simulator(spec, probed)
+    if accepted is not None:
+        return accepted
+
     return HealthResult(
         STATUS_OFFLINE,
-        " ".join(bits),
+        (
+            "The local Reachy Mini simulator is not listening on 127.0.0.1:8000. "
+            "Use Start on this card (or Start all) to launch the virtual Reachy Mini simulator."
+        ),
         details={
             "port": port,
             "sdk_daemon": False,
             "robot_reachable": False,
-            "tried_hosts": tried,
-            "unresolved": unresolved,
-            "refused": refused,
+            "tried_hosts": ["127.0.0.1"],
+            "environment": None,
+            "process": _process_snapshot(spec, include_command=True),
         },
-        technical=last_error,
+        technical=probed.technical or probed.summary,
         suggested_action="Start the virtual Reachy Mini simulator",
     )
 

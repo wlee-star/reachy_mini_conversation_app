@@ -1,0 +1,108 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reachy_mini_conversation_app"
+version = "1.0.1"
+authors = [{ name = "Pollen Robotics", email = "contact@pollen-robotics.com" }]
+description = ""
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "huggingface-hub>=1.17.0",
+    "httpx>=0.28.1",
+
+    #Environment variables
+    "python-dotenv",
+
+    #OpenAI (used by the Hugging Face backend)
+    "openai==2.28.0",
+
+    #Reachy mini
+    "reachy_mini_dances_library",
+    "reachy-mini>=1.10.0rc5",
+    "mcp>=1.27.1,<2",
+]
+
+[dependency-groups]
+dev = [
+  "allure-pytest==2.16.0",
+  "pytest",
+  "pytest-asyncio",
+  "pytest-cov==7.1.0",
+  "ruff==0.15.20",
+  "mypy==2.2.0",
+  "pre-commit",
+]
+
+[project.scripts]
+reachy-mini-conversation-app = "reachy_mini_conversation_app.main:main"
+
+[tool.uv]
+exclude-newer = "7 days"
+
+[tool.uv.exclude-newer-package]
+"reachy-mini" = false
+"reachy-mini-dances-library" = false
+
+[project.entry-points."reachy_mini_apps"]
+reachy_mini_conversation_app = "reachy_mini_conversation_app.main:ReachyMiniConversationApp"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+reachy_mini_conversation_app = [
+  "static/**/*",
+  ".env.example",
+]
+reachy_talk_data = [
+  "profiles/**/*.md",
+]
+
+[tool.ruff]
+line-length = 119
+exclude = [".venv", "dist", "build", "**/__pycache__", "*.egg-info", ".mypy_cache", ".pytest_cache"]
+
+[tool.ruff.lint]
+select = [
+  "E",   # pycodestyle errors
+  "F",   # pyflakes
+  "W",   # pycodestyle warnings
+  "I",   # isort
+  "C4",  # flake8-comprehensions
+  "D",   # pydocstyle
+]
+ignore = [
+  "E501",  # handled by formatter
+  "D100",  # ignore missing module docstrings
+  "D203",  # blank line before class docstring (conflicts with D211)
+  "D213",  # summary on second line (conflicts with D212)
+]
+
+[tool.ruff.lint.isort]
+length-sort = true
+lines-after-imports = 2
+no-lines-before = ["standard-library", "local-folder"]
+known-local-folder = ["reachy_mini_conversation_app"]
+known-first-party = ["reachy_mini", "reachy_mini_dances_library"]
+split-on-trailing-comma = true
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src/"]
+ignore_missing_imports = true
+strict = true
+show_error_codes = true
+warn_unused_ignores = true

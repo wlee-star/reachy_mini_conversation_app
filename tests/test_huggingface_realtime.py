@@ -1,5 +1,6 @@
 import json
 import time
+import base64
 import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -9,17 +10,39 @@ import pytest
 import reachy_mini_conversation_app.conversation_handler as conv_mod
 import reachy_mini_conversation_app.huggingface_realtime as hf_mod
 from reachy_mini_conversation_app.config import config, get_default_voice
+from reachy_mini_conversation_app.streaming import AdditionalOutputs
 from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
 from reachy_mini_conversation_app.huggingface_realtime import (
     _HERMES_SPEECH_FALLBACK,
     RealtimeSessionSlotsBusy,
     HuggingFaceRealtimeHandler,
+    _hermes_result_text,
 )
 from reachy_mini_conversation_app.tools.home_assistant import HomeAssistant
 from reachy_mini_conversation_app.tools.background_tool_manager import ToolState, ToolNotification
 
 
 HF_DEFAULT_VOICE = get_default_voice()
+
+
+def test_hermes_result_text_prefers_report_over_errors() -> None:
+    """A structured reef history report is spoken instead of a vague retry line."""
+    assert _hermes_result_text({"report": "Reef stable - temp 24.0C.", "error": "no"}) == "Reef stable - temp 24.0C."
+    assert (
+        _hermes_result_text({"status": "error", "trend_available": False})
+        == "Historical reef data is currently unavailable."
+    )
+
+
+@pytest.fixture(autouse=True)
+def _skip_boot_diagnostic(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Existing realtime tests must not run live startup diagnostics."""
+
+    async def _fake_boot(_deps: object, _speak: object) -> bool:
+        return True
+
+    monkeypatch.setattr(hf_mod, "deliver_boot_sequence", _fake_boot)
+    monkeypatch.setattr(hf_mod, "boot_sequence_already_delivered", lambda: False)
 
 
 class _FakeEvent:
@@ -36,6 +59,7 @@ def _make_fake_realtime_client(
     events: tuple[_FakeEvent, ...] = (),
     captured_update: dict[str, Any] | None = None,
     captured_connect: dict[str, Any] | None = None,
+    captured_cancels: list[int] | None = None,
     update_errors: list[BaseException] | None = None,
 ) -> Any:
     """Build a fake AsyncOpenAI-shaped client whose realtime session yields `events`.
@@ -60,7 +84,8 @@ def _make_fake_realtime_client(
             pass
 
         async def cancel(self, **_kw: Any) -> None:
-            pass
+            if captured_cancels is not None:
+                captured_cancels.append(1)
 
     class FakeConversation:
         item = FakeNoop()
@@ -174,6 +199,37 @@ def _fake_pool_client(payload: dict[str, Any]) -> type:
             return FakeResponse()
 
     return FakeAsyncClient
+
+
+def _drain_handler_outputs(handler: HuggingFaceRealtimeHandler) -> list[object]:
+    """Return every item currently sitting on the handler output queue."""
+    items: list[object] = []
+    while not handler.output_queue.empty():
+        items.append(handler.output_queue.get_nowait())
+    return items
+
+
+def _assistant_transcripts(items: list[object]) -> list[str]:
+    """Return assistant transcript strings from queued AdditionalOutputs."""
+    transcripts: list[str] = []
+    for item in items:
+        if not isinstance(item, AdditionalOutputs):
+            continue
+        for message in item.args:
+            content = message.get("content")
+            if message.get("role") == "assistant" and isinstance(content, str):
+                transcripts.append(content)
+    return transcripts
+
+
+def _audio_frame_count(items: list[object]) -> int:
+    """Return how many PCM frames were queued for playback."""
+    return sum(1 for item in items if isinstance(item, tuple))
+
+
+def _silent_pcm_delta() -> str:
+    """Return a tiny silent PCM frame encoded like a realtime audio delta."""
+    return base64.b64encode(b"\x00\x00" * 16).decode("ascii")
 
 
 @pytest.mark.asyncio
@@ -397,6 +453,25 @@ async def test_play_device_success_emotion_queues_success_once(monkeypatch: Any)
 
 
 @pytest.mark.asyncio
+async def test_play_bus_helpful1_uses_existing_play_emotion(monkeypatch: Any) -> None:
+    """The 311 10-minute callback reuses play_emotion and the session Reachy connection."""
+    play_calls: list[tuple[ToolDependencies, dict[str, Any]]] = []
+    deps = ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock())
+
+    class FakePlayEmotion:
+        async def __call__(self, tool_deps: ToolDependencies, **kwargs: Any) -> dict[str, Any]:
+            play_calls.append((tool_deps, kwargs))
+            return {"status": "queued", "emotion": "helpful1"}
+
+    monkeypatch.setattr(hf_mod, "PlayEmotion", FakePlayEmotion)
+    handler = HuggingFaceRealtimeHandler(deps)
+
+    await handler._play_bus_helpful1()
+
+    assert play_calls == [(deps, {"emotion": "helpful1", "allow_random": False})]
+
+
+@pytest.mark.asyncio
 async def test_success_emotion_tool_skipped_when_device_control_owns_turn(monkeypatch: Any) -> None:
     """LLM play_emotion(success) must not add a second success animation after device control."""
     monkeypatch.setattr(hf_mod.core_tools, "get_tools", lambda: {"play_emotion": hf_mod.PlayEmotion()})
@@ -534,6 +609,531 @@ async def test_start_fast_bus_command_ignores_unrelated_speech(monkeypatch: Any)
 
 
 @pytest.mark.asyncio
+async def test_start_fast_apex_command_queries_live_status(monkeypatch: Any) -> None:
+    """A live reef request should call Apex immediately, without waiting for the LLM."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    run = AsyncMock()
+    monkeypatch.setattr(handler, "_run_fast_apex_command", run)
+
+    handler._start_fast_apex_command("What is my LLSATO value?")
+    assert handler._fast_apex_task is not None
+    assert handler._suppress_unsolicited_response_turn == handler._turn_generation
+    assert handler._reef_router_owns_turn == handler._turn_generation
+    await handler._fast_apex_task
+
+    run.assert_awaited_once_with("llsato")
+
+
+@pytest.mark.asyncio
+async def test_start_fast_apex_command_ignores_unrelated_speech(monkeypatch: Any) -> None:
+    """Non-reef speech must not start the Apex fast path."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    run = AsyncMock()
+    monkeypatch.setattr(handler, "_run_fast_apex_command", run)
+
+    handler._start_fast_apex_command("what's the weather")
+
+    run.assert_not_awaited()
+    assert handler._fast_apex_task is None
+    assert handler._reef_router_owns_turn is None
+
+
+@pytest.mark.asyncio
+async def test_start_fast_apex_command_routes_report_to_hermes(monkeypatch: Any) -> None:
+    """Report/trend questions must not use the local Apex status fast-path."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    apex_run = AsyncMock()
+    hermes_run = AsyncMock()
+    monkeypatch.setattr(handler, "_run_fast_apex_command", apex_run)
+    monkeypatch.setattr(handler, "_run_fast_hermes_reef_command", hermes_run)
+
+    handler._start_fast_apex_command("Can you give me a reef tank report?")
+    assert handler._fast_apex_task is None
+    assert handler._fast_hermes_reef_task is not None
+    assert handler._suppress_unsolicited_response_turn == handler._turn_generation
+    assert handler._reef_router_owns_turn == handler._turn_generation
+    await handler._fast_hermes_reef_task
+
+    apex_run.assert_not_awaited()
+    hermes_run.assert_awaited_once()
+    assert hermes_run.await_args.args[1] == "detailed_report"
+    assert hermes_run.await_args.args[2] is False
+
+
+@pytest.mark.asyncio
+async def test_start_fast_apex_command_routes_trends_to_hermes(monkeypatch: Any) -> None:
+    """Trend questions are handed to Hermes, not current Apex readings."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    apex_run = AsyncMock()
+    hermes_run = AsyncMock()
+    monkeypatch.setattr(handler, "_run_fast_apex_command", apex_run)
+    monkeypatch.setattr(handler, "_run_fast_hermes_reef_command", hermes_run)
+
+    handler._start_fast_apex_command("Can you give me a reef trending report?")
+    assert handler._fast_hermes_reef_task is not None
+    assert handler._reef_router_owns_turn == handler._turn_generation
+    await handler._fast_hermes_reef_task
+
+    apex_run.assert_not_awaited()
+    hermes_run.assert_awaited_once()
+    assert hermes_run.await_args.args[1] == "trends"
+    assert hermes_run.await_args.args[2] is False
+
+
+@pytest.mark.asyncio
+async def test_hermes_reef_fast_path_speaks_cached_report(monkeypatch: Any, caplog: pytest.LogCaptureFixture) -> None:
+    """A valid Hermes cache is spoken through ask_hermes without a live gateway call."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler._turn_generation = 1
+    create = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", create)
+    send = AsyncMock()
+    monkeypatch.setattr("reachy_mini_conversation_app.hermes_client.send_to_hermes", send)
+    monkeypatch.setattr(
+        "reachy_mini_conversation_app.hermes_client.load_latest_reef_thread",
+        lambda path=None: {
+            "report": "Reef stable - temp 24.0C (-0.012/6h).",
+            "source": "hermes",
+            "trends": {
+                "Tmp": {"trend_6h": -0.0118, "trend_str": "-0.012/6h"},
+                "pH": {"trend_6h": 0.0118, "trend_str": "+0.012/6h"},
+                "ORP": {"trend_6h": -0.4714, "trend_str": "-0.471/6h"},
+                "FS100": {"trend_6h": 0.4716, "trend_str": "+0.471/6h"},
+                "LLSATO": {"trend_6h": -0.0002, "trend_str": "-0.000/6h"},
+            },
+            "handoff": {"for_reachy": {"ask_first": True, "source": "hermes"}},
+        },
+    )
+
+    with caplog.at_level("INFO"):
+        await handler._run_fast_hermes_reef_command("Can you give me a reef trending report?", "trends")
+
+    send.assert_not_awaited()
+    created = handler.connection.conversation.item.create
+    created.assert_awaited_once()
+    spoken_prompt = created.await_args.kwargs["item"]["content"][0]["text"]
+    assert "Reef stable - temp 24.0C (-0.012/6h)." in spoken_prompt
+    create.assert_awaited_once_with(reason="say", response={"tool_choice": "none"})
+    assert handler._hermes_spoke_turn == 1
+    assert handler._suppress_unsolicited_response_turn == 1
+    assert handler._last_reef_response_source == "hermes"
+    assert handler._last_reef_response_type == "trends"
+    assert handler._last_reef_response_route == "ask_hermes"
+    assert "[REEF_ROUTER] intent=trends" in caplog.text
+    assert "[REEF_ROUTER] route=ask_hermes" in caplog.text
+    assert "[REEF_ROUTER] source=hermes" in caplog.text
+    assert "[REEF_ROUTER] source_type=cached_trends" in caplog.text
+    assert "[REEF_ROUTER] cache_used=true" in caplog.text
+    assert "[REEF_ROUTER] response_owner=ask_hermes" in caplog.text
+    assert "[REEF_ROUTER] normal_llm_bypass=true" in caplog.text
+    assert "[REEF_ROUTER] explicit_hermes_request=false" in caplog.text
+    assert "trend_keys=" in caplog.text
+    assert "FS100" in caplog.text
+    assert "LLSATO" in caplog.text
+    assert "skipping competing ask_hermes" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_explicit_hermes_report_uses_ask_hermes_cache(
+    monkeypatch: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The exact spoken workflow hard-routes to ask_hermes and keeps the cache."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler._turn_generation = 1
+    create = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", create)
+    send = AsyncMock()
+    monkeypatch.setattr("reachy_mini_conversation_app.hermes_client.send_to_hermes", send)
+    monkeypatch.setattr(
+        "reachy_mini_conversation_app.hermes_client.load_latest_reef_thread",
+        lambda path=None: {"report": "Reef stable - temp 24.0C (-0.012/6h).", "source": "hermes", "trends": {}},
+    )
+
+    with caplog.at_level("INFO"):
+        await handler._run_fast_hermes_reef_command(
+            "Reachy, ask Hermes what my Reef Tank report is.",
+            "detailed_report",
+            True,
+        )
+
+    send.assert_not_awaited()
+    spoken_prompt = handler.connection.conversation.item.create.await_args.kwargs["item"]["content"][0]["text"]
+    assert "Reef stable - temp 24.0C (-0.012/6h)." in spoken_prompt
+    assert handler._last_reef_response_source == "hermes"
+    assert handler._last_reef_response_type == "detailed_report"
+    assert handler._last_reef_response_route == "ask_hermes"
+    assert "[REEF_ROUTER] intent=detailed_report" in caplog.text
+    assert "[REEF_ROUTER] route=ask_hermes" in caplog.text
+    assert "[REEF_ROUTER] explicit_hermes_request=true" in caplog.text
+    assert "[REEF_ROUTER] source=hermes" in caplog.text
+    assert "[REEF_ROUTER] source_type=cached_report" in caplog.text
+    assert "[REEF_ROUTER] cache_used=true" in caplog.text
+    assert "skipping competing ask_hermes" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_hermes_reef_fast_path_calls_ask_hermes_when_cache_missing(monkeypatch: Any) -> None:
+    """Without a Reefy cache, the Hermes tool remains the report owner."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler._turn_generation = 1
+    create = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", create)
+    monkeypatch.setattr("reachy_mini_conversation_app.hermes_client.load_latest_reef_thread", lambda path=None: None)
+
+    class _FakeAskHermes:
+        async def __call__(self, deps: object, **kwargs: object) -> dict[str, object]:
+            del deps
+            assert kwargs.get("query") == "Give me a reef tank report."
+            return {"spoken": "Nitrate has been falling from 20 to 8.", "status": "success"}
+
+    monkeypatch.setattr(hf_mod, "AskHermes", _FakeAskHermes)
+
+    await handler._run_fast_hermes_reef_command("Give me a reef tank report.", "detailed_report")
+
+    created = handler.connection.conversation.item.create
+    created.assert_awaited_once()
+    spoken_prompt = created.await_args.kwargs["item"]["content"][0]["text"]
+    assert "Nitrate has been falling from 20 to 8." in spoken_prompt
+    create.assert_awaited_once_with(reason="say", response={"tool_choice": "none"})
+    assert handler._hermes_spoke_turn == 1
+    assert handler._last_reef_response_source == "hermes"
+    assert handler._last_reef_response_type == "detailed_report"
+    assert handler._last_reef_response_route == "ask_hermes"
+
+
+@pytest.mark.asyncio
+async def test_reef_router_does_not_skip_ask_hermes_as_competing(
+    monkeypatch: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The LLM must not start a second ask_hermes after the router already dispatched it."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._turn_generation = 1
+    monkeypatch.setattr(handler, "_run_fast_hermes_reef_command", AsyncMock())
+    handler._start_fast_apex_command("Can you give me a reef tank report.")
+    start_tool = AsyncMock()
+    monkeypatch.setattr(type(handler.tool_manager), "start_tool", start_tool)
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent(
+                "response.function_call_arguments.done",
+                name="ask_hermes",
+                arguments='{"query": "Give me a reef tank report."}',
+                call_id="call_hermes",
+            ),
+        ),
+    )
+
+    with caplog.at_level("INFO"):
+        await handler._run_realtime_session()
+
+    start_tool.assert_not_awaited()
+    assert handler._reef_router_owns_turn == 1
+    assert "skipping competing ask_hermes" not in caplog.text
+    assert "ask_hermes already dispatched by deterministic route" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_start_fast_apex_command_routes_explicit_ask_hermes(monkeypatch: Any) -> None:
+    """Explicit Ask Hermes reef requests hard-route to ask_hermes."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    apex_run = AsyncMock()
+    hermes_run = AsyncMock()
+    monkeypatch.setattr(handler, "_run_fast_apex_command", apex_run)
+    monkeypatch.setattr(handler, "_run_fast_hermes_reef_command", hermes_run)
+
+    handler._start_fast_apex_command("Reachy, ask Hermes what my Reef Tank report is.")
+    assert handler._fast_hermes_reef_task is not None
+    await handler._fast_hermes_reef_task
+
+    apex_run.assert_not_awaited()
+    hermes_run.assert_awaited_once()
+    assert hermes_run.await_args.args[1] == "detailed_report"
+    assert hermes_run.await_args.args[2] is True
+
+
+@pytest.mark.asyncio
+async def test_reef_source_question_after_hermes_report(monkeypatch: Any) -> None:
+    """A follow-up source question uses stored Hermes metadata."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler._turn_generation = 1
+    create = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", create)
+    handler._record_reef_response("hermes", "detailed_report", "ask_hermes")
+
+    handler._start_fast_apex_command("Did that come from Hermes?")
+    assert handler._fast_apex_task is not None
+    await handler._fast_apex_task
+
+    spoken_prompt = handler.connection.conversation.item.create.await_args.kwargs["item"]["content"][0]["text"]
+    assert "Yes. That came from Hermes' Reef Tank report." in spoken_prompt
+    create.assert_awaited_once_with(reason="say", response={"tool_choice": "none"})
+
+
+@pytest.mark.asyncio
+async def test_reef_source_question_after_local_stats(monkeypatch: Any) -> None:
+    """A follow-up source question uses stored Home Assistant metadata."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler._turn_generation = 1
+    create = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", create)
+    handler._record_reef_response("home_assistant", "current_stats", "local")
+
+    handler._start_fast_apex_command("Did that come from Hermes?")
+    assert handler._fast_apex_task is not None
+    await handler._fast_apex_task
+
+    spoken_prompt = handler.connection.conversation.item.create.await_args.kwargs["item"]["content"][0]["text"]
+    assert "No. That came directly from the current reef tank data in Home Assistant." in spoken_prompt
+
+
+@pytest.mark.asyncio
+async def test_apex_fast_path_speaks_raw_llsato(monkeypatch: Any, caplog: pytest.LogCaptureFixture) -> None:
+    """The Apex fast-path must speak LLSATO 2.9 from the tool result, not a percentage."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler._turn_generation = 1
+    create = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", create)
+
+    class _FakeApex:
+        async def __call__(self, deps: object, **kwargs: object) -> dict[str, object]:
+            del deps, kwargs
+            return {
+                "apex_status": {
+                    "water_parameters": {"LLSATO": {"value": 2.9, "type": None}},
+                    "equipment": {"ato": {"llsato": 2.9}},
+                    "cached_at": "2026-08-31T03:22:00.869566Z",
+                },
+                "source": "apex_status_http",
+            }
+
+    monkeypatch.setattr(hf_mod, "Apex", _FakeApex)
+
+    with caplog.at_level("INFO"):
+        await handler._run_fast_apex_command("llsato")
+
+    created = handler.connection.conversation.item.create
+    created.assert_awaited_once()
+    spoken_prompt = created.await_args.kwargs["item"]["content"][0]["text"]
+    assert "LLSATO is 2.9." in spoken_prompt
+    assert "85" not in spoken_prompt
+    assert "%" not in spoken_prompt
+    create.assert_awaited_once_with(reason="say", response={"tool_choice": "none"})
+    assert handler._apex_spoke_turn == 1
+    assert handler._suppress_unsolicited_response_turn == 1
+    assert handler._last_reef_response_source == "home_assistant"
+    assert handler._last_reef_response_type == "current_stats"
+    assert handler._last_reef_response_route == "local"
+    assert "[REEF_ROUTER] intent=current_stats" in caplog.text
+    assert "[REEF_ROUTER] route=local" in caplog.text
+    assert "[REEF_ROUTER] source=home_assistant" in caplog.text
+    assert "[REEF_ROUTER] source_type=current_state" in caplog.text
+    assert "[REEF_ROUTER] cache_used=false" in caplog.text
+    assert "[REEF_ROUTER] response_owner=local" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_apex_fast_path_drops_unsolicited_followup_response(monkeypatch: Any) -> None:
+    """After the Apex route claims the turn, the VAD auto-response must not play."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._turn_generation = 1
+    monkeypatch.setattr(handler, "_run_fast_apex_command", AsyncMock())
+    handler._start_fast_apex_command("What's the status of my reef tank?")
+
+    captured_cancels: list[int] = []
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent("response.created", response_id="resp-auto"),
+            _FakeEvent("response.output_audio.delta", delta=_silent_pcm_delta(), response_id="resp-auto"),
+            _FakeEvent(
+                "response.output_audio_transcript.done",
+                transcript="Let me check the reef tank status for you.",
+                response_id="resp-auto",
+                item_id="item-auto",
+                event_id="evt-auto",
+            ),
+            _FakeEvent("response.done"),
+        ),
+        captured_cancels=captured_cancels,
+    )
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+
+    await handler._run_realtime_session()
+
+    outputs = _drain_handler_outputs(handler)
+    assert captured_cancels == [1]
+    assert _assistant_transcripts(outputs) == []
+    assert _audio_frame_count(outputs) == 0
+
+
+@pytest.mark.asyncio
+async def test_bus_fast_path_queues_one_speech_response(monkeypatch: Any) -> None:
+    """One bus query should enqueue exactly one say() response.create."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler._turn_generation = 1
+    create = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", create)
+
+    async def _query(*, preparation_threshold: int = 15) -> dict[str, object]:
+        del preparation_threshold
+        return {"spoken": "Your next 311 bus is arriving in 7 minutes at Macleay St."}
+
+    monkeypatch.setattr(hf_mod.get_bus_monitor(), "query", _query)
+    monkeypatch.setattr(hf_mod.get_bus_monitor(), "mark_query_spoken", MagicMock())
+
+    await handler._run_fast_bus_command("query", 15)
+
+    handler.connection.conversation.item.create.assert_awaited_once()
+    create.assert_awaited_once_with(reason="say")
+    assert handler._bus_spoke_turn == 1
+    assert handler._suppress_unsolicited_response_turn == 1
+
+
+@pytest.mark.asyncio
+async def test_duplicate_transcript_event_is_delivered_once(monkeypatch: Any) -> None:
+    """The same realtime transcript item must not be shown or logged twice."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    spoken = "Your next 311 bus is arriving in 7 minutes at Macleay St."
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._active_response_reason = "say"
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent("response.created", response_id="resp-say"),
+            _FakeEvent(
+                "response.output_audio_transcript.done",
+                transcript=spoken,
+                response_id="resp-say",
+                item_id="item-say",
+                output_index=0,
+                event_id="evt-1",
+            ),
+            _FakeEvent(
+                "response.output_audio_transcript.done",
+                transcript=spoken,
+                response_id="resp-say",
+                item_id="item-say",
+                output_index=0,
+                event_id="evt-2",
+            ),
+            _FakeEvent("response.done"),
+        )
+    )
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+
+    await handler._run_realtime_session()
+
+    assert _assistant_transcripts(_drain_handler_outputs(handler)) == [spoken]
+
+
+@pytest.mark.asyncio
+async def test_bus_fast_path_drops_unsolicited_followup_response(monkeypatch: Any) -> None:
+    """After the bus fast-path speaks, the VAD auto-response must not play."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._turn_generation = 1
+    monkeypatch.setattr(handler, "say", AsyncMock())
+
+    async def _query(*, preparation_threshold: int = 15) -> dict[str, object]:
+        del preparation_threshold
+        return {"spoken": "Your next 311 bus is arriving in 7 minutes at Macleay St."}
+
+    monkeypatch.setattr(hf_mod.get_bus_monitor(), "query", _query)
+    monkeypatch.setattr(hf_mod.get_bus_monitor(), "mark_query_spoken", MagicMock())
+    await handler._run_fast_bus_command("query", 15)
+
+    captured_cancels: list[int] = []
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent("response.created", response_id="resp-auto"),
+            _FakeEvent("response.output_audio.delta", delta=_silent_pcm_delta(), response_id="resp-auto"),
+            _FakeEvent(
+                "response.output_audio_transcript.done",
+                transcript="I'll check the next Route 311 bus for you.",
+                response_id="resp-auto",
+                item_id="item-auto",
+                event_id="evt-auto",
+            ),
+            _FakeEvent("response.done"),
+        ),
+        captured_cancels=captured_cancels,
+    )
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+
+    await handler._run_realtime_session()
+
+    outputs = _drain_handler_outputs(handler)
+    assert captured_cancels == [1]
+    assert _assistant_transcripts(outputs) == []
+    assert _audio_frame_count(outputs) == 0
+
+
+@pytest.mark.asyncio
+async def test_distinct_response_ids_are_not_suppressed_by_identical_text(monkeypatch: Any) -> None:
+    """Two real responses may speak the same words; identity is not the transcript text."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    spoken = "Your next 311 bus is arriving in 7 minutes at Macleay St."
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent("response.created", response_id="resp-one"),
+            _FakeEvent(
+                "response.output_audio_transcript.done",
+                transcript=spoken,
+                response_id="resp-one",
+                item_id="item-one",
+                output_index=0,
+                event_id="evt-one",
+            ),
+            _FakeEvent("response.done"),
+            _FakeEvent("response.created", response_id="resp-two"),
+            _FakeEvent(
+                "response.output_audio_transcript.done",
+                transcript=spoken,
+                response_id="resp-two",
+                item_id="item-two",
+                output_index=0,
+                event_id="evt-two",
+            ),
+            _FakeEvent("response.done"),
+        )
+    )
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+
+    await handler._run_realtime_session()
+
+    assert _assistant_transcripts(_drain_handler_outputs(handler)) == [spoken, spoken]
+
+
+@pytest.mark.asyncio
 async def test_home_assistant_query_skips_followup_when_bus_already_spoken(monkeypatch: Any) -> None:
     """If the fast path already announced the 311, the tool follow-up should not speak again."""
     monkeypatch.setattr(hf_mod.core_tools, "get_tools", lambda: {"home_assistant": HomeAssistant()})
@@ -595,6 +1195,166 @@ async def test_fast_ha_failure_does_not_play_emotion(monkeypatch: Any) -> None:
     await handler._run_fast_ha_commands([{"action": "turn_switch_on", "entity_id": "switch.missing"}])
 
     play.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fast_screen_up_success_plays_success_emotion_once(
+    monkeypatch: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Confirmed Screen Up activation plays the official success emotion once."""
+    ha_calls: list[dict[str, Any]] = []
+
+    class FakeHomeAssistant:
+        async def __call__(self, deps: ToolDependencies, **kwargs: Any) -> dict[str, Any]:
+            ha_calls.append(kwargs)
+            return {"status": "success", "service": "button.press", "entity_id": "button.screen_up"}
+
+    play_calls: list[dict[str, Any]] = []
+
+    class FakePlayEmotion:
+        async def __call__(self, deps: ToolDependencies, **kwargs: Any) -> dict[str, Any]:
+            play_calls.append(kwargs)
+            return {"status": "queued", "emotion": "success1"}
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.output_queue = asyncio.Queue()
+    monkeypatch.setattr(hf_mod, "HomeAssistant", FakeHomeAssistant)
+    monkeypatch.setattr(hf_mod, "PlayEmotion", FakePlayEmotion)
+
+    with caplog.at_level("INFO"):
+        await handler._run_fast_ha_commands([{"action": "press_button", "entity_id": "button.screen_up"}])
+        await handler._run_fast_ha_commands([{"action": "press_button", "entity_id": "button.screen_up"}])
+
+    assert ha_calls == [
+        {"action": "press_button", "entity_id": "button.screen_up"},
+        {"action": "press_button", "entity_id": "button.screen_up"},
+    ]
+    assert play_calls == [{"emotion": "success", "allow_random": False}]
+    assert "[SCREEN UP] User requested Screen Up" in caplog.text
+    assert "[SCREEN UP] Home Assistant turn-on successful" in caplog.text
+    assert "[SCREEN UP] Playing success emotion" in caplog.text
+    assert "[SCREEN UP] success emotion completed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_fast_screen_up_failure_does_not_play_success_emotion(
+    monkeypatch: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failed Screen Up Home Assistant action must not play success."""
+
+    class FakeHomeAssistant:
+        async def __call__(self, deps: ToolDependencies, **kwargs: Any) -> dict[str, Any]:
+            return {"error": "Home Assistant could not find that entity or service."}
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.output_queue = asyncio.Queue()
+    play = AsyncMock()
+    monkeypatch.setattr(hf_mod, "HomeAssistant", FakeHomeAssistant)
+    monkeypatch.setattr(handler, "_play_device_success_emotion", play)
+
+    with caplog.at_level("INFO"):
+        await handler._run_fast_ha_commands([{"action": "press_button", "entity_id": "button.screen_up"}])
+
+    play.assert_not_awaited()
+    assert "[SCREEN UP] Home Assistant turn-on failed" in caplog.text
+    assert "[SCREEN UP] success emotion skipped" in caplog.text
+    assert "[SCREEN UP] Playing success emotion" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_screen_up_tool_result_plays_success_after_confirmation(monkeypatch: Any) -> None:
+    """LLM home_assistant Screen Up success plays the official success emotion."""
+    monkeypatch.setattr(hf_mod.core_tools, "get_tools", lambda: {"home_assistant": HomeAssistant()})
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler.output_queue = asyncio.Queue()
+    monkeypatch.setattr(handler, "_wait_for_response_done_before_tool_result", AsyncMock(return_value=True))
+    create = AsyncMock()
+    play = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", create)
+    monkeypatch.setattr(handler, "_play_device_success_emotion", play)
+    handler._in_flight_tool_calls = {"call_1"}
+    handler._turn_screen_up_call_ids = {"call_1"}
+
+    await handler._handle_tool_result(
+        ToolNotification(
+            id="call_1",
+            tool_name="home_assistant",
+            is_idle_tool_call=False,
+            status=ToolState.COMPLETED,
+            result={"status": "success", "service": "button.press", "entity_id": "button.screen_up"},
+        )
+    )
+
+    play.assert_awaited_once_with(screen_up=True)
+    create.assert_awaited_once_with(reason="tool_result:home_assistant", response={"tool_choice": "none"})
+
+
+@pytest.mark.asyncio
+async def test_screen_up_tool_result_failure_does_not_play_success(
+    monkeypatch: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failed LLM Screen Up tool result keeps existing error handling and skips success."""
+    monkeypatch.setattr(hf_mod.core_tools, "get_tools", lambda: {"home_assistant": HomeAssistant()})
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler.output_queue = asyncio.Queue()
+    monkeypatch.setattr(handler, "_wait_for_response_done_before_tool_result", AsyncMock(return_value=True))
+    create = AsyncMock()
+    play = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", create)
+    monkeypatch.setattr(handler, "_play_device_success_emotion", play)
+    handler._in_flight_tool_calls = {"call_1"}
+    handler._turn_screen_up_call_ids = {"call_1"}
+
+    with caplog.at_level("INFO"):
+        await handler._handle_tool_result(
+            ToolNotification(
+                id="call_1",
+                tool_name="home_assistant",
+                is_idle_tool_call=False,
+                status=ToolState.COMPLETED,
+                result={"error": "Home Assistant is currently unavailable."},
+            )
+        )
+
+    play.assert_not_awaited()
+    create.assert_awaited_once_with(reason="tool_result:home_assistant", response={"tool_choice": "none"})
+    assert "[SCREEN UP] Home Assistant turn-on failed" in caplog.text
+    assert "[SCREEN UP] success emotion skipped" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_screen_up_emotion_failure_does_not_fail_home_assistant(
+    monkeypatch: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Screen Up stays successful if the official success emotion cannot play."""
+
+    class FakeHomeAssistant:
+        async def __call__(self, deps: ToolDependencies, **kwargs: Any) -> dict[str, Any]:
+            return {"status": "success", "service": "button.press", "entity_id": "button.screen_up"}
+
+    class FakePlayEmotion:
+        async def __call__(self, deps: ToolDependencies, **kwargs: Any) -> dict[str, Any]:
+            return {"error": "Emotion library not available"}
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.output_queue = asyncio.Queue()
+    monkeypatch.setattr(hf_mod, "HomeAssistant", FakeHomeAssistant)
+    monkeypatch.setattr(hf_mod, "PlayEmotion", FakePlayEmotion)
+
+    with caplog.at_level("INFO"):
+        await handler._run_fast_ha_commands([{"action": "press_button", "entity_id": "button.screen_up"}])
+
+    transcripts = _assistant_transcripts(_drain_handler_outputs(handler))
+    assert json.loads(transcripts[0]) == {
+        "status": "success",
+        "service": "button.press",
+        "entity_id": "button.screen_up",
+    }
+    assert "[SCREEN UP] Home Assistant turn-on successful" in caplog.text
+    assert "[SCREEN UP] Unable to play success emotion: Emotion library not available" in caplog.text
+    assert "[SCREEN UP] success emotion completed" not in caplog.text
 
 
 @pytest.mark.asyncio

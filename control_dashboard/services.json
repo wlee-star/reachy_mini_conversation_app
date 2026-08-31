@@ -99,7 +99,7 @@
       "port": 8642,
       "depends_on": [],
       "health": "hermes",
-      "process_match": "hermes",
+      "process_match": "hermes_cli\\.main.*\\bgateway\\b|hermes(\\.exe)?[\\s\\\"].*\\bgateway\\b|hermes-gateway",
       "ready_timeout_s": 45,
       "needs": ["HERMES_GATEWAY_URL", "HERMES_API_KEY"],
       "start": {
@@ -139,10 +139,9 @@
       "auto_restart": true,
       "host": "127.0.0.1",
       "port": 8000,
-      "fallback_hosts": ["reachy-mini.local"],
       "depends_on": [],
       "health": "reachy_daemon",
-      "process_match": "reachy-mini-daemon",
+      "process_match": "reachy-mini-daemon.*--sim",
       "ready_timeout_s": 90,
       "start": {
         "executable": "{daemon_exe}",

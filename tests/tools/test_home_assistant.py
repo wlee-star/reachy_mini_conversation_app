@@ -6,8 +6,10 @@ import pytest
 from reachy_mini_conversation_app.tools import home_assistant as home_assistant_mod
 from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
 from reachy_mini_conversation_app.tools.home_assistant import (
+    SCREEN_UP_ENTITY_ID,
     HomeAssistant,
     is_control_action,
+    is_screen_up_success,
     match_fast_ha_commands,
     is_device_control_success,
 )
@@ -245,6 +247,26 @@ async def test_get_bus_arrival_parses_route_departure_attributes() -> None:
             [{"action": "press_button", "entity_id": "button.screen_down"}],
         ),
         (
+            "screen up",
+            [{"action": "press_button", "entity_id": "button.screen_up"}],
+        ),
+        (
+            "turn screen up on",
+            [{"action": "press_button", "entity_id": "button.screen_up"}],
+        ),
+        (
+            "turn on screen up",
+            [{"action": "press_button", "entity_id": "button.screen_up"}],
+        ),
+        (
+            "screen up please",
+            [{"action": "press_button", "entity_id": "button.screen_up"}],
+        ),
+        (
+            "can you turn screen up on",
+            [{"action": "press_button", "entity_id": "button.screen_up"}],
+        ),
+        (
             "Rishi, turn on lamp three and turn off lamp three.",
             [
                 {"action": "turn_switch_on", "entity_id": "switch.lamp_3"},
@@ -296,6 +318,33 @@ def test_device_control_success_requires_confirmed_service_result() -> None:
     assert is_device_control_success({"minutes": 4, "route": "311"}, None) is False
 
 
+def test_screen_up_success_requires_confirmed_button_press() -> None:
+    """Screen Up success is the confirmed button.screen_up press, not a queued or failed call."""
+    assert (
+        is_screen_up_success(
+            {"status": "success", "service": "button.press", "entity_id": SCREEN_UP_ENTITY_ID},
+            None,
+        )
+        is True
+    )
+    assert (
+        is_screen_up_success(
+            {"status": "success", "service": "switch.turn_on", "entity_id": "switch.lamp_3"},
+            None,
+        )
+        is False
+    )
+    assert (
+        is_screen_up_success(
+            {"status": "success", "service": "button.press", "entity_id": "button.screen_down"},
+            None,
+        )
+        is False
+    )
+    assert is_screen_up_success({"status": "accepted", "entity_id": SCREEN_UP_ENTITY_ID}, None) is False
+    assert is_screen_up_success({"error": "Home Assistant is currently unavailable."}, None) is False
+
+
 def test_query_and_error_still_need_spoken_followup() -> None:
     """State reads and failures still need the model to speak."""
     tool = HomeAssistant()
@@ -328,3 +377,32 @@ async def test_opposite_control_invalidates_duplicate_cache() -> None:
         "http://ha.local/api/services/switch/turn_off",
         "http://ha.local/api/services/switch/turn_on",
     ]
+
+
+@pytest.mark.asyncio
+async def test_press_screen_up_calls_button_service(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Screen Up uses the existing button.press Home Assistant service."""
+    with caplog.at_level("INFO"):
+        result = await HomeAssistant()(_deps(), action="press_button", entity_id=SCREEN_UP_ENTITY_ID)
+
+    assert result == {"status": "success", "service": "button.press", "entity_id": SCREEN_UP_ENTITY_ID}
+    assert is_screen_up_success(result, None) is True
+    assert _FakeAsyncClient.requests == [
+        ("POST", "http://ha.local/api/services/button/press", {"entity_id": SCREEN_UP_ENTITY_ID})
+    ]
+    assert "[HA] executing local service call: button.press button.screen_up" in caplog.text
+    assert "[HA] service call succeeded: button.press button.screen_up" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_press_screen_up_failure_is_not_success() -> None:
+    """A rejected Screen Up press is a tool error, not a confirmed activation."""
+    _FakeAsyncClient.response = _FakeResponse(404)
+
+    result = await HomeAssistant()(_deps(), action="press_button", entity_id=SCREEN_UP_ENTITY_ID)
+
+    assert result == {"error": "Home Assistant could not find that entity or service."}
+    assert is_screen_up_success(result, None) is False
+    assert is_device_control_success(result, None) is False

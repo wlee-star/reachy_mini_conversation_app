@@ -36,9 +36,19 @@ def should_launch_simulator(no_sim: bool) -> bool:
     return _is_loopback_host(host)
 
 
+def _remote_physical_host() -> bool:
+    host = _configured_daemon_host()
+    return host is not None and not _is_loopback_host(host)
+
+
 def ensure_simulator_running(app_logger: logging.Logger, *, no_sim: bool) -> None:
     """Start reachy-mini-daemon --sim only when no local daemon is already answering."""
     if not should_launch_simulator(no_sim):
+        if no_sim and not _remote_physical_host() and not _daemon_ready():
+            raise ConnectionError(
+                "Reachy Mini simulator is not listening on 127.0.0.1:8000. "
+                "Start Reachy Mini from the control dashboard, or omit --no-sim."
+            )
         app_logger.info("Skipping Reachy Mini simulator launch")
         return
     if _daemon_ready() or _daemon_image_running():

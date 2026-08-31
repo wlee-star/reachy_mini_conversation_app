@@ -16,6 +16,7 @@ _REQUEST_TIMEOUT_S = 5.0
 _CONTROL_CACHE_TTL_S = 15.0
 _DEFAULT_BUS_ENTITY_ID = "sensor.route_311_at_rockwall_cres"
 _BEDROOM_LAMP_ENTITY_ID = "light.yeelink_sg_269831873_lamp4_s_2_light"
+SCREEN_UP_ENTITY_ID = "button.screen_up"
 _CONTROL_ACTIONS = frozenset(
     {
         "turn_light_on",
@@ -343,6 +344,18 @@ def is_device_control_success(result: dict[str, Any] | None, error: str | None) 
     if error is not None or not isinstance(result, dict) or "error" in result:
         return False
     return result.get("status") == "success" and bool(result.get("service"))
+
+
+def is_screen_up_command(action: object, entity_id: object) -> bool:
+    """Return whether this Home Assistant call is the Screen Up button press."""
+    return action == "press_button" and entity_id == SCREEN_UP_ENTITY_ID
+
+
+def is_screen_up_success(result: dict[str, Any] | None, error: str | None) -> bool:
+    """Return whether Home Assistant confirmed a successful Screen Up press."""
+    if not is_device_control_success(result, error) or result is None:
+        return False
+    return result.get("entity_id") == SCREEN_UP_ENTITY_ID
 
 
 def _remember_control_result(action: str, entity_id: str, result: dict[str, Any]) -> None:

@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>Reachy Mini AI Control</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <header class="top">
+        <div class="brand">
+          <span class="brand__mark" aria-hidden="true"></span>
+          <div>
+            <h1>Reachy Mini AI Control</h1>
+            <p class="brand__sub">Local stack monitor · does not move the robot</p>
+          </div>
+        </div>
+        <div class="top__actions">
+          <label class="toggle">
+            <input id="dev-mode" type="checkbox" />
+            Dev mode
+          </label>
+          <label class="toggle">
+            <input id="auto-restart" type="checkbox" />
+            Auto-recover
+          </label>
+          <nav class="nav">
+            <a href="#/">Overview</a>
+            <a href="#/config">Config</a>
+            <a href="#/tests">Tests</a>
+          </nav>
+        </div>
+      </header>
+
+      <section class="ready" id="ready-banner">
+        <div>
+          <p class="ready__label" id="ready-label">Checking stack…</p>
+          <p class="ready__reason" id="ready-reason"></p>
+        </div>
+        <div class="ready__buttons">
+          <button type="button" class="btn btn--primary" id="start-all">Start all</button>
+          <button type="button" class="btn btn--danger" id="stop-all">Stop all</button>
+        </div>
+      </section>
+
+      <p class="progress" id="progress" hidden></p>
+
+      <main id="view"></main>
+
+      <aside class="events">
+        <div class="events__head">
+          <h2>Live events</h2>
+          <div class="events__tools">
+            <select id="event-filter" aria-label="Filter events">
+              <option value="">All services</option>
+            </select>
+            <label class="toggle toggle--small">
+              <input id="errors-only" type="checkbox" />
+              Errors
+            </label>
+            <button type="button" class="btn btn--ghost" id="pause-events">Pause</button>
+            <button type="button" class="btn btn--ghost" id="clear-events">Clear</button>
+          </div>
+        </div>
+        <ol id="event-list" class="event-list"></ol>
+      </aside>
+    </div>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

@@ -16,6 +16,7 @@ CACHE_PATH = os.path.expanduser("~/reef-monitor/reef_cache.json")
 logger = logging.getLogger(__name__)
 
 _REQUEST_TIMEOUT_S = 5.0
+_FOCUS_PROBE_NAMES = ("Tmp", "pH", "ORP", "FS100", "LLSATO")
 
 
 def _status_url() -> str | None:
@@ -57,6 +58,40 @@ def _controller_name(raw: object) -> object:
     return raw
 
 
+def focus_probe_values(probes: dict[str, Any]) -> dict[str, object]:
+    """Return the raw Tmp/pH/ORP/FS100/LLSATO values, or None when a probe is absent."""
+    by_lower = {key.lower(): value for key, value in probes.items()}
+    summary: dict[str, object] = {}
+    for name in _FOCUS_PROBE_NAMES:
+        item = by_lower.get(name.lower())
+        if isinstance(item, dict):
+            summary[name] = item.get("value")
+        else:
+            summary[name] = item
+    return summary
+
+
+def _log_reef_snapshot(
+    snapshot: dict[str, Any],
+    *,
+    url: str | None = None,
+    http_status: int | None = None,
+    invoked_by: str,
+) -> None:
+    probes_raw = snapshot.get("probes")
+    probes = probes_raw if isinstance(probes_raw, dict) else {}
+    logger.info(
+        "[APEX] %s source=%s url=%s http_status=%s cached_at=%s focus_probes=%s ato=%s",
+        invoked_by,
+        snapshot.get("source"),
+        url,
+        http_status,
+        snapshot.get("cached_at"),
+        focus_probe_values(probes),
+        snapshot.get("ato"),
+    )
+
+
 def _ato_payload(payload: dict[str, Any], probes: dict[str, Any]) -> dict[str, Any]:
     ato = payload.get("ato")
     if isinstance(ato, dict):
@@ -67,10 +102,20 @@ def _ato_payload(payload: dict[str, Any], probes: dict[str, Any]) -> dict[str, A
     return {}
 
 
+def _reading_timestamp(payload: dict[str, Any], controller: object) -> str | None:
+    if isinstance(controller, dict):
+        controller_date = controller.get("date")
+        if isinstance(controller_date, str) and controller_date.strip():
+            return controller_date.strip()
+    fetched_at = payload.get("fetched_at")
+    if isinstance(fetched_at, str) and fetched_at.strip():
+        return fetched_at.strip()
+    return None
+
+
 def _snapshot_from_live_payload(payload: dict[str, Any]) -> dict[str, Any]:
     probes = _normalize_probes(payload.get("probes"))
     controller = payload.get("controller")
-    cached_at = controller.get("date") if isinstance(controller, dict) else None
     outlets = payload.get("outlets")
     return {
         "probes": probes,
@@ -79,7 +124,7 @@ def _snapshot_from_live_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "alerts": payload.get("alerts") if isinstance(payload.get("alerts"), list) else [],
         "outlets": outlets if isinstance(outlets, list) else [],
         "controller": _controller_name(controller),
-        "cached_at": cached_at,
+        "cached_at": _reading_timestamp(payload, controller),
         "age_seconds": 0,
         "stale": False,
         "source": "apex_status_http",
@@ -90,27 +135,29 @@ async def _fetch_live_status(url: str) -> tuple[dict[str, Any] | None, str | Non
     try:
         async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_S) as http_client:
             response = await http_client.get(url)
+            logger.info("[APEX] GET %s -> HTTP %s", url, response.status_code)
             response.raise_for_status()
     except httpx.TimeoutException:
-        logger.warning("Apex status request timed out")
+        logger.warning("[APEX] GET %s timed out", url)
         return None, "Apex status is currently unavailable."
     except httpx.HTTPStatusError as exc:
-        logger.warning("Apex status HTTP %s for GET %s", exc.response.status_code, url)
+        logger.warning("[APEX] GET %s rejected HTTP %s", url, exc.response.status_code)
         return None, "Apex status rejected the request."
     except httpx.RequestError as exc:
-        logger.warning("Apex status request failed: %s", exc)
+        logger.warning("[APEX] GET %s failed: %s", url, exc)
         return None, "Apex status is currently unavailable."
 
     try:
         payload: object = response.json()
     except ValueError:
-        logger.warning("Apex status returned malformed JSON")
+        logger.warning("[APEX] GET %s returned malformed JSON", url)
         return None, "Apex status returned an unexpected response."
     if not isinstance(payload, dict):
-        logger.warning("Apex status payload must be a JSON object")
+        logger.warning("[APEX] GET %s payload must be a JSON object", url)
         return None, "Apex status returned an unexpected response."
-    logger.info("[APEX] live status read succeeded")
-    return _snapshot_from_live_payload(payload), None
+    snapshot = _snapshot_from_live_payload(payload)
+    _log_reef_snapshot(snapshot, url=url, http_status=response.status_code, invoked_by="live_status")
+    return snapshot, None
 
 
 def _load_cache() -> tuple[dict[str, Any] | None, str | None]:
@@ -129,6 +176,8 @@ def _load_cache() -> tuple[dict[str, Any] | None, str | None]:
     snapshot.setdefault("source", "reef_cache_direct")
     if "probes" in snapshot:
         snapshot["probes"] = _normalize_probes(snapshot.get("probes"))
+    logger.info("[APEX] reef_status fallback invoked cache=%s", CACHE_PATH)
+    _log_reef_snapshot(snapshot, invoked_by="reef_cache")
     return snapshot, None
 
 
@@ -138,7 +187,9 @@ async def _load_reef_snapshot() -> tuple[dict[str, Any] | None, str | None]:
         snapshot, error = await _fetch_live_status(url)
         if snapshot is not None:
             return snapshot, None
-        logger.warning("Apex live status failed (%s); trying reef cache", error)
+        logger.warning("[APEX] live status failed (%s); trying reef cache", error)
+    else:
+        logger.info("[APEX] APEX_STATUS_URL unset; reading reef cache")
     return _load_cache()
 
 
@@ -170,6 +221,7 @@ class ReefStatus(Tool):
         if include is not None and not isinstance(include, list):
             return {"error": "include must be a list of metric names"}
 
+        logger.info("[APEX] reef_status tool invoked")
         cache, error = await _load_reef_snapshot()
         if cache is None:
             return {"error": error or "Reef cache not found. Ensure reef_cache.py cron is running."}
@@ -191,7 +243,7 @@ class ReefStatus(Tool):
             }
 
         source = cache.get("source")
-        return {
+        result = {
             "reef_status": {
                 "probes": results,
                 "ato": cache.get("ato", {}),
@@ -205,3 +257,5 @@ class ReefStatus(Tool):
             },
             "source": source if isinstance(source, str) else "reef_cache_direct",
         }
+        logger.info("[APEX] reef_status tool result=%s", result)
+        return result

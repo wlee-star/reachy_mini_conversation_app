@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import json
+import socket
 import logging
 import threading
 from typing import Any
@@ -122,6 +123,18 @@ def _handle_action(service_id: str, action: str) -> tuple[int, dict[str, Any]]:
     if action == "stop":
         return 200, controller.stop(spec)
     return 200, controller.restart(spec)
+
+
+class ExclusiveThreadingHTTPServer(ThreadingHTTPServer):
+    """Refuse to share the dashboard port with a second controller."""
+
+    allow_reuse_address = False
+
+    def server_bind(self) -> None:
+        """Bind the port exclusively so a second dashboard cannot share it."""
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -263,7 +276,7 @@ def serve(host: str | None = None, port: int | None = None) -> None:
     _controller = stack.StackController(_config)
     bind_host = host or _config.host
     bind_port = port or _config.port
-    httpd = ThreadingHTTPServer((bind_host, bind_port), DashboardHandler)
+    httpd = ExclusiveThreadingHTTPServer((bind_host, bind_port), DashboardHandler)
     stop_event = threading.Event()
     recovery = threading.Thread(target=_recovery_loop, args=(_controller, stop_event), daemon=True)
     recovery.start()

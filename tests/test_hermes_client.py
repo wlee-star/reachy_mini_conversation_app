@@ -1,6 +1,7 @@
 """Tests for the Hermes Gateway HTTP client."""
 
 import asyncio
+from pathlib import Path
 
 import httpx
 import pytest
@@ -11,14 +12,17 @@ from reachy_mini_conversation_app.hermes_client import (
     HERMES_SESSION_HEADER,
     HERMES_VOICE_SYSTEM_PROMPT,
     HERMES_REEF_TREND_INSTRUCTION,
+    HERMES_REEF_VOICE_SYSTEM_PROMPT,
     HermesRequestError,
     HermesTimeoutError,
     HermesNotConfiguredError,
     hermes_is_busy,
     is_trend_query,
     send_to_hermes,
+    chat_completions_url,
     is_process_narration,
     get_hermes_session_id,
+    load_latest_reef_thread,
 )
 
 
@@ -291,6 +295,7 @@ def test_is_process_narration_detects_file_access_failures() -> None:
     assert is_process_narration("It seems there is an issue with accessing the file content.") is True
     assert is_process_narration("I need to inspect the file before I can answer.") is True
     assert is_process_narration("I couldn't access the file") is True
+    assert is_process_narration("I'm having trouble accessing the reef data. Let me try again!") is True
     assert is_process_narration("Nitrate has been falling from 20 to 8, while temperature stayed near 26.") is False
 
 
@@ -298,7 +303,78 @@ def test_is_trend_query_matches_reef_history_phrases() -> None:
     """Trend routing stays on Hermes; live snapshot phrases do not match."""
     assert is_trend_query("how is my reef tank trending?") is True
     assert is_trend_query("parameter history") is True
+    assert is_trend_query("How has my reef tank changed over the last 6 hours?") is True
+    assert is_trend_query("How is my ATO trending?") is True
+    assert is_trend_query("How much ATO have I been using?") is True
+    assert is_trend_query("Give me a reef tank report.") is True
+    assert is_trend_query("Give me a report on my reef tank") is True
+    assert is_trend_query("Analyse my reef tank.") is True
+    assert is_trend_query("How has my reef tank been doing?") is True
+    assert is_trend_query("Are my reef parameters improving?") is True
+    assert is_trend_query("Give me a trending report") is True
+    assert is_trend_query("Can you give me a reef trending report?") is True
     assert is_trend_query("what's the reef temperature") is False
+    assert is_trend_query("What is the current pH?") is False
+    assert is_trend_query("Give me a weather report") is False
+
+
+def test_chat_completions_url_normalizes_host_port() -> None:
+    """A host:port gateway URL is posted to the chat-completions path, not /."""
+    assert chat_completions_url("http://127.0.0.1:8642") == "http://127.0.0.1:8642/v1/chat/completions"
+    assert chat_completions_url("http://127.0.0.1:8642/") == "http://127.0.0.1:8642/v1/chat/completions"
+    assert (
+        chat_completions_url("http://127.0.0.1:8642/v1/chat/completions")
+        == "http://127.0.0.1:8642/v1/chat/completions"
+    )
+
+
+def test_load_latest_reef_thread_reads_summary_and_slopes(tmp_path: Path) -> None:
+    """The Reefy thread cache is the history source Hermes should report from."""
+    thread = tmp_path / "reef_thread.jsonl"
+    thread.write_text(
+        '{"type":"run","ts":"2026-08-31T04:00:04Z","cache_ts":"2026-08-31T03:59:03Z",'
+        '"summary":"Reef stable - temp 24.0C (-0.012/6h); ATO 2.9 (~204h until refill).",'
+        '"trends":{"Tmp":{"trend_6h":-0.012,"trend_str":"-0.012/6h"},'
+        '"LLSATO":{"trend_6h":-0.071,"trend_str":"-0.071/6h"}},'
+        '"handoff":{"for_reachy":{"ask_first":true,"source":"hermes"}},'
+        '"ato_hours_until_low":204.0}\n',
+        encoding="utf-8",
+    )
+    snapshot = load_latest_reef_thread(str(thread))
+    assert snapshot is not None
+    assert snapshot["report"].startswith("Reef stable")
+    assert snapshot["ato_hours_until_low"] == 204.0
+    assert snapshot["source"] == "hermes"
+    handoff = snapshot["handoff"]
+    assert isinstance(handoff, dict)
+    for_reachy = handoff["for_reachy"]
+    assert isinstance(for_reachy, dict)
+    assert for_reachy["source"] == "hermes"
+    assert for_reachy["ask_first"] is True
+    trends = snapshot["trends"]
+    assert isinstance(trends, dict)
+    assert trends["Tmp"]["trend_str"] == "-0.012/6h"
+    assert trends["LLSATO"]["trend_6h"] == -0.071
+
+
+@pytest.mark.asyncio
+async def test_send_to_hermes_posts_to_chat_completions_when_url_is_host_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ask_hermes must not POST to the gateway root, which returns HTTP 404."""
+    monkeypatch.setattr(hermes_client.config, "HERMES_GATEWAY_URL", "http://127.0.0.1:8642")
+    monkeypatch.setattr(hermes_client.config, "HERMES_API_KEY", API_KEY)
+    posts: list[tuple[str, dict[str, str] | None, object | None]] = []
+    monkeypatch.setattr(
+        hermes_client.httpx,
+        "AsyncClient",
+        _fake_async_client(response=_json_response(200, _completion_payload("ok")), posts=posts),
+    )
+
+    reply = await send_to_hermes("hello", "session-abc")
+
+    assert reply == "ok"
+    assert posts[0][0] == "http://127.0.0.1:8642/v1/chat/completions"
 
 
 @pytest.mark.asyncio
@@ -319,8 +395,11 @@ async def test_send_to_hermes_appends_trend_instruction(monkeypatch: pytest.Monk
     assert isinstance(body, dict)
     messages = body["messages"]
     assert isinstance(messages, list)
+    system_message = messages[0]
     user_message = messages[1]
+    assert isinstance(system_message, dict)
     assert isinstance(user_message, dict)
+    assert system_message["content"] == HERMES_REEF_VOICE_SYSTEM_PROMPT
     assert "how is my reef tank trending?" in str(user_message["content"])
     assert HERMES_REEF_TREND_INSTRUCTION in str(user_message["content"])
     assert "Do not narrate files" in HERMES_REEF_TREND_INSTRUCTION

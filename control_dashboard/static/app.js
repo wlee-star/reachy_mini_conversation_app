@@ -68,7 +68,12 @@ function renderReady(readiness) {
 
 function serviceCard(service) {
   const reason = service.reason && service.status !== "online" ? `<p class="card__reason">${escapeHtml(service.reason)}</p>` : "";
-  const meta = [service.port ? `Port ${service.port}` : null, service.details?.model ? `Model ${service.details.model}` : null]
+  const meta = [
+    service.port ? `Port ${service.port}` : null,
+    service.managed && service.external ? "External process" : null,
+    service.details?.environment ? service.details.environment : null,
+    service.details?.model ? `Model ${service.details.model}` : null,
+  ]
     .filter(Boolean)
     .join(" · ");
   return `<button type="button" class="card" data-open="${service.id}">
@@ -131,6 +136,8 @@ async function renderDetail(serviceId) {
       <dl class="kv">
         ${kv("Port", service.port)}
         ${kv("Host", service.host)}
+        ${kv("Ownership", service.managed ? (service.external ? "External process" : service.owned ? "Started by dashboard" : "Not running") : "Monitored only")}
+        ${kv("Environment", service.details?.environment)}
         ${kv("Model", service.details?.model)}
         ${kv("GPU", service.details?.gpu)}
         ${kv("Last response", service.latency_ms != null ? `${service.latency_ms} ms` : "")}
@@ -272,7 +279,7 @@ async function refresh() {
 document.getElementById("start-all").addEventListener("click", async () => {
   showProgress("Starting Reachy AI stack…");
   const result = await api("/api/stack/start", { method: "POST", body: "{}" });
-  const lines = (result.steps || []).map((step) => `${step.ok ? "✓" : "✗"} ${step.name}: ${step.error || (step.already_running ? "already running" : "ok")}`);
+  const lines = (result.steps || []).map((step) => `${step.ok ? "✓" : "✗"} ${step.name}: ${step.error || (step.already_running ? (step.external ? "already running — external process" : "already running") : "ok")}`);
   showProgress(lines.join("\n") + (result.ok ? "\n\nSYSTEM READY" : "\n\nStartup finished with errors"));
   await refresh();
 });
@@ -280,7 +287,11 @@ document.getElementById("start-all").addEventListener("click", async () => {
 document.getElementById("stop-all").addEventListener("click", async () => {
   showProgress("Stopping managed services…");
   const result = await api("/api/stack/stop", { method: "POST", body: "{}" });
-  const lines = (result.steps || []).map((step) => `${step.ok ? "✓" : "✗"} ${step.name}`);
+  const lines = (result.steps || []).map((step) => {
+    if (step.already_stopped) return `✓ ${step.name}: already stopped`;
+    if (step.stopped_pids && step.stopped_pids.length) return `✓ ${step.name}: stopped`;
+    return `${step.ok ? "✓" : "✗"} ${step.name}${step.error ? `: ${step.error}` : ""}`;
+  });
   showProgress(lines.join("\n"));
   await refresh();
 });

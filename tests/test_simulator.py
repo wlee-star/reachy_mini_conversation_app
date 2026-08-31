@@ -100,13 +100,27 @@ def test_ensure_simulator_running_times_out(monkeypatch: pytest.MonkeyPatch) -> 
         simulator.ensure_simulator_running(logging.getLogger("test"), no_sim=False)
 
 
-def test_ensure_simulator_running_honors_no_sim(monkeypatch: pytest.MonkeyPatch) -> None:
-    """--no-sim does not spawn a daemon even when localhost is empty."""
+def test_ensure_simulator_running_honors_no_sim_when_local_daemon_is_up(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--no-sim reuses a local simulator and does not spawn another."""
     popen = MagicMock()
-    monkeypatch.setattr(simulator, "_daemon_ready", lambda: False)
+    monkeypatch.delenv("REACHY_DAEMON_HOST", raising=False)
+    monkeypatch.setattr(simulator, "_daemon_ready", lambda: True)
     monkeypatch.setattr(simulator.subprocess, "Popen", popen)
 
     simulator.ensure_simulator_running(logging.getLogger("test"), no_sim=True)
+
+    popen.assert_not_called()
+
+
+def test_no_sim_without_local_daemon_does_not_fall_through_to_physical(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--no-sim must not let the SDK hunt for a physical robot when localhost is empty."""
+    popen = MagicMock()
+    monkeypatch.delenv("REACHY_DAEMON_HOST", raising=False)
+    monkeypatch.setattr(simulator, "_daemon_ready", lambda: False)
+    monkeypatch.setattr(simulator.subprocess, "Popen", popen)
+
+    with pytest.raises(ConnectionError, match="127.0.0.1:8000"):
+        simulator.ensure_simulator_running(logging.getLogger("test"), no_sim=True)
 
     popen.assert_not_called()
 

@@ -14,6 +14,7 @@ STATIC_DIR = DASHBOARD_DIR / "static"
 SERVICES_PATH = DASHBOARD_DIR / "services.json"
 LOCAL_SERVICES_PATH = DASHBOARD_DIR / "services.local.json"
 OWNED_PATH = RUNTIME_DIR / "owned.json"
+STOPPED_PATH = RUNTIME_DIR / "stopped.json"
 SETTINGS_PATH = RUNTIME_DIR / "settings.json"
 
 

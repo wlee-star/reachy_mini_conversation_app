@@ -43,17 +43,32 @@ from reachy_mini_conversation_app.prompts import (
     get_session_greeting_prompt,
 )
 from reachy_mini_conversation_app.streaming import AdditionalOutputs, audio_to_int16
+from reachy_mini_conversation_app.tools.apex import (
+    Apex,
+    ReefRoute,
+    spoken_apex_update,
+    classify_reef_intent,
+    spoken_reef_source_answer,
+    match_reef_source_question,
+)
 from reachy_mini_conversation_app.bus_monitor import get_bus_monitor, match_bus_intent
+from reachy_mini_conversation_app.tools.ask_hermes import AskHermes
 from reachy_mini_conversation_app.tools.core_tools import (
     ToolSpec,
     ToolDependencies,
     get_tool_specs,
+)
+from reachy_mini_conversation_app.startup_diagnostic import (
+    deliver_boot_sequence,
+    boot_sequence_already_delivered,
 )
 from reachy_mini_conversation_app.tools.play_emotion import PlayEmotion, is_success_emotion_request
 from reachy_mini_conversation_app.conversation_handler import ConversationHandler
 from reachy_mini_conversation_app.tools.home_assistant import (
     HomeAssistant,
     is_control_action,
+    is_screen_up_command,
+    is_screen_up_success,
     match_fast_ha_commands,
     is_device_control_success,
 )
@@ -98,6 +113,19 @@ _BUS_ALERT_PROMPT: Final[str] = (
     "Speak this exact bus update to the user now, in one or two short sentences, "
     "without mentioning tools, Home Assistant, or that this is a reminder: {text}"
 )
+_APEX_ALERT_PROMPT: Final[str] = (
+    "Speak this exact reef update to the user now, in one or two short sentences. "
+    "Use the probe names and numbers as written. Do not convert them, do not add a "
+    "percentage, unit, or salinity claim, and do not mention tools or Apex: {text}"
+)
+_HERMES_REEF_ALERT_PROMPT: Final[str] = (
+    "Speak this exact reef report to the user now. Do not call tools. "
+    "Do not mention files, Hermes, or that this was cached: {text}"
+)
+_REEF_SOURCE_ALERT_PROMPT: Final[str] = (
+    "Speak this exact sentence to the user now. Do not call tools. Do not add extra explanation: {text}"
+)
+_COMPETING_REEF_TOOLS: Final[frozenset[str]] = frozenset({"apex", "reef_status"})
 _HERMES_SPEECH_REASONS: Final[frozenset[str]] = frozenset(
     {
         "tool_result:ask_hermes",
@@ -124,14 +152,38 @@ class _HermesPendingResult:
         self.speech_attempts = 0
 
 
+def _log_reef_router(
+    *,
+    intent: str,
+    route: str,
+    source: str,
+    source_type: str,
+    cache_used: bool,
+    response_owner: str,
+    explicit_hermes_request: bool,
+) -> None:
+    """Emit one complete Reef Router attribution block for the current turn."""
+    logger.info("[REEF_ROUTER] intent=%s", intent)
+    logger.info("[REEF_ROUTER] route=%s", route)
+    logger.info("[REEF_ROUTER] source=%s", source)
+    logger.info("[REEF_ROUTER] source_type=%s", source_type)
+    logger.info("[REEF_ROUTER] cache_used=%s", str(cache_used).lower())
+    logger.info("[REEF_ROUTER] response_owner=%s", response_owner)
+    logger.info("[REEF_ROUTER] normal_llm_bypass=true")
+    logger.info("[REEF_ROUTER] explicit_hermes_request=%s", str(explicit_hermes_request).lower())
+
+
 def _hermes_result_text(tool_result: object) -> str:
     """Return the spoken Hermes payload, or empty if there is nothing to deliver."""
     if isinstance(tool_result, dict):
         if tool_result.get("status") == "already_running":
             return ""
-        reply = tool_result.get("reply")
-        if isinstance(reply, str) and reply.strip():
-            return reply.strip()
+        for key in ("spoken", "report", "reply"):
+            value = tool_result.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        if tool_result.get("trend_available") is False or tool_result.get("status") == "error":
+            return "Historical reef data is currently unavailable."
         error = tool_result.get("error")
         if isinstance(error, str) and error.strip():
             return error.strip()
@@ -144,6 +196,33 @@ def _is_session_limit_error(exc: BaseException) -> bool:
     """Return whether a realtime close is the local one-session pool limit."""
     text = str(exc).lower()
     return any(marker in text for marker in _SESSION_LIMIT_MARKERS)
+
+
+def _realtime_response_id(event: object) -> str | None:
+    """Return the realtime response id on an event, if present."""
+    response_id = getattr(event, "response_id", None)
+    if isinstance(response_id, str) and response_id:
+        return response_id
+    response = getattr(event, "response", None)
+    if isinstance(response, dict):
+        nested_id = response.get("id")
+        return nested_id if isinstance(nested_id, str) and nested_id else None
+    nested = getattr(response, "id", None) if response is not None else None
+    return nested if isinstance(nested, str) and nested else None
+
+
+def _assistant_transcript_identity(event: object) -> str | None:
+    """Identity for one assistant transcript item, used to drop duplicate events."""
+    response_id = _realtime_response_id(event)
+    item_id = getattr(event, "item_id", None)
+    if not isinstance(item_id, str) or not item_id:
+        item_id = None
+    output_index = getattr(event, "output_index", 0)
+    if not isinstance(output_index, int):
+        output_index = 0
+    if response_id or item_id:
+        return f"{response_id or ''}:{item_id or ''}:{output_index}"
+    return None
 
 
 def _realtime_pool_has_idle_slot(payload: dict[str, Any]) -> bool:
@@ -276,11 +355,25 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._tool_followup_tools_disabled = False
         self._fast_ha_task: asyncio.Task[None] | None = None
         self._fast_bus_task: asyncio.Task[None] | None = None
+        self._fast_apex_task: asyncio.Task[None] | None = None
+        self._fast_hermes_reef_task: asyncio.Task[None] | None = None
         self._bus_monitor_start_task: asyncio.Task[None] | None = None
         self._bus_spoke_turn: int | None = None
+        self._apex_spoke_turn: int | None = None
+        self._hermes_spoke_turn: int | None = None
+        self._reef_router_owns_turn: int | None = None
+        self._reef_router_route: ReefRoute | None = None
+        self._last_reef_response_source: str | None = None
+        self._last_reef_response_type: str | None = None
+        self._last_reef_response_route: str | None = None
+        self._last_reef_response_timestamp: float | None = None
+        self._suppress_unsolicited_response_turn: int | None = None
+        self._drop_active_response_output = False
+        self._delivered_assistant_transcript_ids: set[str] = set()
         self._user_speech_in_progress = False
         self._pending_hermes_result: _HermesPendingResult | None = None
         self._turn_device_control_call_ids: set[str] = set()
+        self._turn_screen_up_call_ids: set[str] = set()
         self._device_success_emotion_played = False
 
     @staticmethod
@@ -328,12 +421,18 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     async def _run_fast_ha_commands(self, commands: list[dict[str, Any]]) -> None:
         for command in commands:
+            screen_up = is_screen_up_command(command.get("action"), command.get("entity_id"))
+            if screen_up:
+                logger.info("[SCREEN UP] User requested Screen Up")
             logger.info("[HA] fast-path executing %s", command)
             started = time.perf_counter()
             try:
                 result = await HomeAssistant()(self.deps, **command)
             except Exception as exc:
                 logger.warning("Fast-path Home Assistant command failed: %s", exc)
+                if screen_up:
+                    logger.warning("[SCREEN UP] Home Assistant turn-on failed")
+                    logger.info("[SCREEN UP] success emotion skipped")
                 continue
             logger.info(
                 "[HA] fast-path finished in %.0f ms: %s",
@@ -341,8 +440,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 result,
             )
             await self.output_queue.put(AdditionalOutputs({"role": "assistant", "content": json.dumps(result)}))
-            if is_device_control_success(result if isinstance(result, dict) else None, None):
-                await self._play_device_success_emotion()
+            await self._play_success_emotion_after_ha_control(
+                result if isinstance(result, dict) else None,
+                None,
+                screen_up=screen_up,
+            )
 
     def _start_fast_bus_command(self, transcript: str) -> None:
         manager = get_bus_monitor()
@@ -389,7 +491,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if not isinstance(spoken, str) or not spoken:
             return
         self._bus_spoke_turn = self._turn_generation
+        self._suppress_unsolicited_response_turn = self._turn_generation
         manager.mark_query_spoken()
+        if not self._response_done_event.is_set() and self._active_response_reason is None:
+            logger.info("Cancelling unsolicited realtime response before bus speech")
+            await self._cancel_active_realtime_response()
         await self._speak_bus_alert(spoken)
         logger.info(
             "BUS fast-path action=%s finished in %.0f ms",
@@ -397,17 +503,184 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             (time.perf_counter() - started) * 1000,
         )
 
+    def _claim_deterministic_route(self) -> None:
+        """Own this turn as soon as a deterministic reef/bus/HA route is known."""
+        self._suppress_unsolicited_response_turn = self._turn_generation
+        if self._active_response_reason is None:
+            self._drop_active_response_output = True
+
+    async def _suppress_unsolicited_realtime(self) -> None:
+        """Stop the realtime model from answering a turn a deterministic route owns."""
+        self._claim_deterministic_route()
+        if not self._response_done_event.is_set() and self._active_response_reason is None:
+            logger.info("[ROUTER] suppressing unsolicited realtime response reason=deterministic_route")
+            await self._cancel_active_realtime_response()
+
+    def _record_reef_response(self, source: str, response_type: str, route: str) -> None:
+        """Store which backend produced the last spoken reef answer."""
+        self._last_reef_response_source = source
+        self._last_reef_response_type = response_type
+        self._last_reef_response_route = route
+        self._last_reef_response_timestamp = time.time()
+
+    def _start_fast_apex_command(self, transcript: str) -> None:
+        if match_reef_source_question(transcript):
+            self._reef_router_owns_turn = self._turn_generation
+            self._claim_deterministic_route()
+            self._fast_apex_task = asyncio.create_task(
+                self._run_reef_source_question(),
+                name="reef-source-question",
+            )
+            return
+        route = classify_reef_intent(transcript)
+        if route is None:
+            return
+        self._reef_router_owns_turn = self._turn_generation
+        self._reef_router_route = route
+        self._claim_deterministic_route()
+        if route.route == "ask_hermes":
+            self._fast_hermes_reef_task = asyncio.create_task(
+                self._run_fast_hermes_reef_command(transcript, route.intent, route.explicit_hermes_request),
+                name="hermes-reef-fast-path",
+            )
+            return
+        logger.info("[APEX] fast-path matched metric=%s transcript=%s", route.metric, transcript)
+        self._fast_apex_task = asyncio.create_task(
+            self._run_fast_apex_command(route.metric or "status"),
+            name="apex-fast-path",
+        )
+
+    async def _speak_apex_update(self, text: str) -> None:
+        """Speak a deterministic Apex reading through the existing realtime session."""
+        try:
+            await self.say(_APEX_ALERT_PROMPT.format(text=text), **_TOOL_FOLLOWUP_CREATE_KWARGS)
+        except Exception as exc:
+            logger.warning("[APEX] fast-path speech failed: %s", exc)
+
+    async def _speak_hermes_reef_update(self, text: str) -> None:
+        """Speak a cached or Hermes reef report through the existing realtime session."""
+        try:
+            await self.say(_HERMES_REEF_ALERT_PROMPT.format(text=text), **_TOOL_FOLLOWUP_CREATE_KWARGS)
+        except Exception as exc:
+            logger.warning("[HERMES] fast-path speech failed: %s", exc)
+
+    async def _speak_reef_source_update(self, text: str) -> None:
+        """Speak stored reef-source attribution through the existing realtime session."""
+        try:
+            await self.say(_REEF_SOURCE_ALERT_PROMPT.format(text=text), **_TOOL_FOLLOWUP_CREATE_KWARGS)
+        except Exception as exc:
+            logger.warning("[REEF_ROUTER] source-question speech failed: %s", exc)
+
+    async def _run_reef_source_question(self) -> None:
+        await self._suppress_unsolicited_realtime()
+        spoken = spoken_reef_source_answer(self._last_reef_response_source, self._last_reef_response_type)
+        logger.info(
+            "[REEF_ROUTER] source_question last_source=%s last_type=%s last_route=%s",
+            self._last_reef_response_source,
+            self._last_reef_response_type,
+            self._last_reef_response_route,
+        )
+        await self._suppress_unsolicited_realtime()
+        await self._speak_reef_source_update(spoken)
+
+    async def _run_fast_apex_command(self, metric: str) -> None:
+        started = time.perf_counter()
+        await self._suppress_unsolicited_realtime()
+        _log_reef_router(
+            intent="current_stats",
+            route="local",
+            source="home_assistant",
+            source_type="current_state",
+            cache_used=False,
+            response_owner="local",
+            explicit_hermes_request=False,
+        )
+        logger.info("[APEX] fast-path invoking apex metric=%s", metric)
+        try:
+            result = await Apex()(self.deps, action="get_apex_status")
+        except Exception as exc:
+            logger.warning("[APEX] fast-path failed: %s", exc)
+            return
+        logger.info("[APEX] fast-path tool result=%s", result)
+        spoken = spoken_apex_update(result, metric)
+        source = result.get("source") if isinstance(result, dict) else None
+        logger.info("[APEX] fast-path spoken=%s source=%s", spoken, source)
+        if not spoken:
+            return
+        self._apex_spoke_turn = self._turn_generation
+        self._record_reef_response("home_assistant", "current_stats", "local")
+        await self._suppress_unsolicited_realtime()
+        await self._speak_apex_update(spoken)
+        logger.info(
+            "[APEX] fast-path metric=%s finished in %.0f ms",
+            metric,
+            (time.perf_counter() - started) * 1000,
+        )
+
+    async def _run_fast_hermes_reef_command(
+        self, transcript: str, intent: str, explicit_hermes_request: bool = False
+    ) -> None:
+        started = time.perf_counter()
+        await self._suppress_unsolicited_realtime()
+        try:
+            result = await AskHermes()(self.deps, query=transcript)
+        except Exception as exc:
+            logger.warning("[HERMES] fast-path failed intent=%s: %s", intent, exc)
+            return
+        spoken = _hermes_result_text(result)
+        cache_used = bool(result.get("cache_used")) if isinstance(result, dict) else False
+        source_type = "cached_trends" if intent == "trends" else "cached_report"
+        if not cache_used:
+            source_type = "live_trends" if intent == "trends" else "live_report"
+        if intent == "trends":
+            trends = result.get("trends") if isinstance(result, dict) else None
+            trend_keys = sorted(str(key) for key in trends) if isinstance(trends, dict) else []
+            logger.info("[REEF_ROUTER] trend_keys=%s", trend_keys)
+        _log_reef_router(
+            intent=intent,
+            route="ask_hermes",
+            source="hermes",
+            source_type=source_type,
+            cache_used=cache_used,
+            response_owner="ask_hermes",
+            explicit_hermes_request=explicit_hermes_request,
+        )
+        if not spoken:
+            return
+        self._hermes_spoke_turn = self._turn_generation
+        self._record_reef_response("hermes", intent, "ask_hermes")
+        await self._suppress_unsolicited_realtime()
+        await self._speak_hermes_reef_update(spoken)
+        logger.info(
+            "[HERMES] fast-path intent=%s finished in %.0f ms cached=%s",
+            intent,
+            (time.perf_counter() - started) * 1000,
+            cache_used,
+        )
+
     async def _start_bus_monitor(self) -> None:
         try:
             manager = get_bus_monitor()
-            manager.attach(instance_path=self.instance_path, notify=self._speak_bus_alert)
+            manager.attach(
+                instance_path=self.instance_path,
+                notify=self._speak_bus_alert,
+                play_helpful1=self._play_bus_helpful1,
+            )
             await manager.resume_from_disk()
         except Exception as exc:
             logger.warning("Bus monitor failed to start: %s", exc)
 
+    async def _play_bus_helpful1(self) -> None:
+        """Queue official helpful1 on the existing Reachy movement manager."""
+        result = await PlayEmotion()(self.deps, emotion="helpful1", allow_random=False)
+        error = result.get("error")
+        if error is not None:
+            raise RuntimeError(str(error))
+
     def _reset_device_success_turn_state(self) -> None:
         """Clear per-turn device-control success tracking."""
         self._turn_device_control_call_ids.clear()
+        self._turn_screen_up_call_ids.clear()
         self._device_success_emotion_played = False
 
     def _value_from_tool_args(self, args_json: str, key: str) -> object:
@@ -419,20 +692,50 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             return None
         return parsed.get(key)
 
-    async def _play_device_success_emotion(self) -> None:
+    async def _play_success_emotion_after_ha_control(
+        self,
+        result: dict[str, Any] | None,
+        error: str | None,
+        *,
+        screen_up: bool = False,
+    ) -> None:
+        """Play success only after Home Assistant confirms the control action."""
+        success = is_device_control_success(result, error)
+        if screen_up and not success:
+            logger.warning("[SCREEN UP] Home Assistant turn-on failed")
+            logger.info("[SCREEN UP] success emotion skipped")
+            return
+        if not success:
+            return
+        if screen_up:
+            logger.info("[SCREEN UP] Home Assistant turn-on successful")
+        await self._play_device_success_emotion(screen_up=screen_up)
+
+    async def _play_device_success_emotion(self, *, screen_up: bool = False) -> None:
         """Queue the existing success emotion once after a confirmed device action."""
         if self._device_success_emotion_played:
             return
         self._device_success_emotion_played = True
+        if screen_up:
+            logger.info("[SCREEN UP] Playing success emotion")
         try:
             result = await PlayEmotion()(self.deps, emotion="success", allow_random=False)
         except Exception as exc:
-            logger.warning("Device success emotion failed: %s", exc)
+            if screen_up:
+                logger.warning("[SCREEN UP] Unable to play success emotion: %s", exc)
+            else:
+                logger.warning("Device success emotion failed: %s", exc)
             return
         if result.get("error"):
-            logger.warning("Device success emotion failed: %s", result["error"])
+            if screen_up:
+                logger.warning("[SCREEN UP] Unable to play success emotion: %s", result["error"])
+            else:
+                logger.warning("Device success emotion failed: %s", result["error"])
             return
-        logger.info("Played device success emotion: %s", result.get("emotion"))
+        if screen_up:
+            logger.info("[SCREEN UP] success emotion completed")
+        else:
+            logger.info("Played device success emotion: %s", result.get("emotion"))
 
     async def _complete_skipped_success_emotion(self, call_id: str) -> None:
         """Finish a play_emotion(success) call without queuing a second animation."""
@@ -488,6 +791,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if self._user_speech_in_progress:
             return
         if call_id not in self._in_flight_tool_calls:
+            return
+        if self._reef_router_owns_turn == self._turn_generation:
             return
         if self._active_response_transcript_seen or self._active_response_audio_delta_count > 0:
             return
@@ -899,7 +1204,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         logger.info("Queued response.create reason=%s", reason)
         await self._pending_responses.put((reason, kwargs))
 
-    async def say(self, text: str) -> None:
+    async def say(self, text: str, **create_kwargs: Any) -> None:
         """Inject ``text`` as a turn and have the model voice it now.
 
         Mirrors the startup-greeting path: create a user message item, then
@@ -919,11 +1224,35 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             },
         )
         self._mark_activity("say")
-        await self._safe_response_create(reason="say")
+        await self._safe_response_create(reason="say", **create_kwargs)
+
+    async def _cancel_active_realtime_response(self) -> None:
+        """Cancel the in-flight realtime response, if the server accepts cancel."""
+        if not self.connection:
+            return
+        try:
+            await self.connection.response.cancel()
+        except Exception as exc:
+            logger.debug("Failed to cancel realtime response: %s", exc)
 
     async def _send_startup_greeting_prompt(self) -> None:
         """Prompt the model to open the conversation once the session is ready."""
         if self._startup_greeting_sent or not self.connection:
+            return
+
+        if boot_sequence_already_delivered():
+            self._startup_greeting_sent = True
+            return
+
+        try:
+            delivered = await deliver_boot_sequence(self.deps, self.say)
+        except Exception as e:
+            logger.warning("Startup diagnostic sequence failed: %s", e)
+            delivered = False
+
+        if delivered:
+            self._startup_greeting_sent = True
+            self._mark_activity("startup_greeting_prompt")
             return
 
         greeting_prompt = get_session_greeting_prompt().strip()
@@ -1072,6 +1401,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 completed_tool.tool_name,
                 completed_tool.id,
             )
+            if completed_tool.tool_name in {"apex", "reef_status", "monitor_bus", "ask_hermes"}:
+                logger.info("[TOOL] %s result passed to model: %s", completed_tool.tool_name, tool_result_for_model)
             logger.debug("Tool '%s' model-visible result: %s", completed_tool.tool_name, tool_result_for_model)
         else:
             logger.warning(
@@ -1194,27 +1525,39 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         jpeg_bytes,
                     )
 
+            screen_up_call = completed_tool.id in self._turn_screen_up_call_ids
             if isinstance(completed_tool.id, str):
                 self._in_flight_tool_calls.discard(completed_tool.id)
                 self._turn_device_control_call_ids.discard(completed_tool.id)
+                self._turn_screen_up_call_ids.discard(completed_tool.id)
 
-            if (
-                not result_is_stale
-                and completed_tool.tool_name == "home_assistant"
-                and is_device_control_success(completed_tool.result, completed_tool.error)
-            ):
-                await self._play_device_success_emotion()
+            if not result_is_stale and completed_tool.tool_name == "home_assistant":
+                screen_up = screen_up_call or is_screen_up_success(completed_tool.result, completed_tool.error)
+                await self._play_success_emotion_after_ha_control(
+                    completed_tool.result,
+                    completed_tool.error,
+                    screen_up=screen_up,
+                )
 
             tool = core_tools.get_tools().get(completed_tool.tool_name)
             bus_already_spoken = self._bus_spoke_turn == self._turn_generation and completed_tool.tool_name in {
                 "home_assistant",
                 "monitor_bus",
             }
+            apex_already_spoken = self._apex_spoke_turn == self._turn_generation and completed_tool.tool_name in {
+                "apex",
+                "reef_status",
+            }
+            hermes_already_spoken = (
+                self._hermes_spoke_turn == self._turn_generation and completed_tool.tool_name == "ask_hermes"
+            )
 
             # Always surface errors, skip the spoken follow-up for tools that opt out.
             if (
                 model_result_submitted
                 and not bus_already_spoken
+                and not apex_already_spoken
+                and not hermes_already_spoken
                 and (tool is None or tool.wants_spoken_followup(completed_tool.result, completed_tool.error))
             ):
                 self._tool_batch_needs_response = True
@@ -1314,10 +1657,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     if event.type == "response.output_audio.done":
                         self.deps.movement_manager.set_speaking(False)
                         logger.info(
-                            "Response audio done reason=%s audio_deltas=%d audio_bytes=%d",
+                            "Response audio done reason=%s audio_deltas=%d audio_bytes=%d dropped=%s",
                             self._active_response_reason,
                             self._active_response_audio_delta_count,
                             self._active_response_audio_bytes,
+                            self._drop_active_response_output,
                         )
 
                     if event.type == "response.output_text.delta":
@@ -1327,15 +1671,32 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         logger.debug("response text done: %s", event.text)
 
                     if event.type == "response.created":
+                        response_id = _realtime_response_id(event)
+                        self._reset_active_response_audio_state()
+                        self._drop_active_response_output = (
+                            self._active_response_reason is None
+                            and self._suppress_unsolicited_response_turn == self._turn_generation
+                        )
                         self._mark_activity("response_created")
-                        self.deps.movement_manager.set_speaking(True)
                         self._response_done_event.clear()
                         self._response_started_or_rejected_event.set()
                         if self._turn_user_done_at is not None and self._turn_response_created_at is None:
                             self._turn_response_created_at = time.perf_counter()
                             delta_ms = (self._turn_response_created_at - self._turn_user_done_at) * 1000
                             logger.info("Turn latency: response.created %.0f ms after user transcript", delta_ms)
-                        logger.info("Response created reason=%s", self._active_response_reason)
+                        logger.info(
+                            "Response created reason=%s response_id=%s",
+                            self._active_response_reason,
+                            response_id,
+                        )
+                        if self._drop_active_response_output:
+                            logger.info(
+                                "[ROUTER] suppressing unsolicited realtime response reason=deterministic_route response_id=%s",
+                                response_id,
+                            )
+                            await self._cancel_active_realtime_response()
+                        else:
+                            self.deps.movement_manager.set_speaking(True)
 
                     if event.type == "response.done":
                         # Doesn't mean the audio is done playing
@@ -1370,6 +1731,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             await self._set_tool_followup_choice("auto")
                         self._active_response_reason = None
                         self._active_response_started_at = None
+                        self._drop_active_response_output = False
 
                     if event.type == "conversation.item.input_audio_transcription.delta":
                         self._mark_activity("user_transcription_delta")
@@ -1421,19 +1783,41 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._tool_batch_needs_response = False
                         self._reset_device_success_turn_state()
                         self._reset_active_response_audio_state()
+                        self._delivered_assistant_transcript_ids.clear()
+                        self._suppress_unsolicited_response_turn = None
+                        self._drop_active_response_output = False
+                        self._reef_router_owns_turn = None
+                        self._reef_router_route = None
                         self._start_fast_ha_command(transcript)
                         self._start_fast_bus_command(transcript)
+                        self._start_fast_apex_command(transcript)
 
                         await self.output_queue.put(AdditionalOutputs({"role": "user", "content": transcript}))
                         self._emit_transcript("user", transcript, True)
 
                     # Handle assistant transcription
                     if event.type == "response.output_audio_transcript.done":
+                        if self._drop_active_response_output:
+                            continue
+                        transcript_identity = _assistant_transcript_identity(event)
+                        if transcript_identity is not None:
+                            if transcript_identity in self._delivered_assistant_transcript_ids:
+                                logger.info(
+                                    "Skipping duplicate assistant transcript response_id=%s item_id=%s event_id=%s",
+                                    _realtime_response_id(event),
+                                    getattr(event, "item_id", None),
+                                    getattr(event, "event_id", None),
+                                )
+                                continue
+                            self._delivered_assistant_transcript_ids.add(transcript_identity)
                         self._mark_activity("assistant_transcript_done")
                         self._active_response_transcript_seen = bool(event.transcript)
                         logger.info(
-                            "Assistant transcript done reason=%s transcript=%s",
+                            "Assistant transcript done reason=%s response_id=%s item_id=%s event_id=%s transcript=%s",
                             self._active_response_reason,
+                            _realtime_response_id(event),
+                            getattr(event, "item_id", None),
+                            getattr(event, "event_id", None),
                             event.transcript,
                         )
                         await self.output_queue.put(
@@ -1443,6 +1827,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                     # Handle audio delta
                     if event.type == "response.output_audio.delta":
+                        if self._drop_active_response_output:
+                            continue
                         decoded_pcm_bytes = base64.b64decode(event.delta)
                         decoded_pcm = np.frombuffer(decoded_pcm_bytes, dtype=np.int16).reshape(1, -1)
                         self._mark_activity("assistant_audio_delta")
@@ -1464,6 +1850,37 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         tool_name = getattr(event, "name", None)
                         args_json_str = getattr(event, "arguments", None)
                         call_id: str = str(getattr(event, "call_id", uuid.uuid4()))
+
+                        skip_deterministic_tool = False
+                        if isinstance(tool_name, str) and self._reef_router_owns_turn == self._turn_generation:
+                            if tool_name in _COMPETING_REEF_TOOLS:
+                                logger.info(
+                                    "[REEF_ROUTER] skipping competing %s; response_owner=deterministic normal_llm_bypass=true",
+                                    tool_name,
+                                )
+                                skip_deterministic_tool = True
+                            elif tool_name == "ask_hermes":
+                                route = self._reef_router_route
+                                if route is not None and route.route == "ask_hermes":
+                                    logger.info("[REEF_ROUTER] ask_hermes already dispatched by deterministic route")
+                                else:
+                                    logger.info(
+                                        "[REEF_ROUTER] skipping competing ask_hermes; "
+                                        "response_owner=deterministic normal_llm_bypass=true"
+                                    )
+                                skip_deterministic_tool = True
+                        if skip_deterministic_tool:
+                            if self.connection:
+                                await self.connection.conversation.item.create(
+                                    item={
+                                        "type": "function_call_output",
+                                        "call_id": call_id,
+                                        "output": json.dumps(
+                                            {"status": "skipped", "reason": "deterministic_reef_route"}
+                                        ),
+                                    },
+                                )
+                            continue
 
                         logger.info(
                             "Tool call received — tool_name=%r, call_id=%s, args=%s",
@@ -1495,10 +1912,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._turn_tool_received_at = time.perf_counter()
                         self._tool_call_generation[call_id] = self._turn_generation
                         self._in_flight_tool_calls.add(call_id)
-                        if tool_name == "home_assistant" and is_control_action(
-                            self._value_from_tool_args(args_json_str, "action")
-                        ):
-                            self._turn_device_control_call_ids.add(call_id)
+                        if tool_name == "home_assistant":
+                            ha_action = self._value_from_tool_args(args_json_str, "action")
+                            if is_control_action(ha_action):
+                                self._turn_device_control_call_ids.add(call_id)
+                            if is_screen_up_command(ha_action, self._value_from_tool_args(args_json_str, "entity_id")):
+                                self._turn_screen_up_call_ids.add(call_id)
+                                logger.info("[SCREEN UP] User requested Screen Up")
                         if tool_name == "play_emotion" and is_success_emotion_request(
                             self._value_from_tool_args(args_json_str, "emotion")
                         ):
@@ -1683,6 +2103,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if self._fast_bus_task is not None:
             self._fast_bus_task.cancel()
             self._fast_bus_task = None
+        if self._fast_apex_task is not None:
+            self._fast_apex_task.cancel()
+            self._fast_apex_task = None
         if self._bus_monitor_start_task is not None:
             self._bus_monitor_start_task.cancel()
             self._bus_monitor_start_task = None

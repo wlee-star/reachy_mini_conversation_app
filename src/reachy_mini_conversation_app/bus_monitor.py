@@ -15,6 +15,7 @@ import logging
 from typing import Any, Callable, Awaitable
 from pathlib import Path
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from dataclasses import asdict, replace, dataclass
 from urllib.parse import quote
 from collections.abc import Mapping
@@ -38,6 +39,8 @@ logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 DEFAULT_ROUTE = "311"
+SYDNEY_TIMEZONE = "Australia/Sydney"
+_SYDNEY_TZ = ZoneInfo(SYDNEY_TIMEZONE)
 DEFAULT_PREPARATION_MINUTES = 15
 TEN_MINUTE_THRESHOLD = 10
 SEVEN_MINUTE_THRESHOLD = 7
@@ -88,6 +91,8 @@ _CONTINUOUS_RE = re.compile(
 _CLOCK_RE = re.compile(r"\b(\d{1,2}:\d{2})(?::\d{2})?\b")
 
 NotifyFn = Callable[[str], Awaitable[None]]
+PlayHelpful1Fn = Callable[[], Awaitable[None]]
+TEN_MINUTE_EMOTION = "helpful1"
 
 
 @dataclass(frozen=True)
@@ -194,14 +199,22 @@ def _scheduled_from_source(source: Mapping[str, Any]) -> str | None:
     )
 
 
-def _parse_ha_timestamp(value: object) -> float | None:
+def _parse_ha_datetime(value: object) -> datetime | None:
     if not isinstance(value, str) or not value.strip():
         return None
     text = value.strip().replace("Z", "+00:00")
     try:
-        return datetime.fromisoformat(text).timestamp()
+        parsed = datetime.fromisoformat(text)
     except ValueError:
         return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=_SYDNEY_TZ)
+    return parsed
+
+
+def _parse_ha_timestamp(value: object) -> float | None:
+    parsed = _parse_ha_datetime(value)
+    return parsed.timestamp() if parsed is not None else None
 
 
 def _arrival_from_details(
@@ -305,6 +318,10 @@ def _clock_label(arrival: BusArrival) -> str | None:
             continue
         if re.search(r"\b(?:h|hr|hour|min|mins|minute)\b", candidate, re.IGNORECASE):
             continue
+        parsed = _parse_ha_datetime(candidate)
+        if parsed is not None and any(marker in candidate for marker in ("T", "+", "Z")):
+            local = parsed.astimezone(_SYDNEY_TZ)
+            return f"{local.hour:02d}:{local.minute:02d}"
         match = _CLOCK_RE.search(candidate)
         if match is None:
             continue
@@ -316,7 +333,7 @@ def _clock_label(arrival: BusArrival) -> str | None:
 
 
 def _approx_clock(minutes: int) -> str:
-    when = datetime.now() + timedelta(minutes=max(0, minutes))
+    when = datetime.now(_SYDNEY_TZ) + timedelta(minutes=max(0, minutes))
     hour = when.hour % 12 or 12
     return f"{hour}:{when.minute:02d}"
 
@@ -364,8 +381,9 @@ def format_initial_spoken(
         spoken = f"The next {route} is arriving in about {arrival.minutes} minutes. Please leave now."
     else:
         spoken = f"The next {route} is currently about {arrival.minutes} minutes away"
-        if arrival.eta_display and _clock_label(arrival):
-            spoken += f", expected at {arrival.eta_display}"
+        clock = _clock_label(arrival)
+        if clock:
+            spoken += f", expected at {clock}"
         spoken += "."
         if following_clause is not None:
             spoken += f" {following_clause}."
@@ -542,6 +560,60 @@ def evaluate_alerts(monitor: BusMonitorState, arrival: BusArrival) -> list[str]:
     return alerts
 
 
+def _arrival_diagnostic(arrival: BusArrival) -> dict[str, Any]:
+    return {
+        "minutes": arrival.minutes,
+        "route": arrival.route,
+        "stop": arrival.stop,
+        "destination": arrival.destination,
+        "eta_display": arrival.eta_display,
+        "scheduled_at": arrival.scheduled_at,
+        "realtime": arrival.realtime,
+        "service_id": arrival.service_id,
+    }
+
+
+def _sydney_iso(value: float | None) -> str | None:
+    if value is None:
+        return None
+    return datetime.fromtimestamp(value, _SYDNEY_TZ).isoformat()
+
+
+def _log_ha_bus_payload(payload: dict[str, Any], entity_id: str, arrivals: list[BusArrival]) -> None:
+    attributes = payload.get("attributes")
+    if not isinstance(attributes, dict):
+        attributes = {}
+    last_updated = payload.get("last_updated") or payload.get("last_changed")
+    parsed = _parse_ha_datetime(last_updated)
+    next_arrival = arrivals[0] if arrivals else None
+    route = attributes.get("route") or attributes.get("route_short_name")
+    stop = attributes.get("stop") or attributes.get("stop_name")
+    direction = attributes.get("direction") or attributes.get("headsign") or attributes.get("destination")
+    if next_arrival is not None:
+        route = next_arrival.route or route
+        stop = next_arrival.stop or stop
+        direction = next_arrival.destination or direction
+    logger.info(
+        "[BUS] ha_payload entity_id=%s state=%s friendly_name=%s route=%s stop=%s direction=%s "
+        "last_updated=%s last_updated_sydney=%s timezone=%s next_minutes=%s realtime=%s "
+        "scheduled_at=%s eta_display=%s arrivals=%s",
+        entity_id,
+        payload.get("state"),
+        attributes.get("friendly_name"),
+        route,
+        stop,
+        direction,
+        last_updated,
+        parsed.astimezone(_SYDNEY_TZ).isoformat() if parsed is not None else None,
+        SYDNEY_TIMEZONE,
+        next_arrival.minutes if next_arrival is not None else None,
+        next_arrival.realtime if next_arrival is not None else None,
+        next_arrival.scheduled_at if next_arrival is not None else None,
+        next_arrival.eta_display if next_arrival is not None else None,
+        [_arrival_diagnostic(item) for item in arrivals],
+    )
+
+
 async def fetch_live_snapshot() -> LiveBusSnapshot:
     """Read the configured Home Assistant 311 sensor once."""
     started = time.perf_counter()
@@ -608,6 +680,7 @@ async def fetch_live_snapshot() -> LiveBusSnapshot:
             stale = data_age_s is not None and data_age_s > STALE_AFTER_S
 
     arrivals = extract_arrivals(payload, entity_id)
+    _log_ha_bus_payload(payload, entity_id, arrivals)
     if stale and not arrivals:
         return LiveBusSnapshot(
             arrivals=[],
@@ -698,6 +771,8 @@ class BusMonitorManager:
         self._persist_path = persist_path
         self._instance_path: str | Path | None = None
         self._notify: NotifyFn | None = None
+        self._play_helpful1: PlayHelpful1Fn | None = None
+        self._helpful1_task: asyncio.Task[None] | None = None
         self._monitor: BusMonitorState | None = None
         self._task: asyncio.Task[None] | None = None
         self._lock = asyncio.Lock()
@@ -712,16 +787,19 @@ class BusMonitorManager:
         instance_path: str | Path | None,
         notify: NotifyFn,
         persist_path: Path | None = None,
+        play_helpful1: PlayHelpful1Fn | None = None,
     ) -> None:
-        """Bind speech and persistence for the current conversation session."""
+        """Bind speech, emotion playback, and persistence for the current conversation session."""
         self._instance_path = instance_path
         self._notify = notify
+        self._play_helpful1 = play_helpful1
         if persist_path is not None:
             self._persist_path = persist_path
 
     async def detach(self) -> None:
         """Stop the polling task without clearing persisted state."""
         self._notify = None
+        self._play_helpful1 = None
         await self._cancel_task()
 
     def pending_offer(self) -> bool:
@@ -819,6 +897,8 @@ class BusMonitorManager:
             "decision_latency_s": round(decision_latency, 3),
             "stale": snapshot.stale,
             "already_spoken": self.query_already_spoken(),
+            "timezone": SYDNEY_TIMEZONE,
+            "last_updated": _sydney_iso(snapshot.last_updated_s),
         }
         if snapshot.error:
             result["error"] = snapshot.error
@@ -829,8 +909,10 @@ class BusMonitorManager:
         else:
             result["minutes"] = arrival.minutes
             result["route"] = arrival.route
+            result["stop"] = arrival.stop
             result["destination"] = arrival.destination
             result["eta_display"] = arrival.eta_display
+            result["scheduled_at"] = arrival.scheduled_at
             result["realtime"] = arrival.realtime
             result["service_id"] = arrival.service_id
             following = snapshot.following_arrival
@@ -839,6 +921,7 @@ class BusMonitorManager:
                 result["following_destination"] = following.destination
                 result["following_eta_display"] = following.eta_display
                 result["following_service_id"] = following.service_id
+        logger.info("[BUS] tool_result=%s", result)
         return result
 
     def _bind_service(
@@ -1232,7 +1315,19 @@ class BusMonitorManager:
             )
             return
         following = find_following_arrival(monitor, snapshot)
+        previous_eta = monitor.latest_live_eta
         alerts = evaluate_alerts(monitor, arrival)
+        helpful1_sent = (
+            monitor.preparation_alert_sent
+            if monitor.preparation_threshold == TEN_MINUTE_THRESHOLD
+            else monitor.ten_minute_alert_sent
+        )
+        if helpful1_sent and _threshold_crossed(previous_eta, arrival.minutes, TEN_MINUTE_THRESHOLD):
+            logger.info(
+                "[311] %s already triggered for bus %s; skipping duplicate",
+                TEN_MINUTE_EMOTION,
+                monitor.service_id or monitor.monitor_id,
+            )
         monitor.latest_live_eta = arrival.minutes
         monitor.last_check = time.time()
         decision_latency = time.perf_counter() - decision_started
@@ -1251,6 +1346,12 @@ class BusMonitorManager:
                 break
             await self._emit(spoken)
             notify_latency += time.perf_counter() - notify_started
+            if alert == "ten" or (alert == "preparation" and monitor.preparation_threshold == TEN_MINUTE_THRESHOLD):
+                logger.info(
+                    "[311] Bus %s is approximately 10 minutes away",
+                    monitor.service_id or monitor.monitor_id,
+                )
+                self._schedule_helpful1()
             if self._monitor is monitor:
                 self._mark_alert_sent(monitor, alert)
         if self._monitor is monitor:
@@ -1263,6 +1364,26 @@ class BusMonitorManager:
                 notify_latency,
                 time.perf_counter() - poll_started,
             )
+
+    def _schedule_helpful1(self) -> None:
+        if self._play_helpful1 is None:
+            return
+        try:
+            self._helpful1_task = asyncio.create_task(self._play_helpful1_emotion(), name="bus-helpful1")
+        except Exception as exc:
+            logger.warning("[311] Unable to play %s emotion: %s", TEN_MINUTE_EMOTION, exc)
+
+    async def _play_helpful1_emotion(self) -> None:
+        play = self._play_helpful1
+        if play is None:
+            return
+        logger.info("[311] Playing %s emotion", TEN_MINUTE_EMOTION)
+        try:
+            await play()
+        except Exception as exc:
+            logger.warning("[311] Unable to play %s emotion: %s", TEN_MINUTE_EMOTION, exc)
+            return
+        logger.info("[311] %s emotion completed", TEN_MINUTE_EMOTION)
 
     async def _emit(self, text: str) -> None:
         notify = self._notify

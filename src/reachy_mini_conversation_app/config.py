@@ -66,10 +66,16 @@ HF_REALTIME_WS_URL_ENV = "HF_REALTIME_WS_URL"
 REALTIME_TRANSCRIPTION_LANGUAGE_ENV = "REALTIME_TRANSCRIPTION_LANGUAGE"
 HERMES_GATEWAY_URL_ENV = "HERMES_GATEWAY_URL"
 HERMES_API_KEY_ENV = "HERMES_API_KEY"
+HERMES_REQUEST_TIMEOUT_SECONDS_ENV = "HERMES_REQUEST_TIMEOUT_SECONDS"
+HERMES_REEF_REQUEST_TIMEOUT_SECONDS_ENV = "HERMES_REEF_REQUEST_TIMEOUT_SECONDS"
+DEFAULT_HERMES_REQUEST_TIMEOUT_SECONDS = 180
+DEFAULT_HERMES_REEF_REQUEST_TIMEOUT_SECONDS = 15
 HA_URL_ENV = "HA_URL"
 HA_TOKEN_ENV = "HA_TOKEN"
 HA_BUS_ENTITY_ID_ENV = "HA_BUS_ENTITY_ID"
 APEX_STATUS_URL_ENV = "APEX_STATUS_URL"
+REEF_CACHE_MAX_AGE_SECONDS_ENV = "REEF_CACHE_MAX_AGE_SECONDS"
+DEFAULT_REEF_CACHE_MAX_AGE_SECONDS = 3600
 HF_LOCAL_CONNECTION_MODE = "local"
 HF_DEPLOYED_CONNECTION_MODE = "deployed"
 HF_REALTIME_SESSION_PROXY_URL = "https://pollen-robotics-reachy-mini-realtime-url.hf.space/session"
@@ -125,6 +131,22 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
     logger.warning("Invalid boolean value for %s=%r, using default=%s", name, raw, default)
     return default
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    """Parse a positive integer environment variable, keeping the default on invalid input."""
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r; using default %s.", name, raw, default)
+        return default
+    if value <= 0:
+        logger.warning("Ignoring non-positive %s=%r; using default %s.", name, raw, default)
+        return default
+    return value
 
 
 APP_TIMEOUT_MINUTES_ENV = "REACHY_MINI_APP_TIMEOUT_MINUTES"
@@ -326,10 +348,17 @@ class Config:
     HF_TOKEN = os.getenv("HF_TOKEN")  # Optional, falls back to hf auth login if not set
     HERMES_GATEWAY_URL = os.getenv(HERMES_GATEWAY_URL_ENV)
     HERMES_API_KEY = os.getenv(HERMES_API_KEY_ENV)
+    HERMES_REQUEST_TIMEOUT_SECONDS = _env_positive_int(
+        HERMES_REQUEST_TIMEOUT_SECONDS_ENV, DEFAULT_HERMES_REQUEST_TIMEOUT_SECONDS
+    )
+    HERMES_REEF_REQUEST_TIMEOUT_SECONDS = _env_positive_int(
+        HERMES_REEF_REQUEST_TIMEOUT_SECONDS_ENV, DEFAULT_HERMES_REEF_REQUEST_TIMEOUT_SECONDS
+    )
     HA_URL = os.getenv(HA_URL_ENV)
     HA_TOKEN = os.getenv(HA_TOKEN_ENV)
     HA_BUS_ENTITY_ID = os.getenv(HA_BUS_ENTITY_ID_ENV)
     APEX_STATUS_URL = os.getenv(APEX_STATUS_URL_ENV)
+    REEF_CACHE_MAX_AGE_SECONDS = _env_positive_int(REEF_CACHE_MAX_AGE_SECONDS_ENV, DEFAULT_REEF_CACHE_MAX_AGE_SECONDS)
 
     logger.debug(
         "HF mode: %s, HF session URL set: %s, HF direct URL set: %s",
@@ -444,10 +473,19 @@ def refresh_runtime_config_from_env() -> None:
     config.HF_TOKEN = os.getenv("HF_TOKEN")
     config.HERMES_GATEWAY_URL = os.getenv(HERMES_GATEWAY_URL_ENV)
     config.HERMES_API_KEY = os.getenv(HERMES_API_KEY_ENV)
+    config.HERMES_REQUEST_TIMEOUT_SECONDS = _env_positive_int(
+        HERMES_REQUEST_TIMEOUT_SECONDS_ENV, DEFAULT_HERMES_REQUEST_TIMEOUT_SECONDS
+    )
+    config.HERMES_REEF_REQUEST_TIMEOUT_SECONDS = _env_positive_int(
+        HERMES_REEF_REQUEST_TIMEOUT_SECONDS_ENV, DEFAULT_HERMES_REEF_REQUEST_TIMEOUT_SECONDS
+    )
     config.HA_URL = os.getenv(HA_URL_ENV)
     config.HA_TOKEN = os.getenv(HA_TOKEN_ENV)
     config.HA_BUS_ENTITY_ID = os.getenv(HA_BUS_ENTITY_ID_ENV)
     config.APEX_STATUS_URL = os.getenv(APEX_STATUS_URL_ENV)
+    config.REEF_CACHE_MAX_AGE_SECONDS = _env_positive_int(
+        REEF_CACHE_MAX_AGE_SECONDS_ENV, DEFAULT_REEF_CACHE_MAX_AGE_SECONDS
+    )
     config.REACHY_MINI_CUSTOM_PROFILE = LOCKED_PROFILE or os.getenv("REACHY_MINI_CUSTOM_PROFILE")
 
 

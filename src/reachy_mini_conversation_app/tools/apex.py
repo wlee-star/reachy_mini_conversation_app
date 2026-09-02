@@ -4,7 +4,7 @@ from typing import Any
 from dataclasses import dataclass
 
 from reachy_mini_conversation_app.tools.core_tools import Tool, ToolDependencies
-from reachy_mini_conversation_app.tools.reef_status import _load_reef_snapshot
+from reachy_mini_conversation_app.tools.reef_status import _load_reef_snapshot, snapshot_provenance
 
 
 logger = logging.getLogger(__name__)
@@ -265,7 +265,9 @@ class Apex(Tool):
         "Get current Neptune Apex reef status from the local Apex /status URL when APEX_STATUS_URL "
         "is set, otherwise the reef cache. Use immediately for live tank status, current temperature, "
         "pH, ORP, salinity, equipment, alarm, or alert. Not for historical trends, threading, or ATO "
-        "history — use ask_hermes for those. Returns structured current data."
+        "history — use ask_hermes for those. Returns structured current data. "
+        "source=live and stale=false is current Apex data. source=cache and stale=true is cached: "
+        "use the numbers but tell the user they are cached/stale, not live."
     )
     parameters_schema = {
         "type": "object",
@@ -290,7 +292,7 @@ class Apex(Tool):
         action = action_raw if isinstance(action_raw, str) else ""
         logger.info("[APEX] apex tool invoked action=%s", action or "(missing)")
         if action not in {"get_apex_status", "get_water_parameters", "get_equipment_status", "get_alerts"}:
-            result = {
+            result: dict[str, Any] = {
                 "error": "action must be one of get_apex_status, get_water_parameters, "
                 "get_equipment_status, get_alerts"
             }
@@ -299,11 +301,21 @@ class Apex(Tool):
 
         cache, error = await _load_reef_snapshot()
         if error is not None and cache is None:
-            result = {"error": error or "Apex reef cache is unavailable."}
+            result = {
+                "error": error or "Apex reef cache is unavailable.",
+                "status": "error",
+                "stale": True,
+                "source": "none",
+            }
             logger.info("[APEX] apex tool result=%s", result)
             return result
         if cache is None:
-            result = {"error": "Apex reef cache is unavailable."}
+            result = {
+                "error": "Apex reef cache is unavailable.",
+                "status": "error",
+                "stale": True,
+                "source": "none",
+            }
             logger.info("[APEX] apex tool result=%s", result)
             return result
 
@@ -319,6 +331,7 @@ class Apex(Tool):
         return result
 
     def _apex_status(self, cache: dict[str, Any]) -> dict[str, Any]:
+        provenance = snapshot_provenance(cache)
         return {
             "apex_status": {
                 "water_parameters": _dict_field(cache, "probes"),
@@ -328,9 +341,9 @@ class Apex(Tool):
                 "controller": cache.get("controller"),
                 "cached_at": cache.get("cached_at"),
                 "age_seconds": cache.get("age_seconds"),
-                "stale": cache.get("stale", False),
+                "stale": provenance["stale"],
             },
-            "source": _source(cache),
+            **provenance,
         }
 
     def _water_parameters(self, cache: dict[str, Any], include: object) -> dict[str, Any]:
@@ -338,31 +351,31 @@ class Apex(Tool):
         filtered_probes = _filter_probes(probes, include)
         if include is not None and not filtered_probes:
             return {"error": "include must be a list of known water parameter names"}
+        provenance = snapshot_provenance(cache)
         return {
             "water_parameters": filtered_probes,
             "cached_at": cache.get("cached_at"),
             "age_seconds": cache.get("age_seconds"),
-            "stale": cache.get("stale", False),
-            "source": _source(cache),
+            **provenance,
         }
 
     def _equipment_status(self, cache: dict[str, Any]) -> dict[str, Any]:
+        provenance = snapshot_provenance(cache)
         return {
             "equipment_status": self._equipment_payload(cache),
             "cached_at": cache.get("cached_at"),
             "age_seconds": cache.get("age_seconds"),
-            "stale": cache.get("stale", False),
-            "source": _source(cache),
+            **provenance,
         }
 
     def _alerts(self, cache: dict[str, Any]) -> dict[str, Any]:
+        provenance = snapshot_provenance(cache)
         return {
             "alerts": _list_field(cache, "alerts"),
             "alarms": _dict_field(cache, "alarms"),
             "cached_at": cache.get("cached_at"),
             "age_seconds": cache.get("age_seconds"),
-            "stale": cache.get("stale", False),
-            "source": _source(cache),
+            **provenance,
         }
 
     def _equipment_payload(self, cache: dict[str, Any]) -> dict[str, Any]:
@@ -372,8 +385,3 @@ class Apex(Tool):
             "controller": cache.get("controller"),
             "outlets": outlets if isinstance(outlets, list) else [],
         }
-
-
-def _source(cache: dict[str, Any]) -> str:
-    source = cache.get("source")
-    return source if isinstance(source, str) else "reef_cache_direct"

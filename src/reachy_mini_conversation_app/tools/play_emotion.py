@@ -162,13 +162,34 @@ _INTENT_TO_MOVES: dict[str, tuple[str, ...]] = {
     "goodbye": ("loving1", "welcoming2"),
     "go_away": ("go_away1",),
     "helpful": ("helpful1",),
-    "dance": ("dance2", "dance3"),
+    "dance": ("dance1", "dance2", "dance3"),
     "electric": ("electric1",),
     "dying": ("dying1",),
 }
 
 _ALLOWED_MOVE_NAMES: frozenset[str] = frozenset(_CURATED_DEFAULT_MOVES).union(*_INTENT_TO_MOVES.values())
 _SUCCESS_EMOTION_KEYS: frozenset[str] = frozenset({"success", "success1", "success2"})
+_DANCE_EMOTION_KEYS: frozenset[str] = frozenset({"dance", "dance1", "dance2", "dance3"})
+_DANCE_WAKE_PREFIX = re.compile(r"^(?:hey |hi |hello |ok |okay )?(?:reachy|erichi|richie|rishi|ricci|ritchie)\s+")
+_DANCE_INFORMATIONAL_RE = re.compile(
+    r"\b(?:what is|whats|what are|tell me about|history of|watched|watching|know what|definition of)\b"
+)
+_DANCE_REFUSAL_RE = re.compile(r"\b(?:dont|do not|never) (?:want (?:you to )?|you )?danc")
+_DANCE_ENERGETIC_RE = re.compile(r"\b(?:energetic|crazy|wild|insane|best)\b")
+_DANCE_REQUEST_RE = re.compile(
+    r"(?:"
+    r"^(?:please )?danc(?:e|es|ing)?(?: for me)?(?: please)?$"
+    r"|lets danc"
+    r"|(?:can|could|will|would) (?:you |reachy )?(?:please )?danc"
+    r"|(?:can|could|will|would) you (?:please )?(?:show me )?how (?:you |to )?danc"
+    r"|do you (?:know how (?:to |you )?|wanna |want to )?danc"
+    r"|(?:i )?(?:want to|wanna) (?:see |watch )?(?:you )?danc"
+    r"|(?:show|give) (?:me )?(?:a |an |some |your |off your )?(?:\w+ )?danc"
+    r"|do (?:a |an |some |your )?(?:\w+ )?danc"
+    r"|(?:show|do|give) (?:me )?(?:some |a few |your |off (?:your )?)?(?:best )?(?:dance )?moves"
+    r"|(?:can|could|will|would) you (?:please )?(?:do|show) (?:me )?(?:some |a few )?(?:dance )?moves"
+    r")"
+)
 
 _KEYWORD_INTENTS: tuple[tuple[tuple[str, ...], str], ...] = (
     (("no", "sad"), "no_sad"),
@@ -196,6 +217,35 @@ def _keyword_intent(normalized_key: str) -> str | None:
 def is_success_emotion_request(requested_emotion: object) -> bool:
     """Return whether a play_emotion request is the curated success intent or move."""
     return _normalize_emotion_key(str(requested_emotion or "")) in _SUCCESS_EMOTION_KEYS
+
+
+def is_dance_emotion_request(requested_emotion: object) -> bool:
+    """Return whether a play_emotion request is the curated dance intent or move."""
+    return _normalize_emotion_key(str(requested_emotion or "")) in _DANCE_EMOTION_KEYS
+
+
+def _normalize_dance_transcript(transcript: str) -> str:
+    without_accents = unicodedata.normalize("NFKD", transcript).encode("ascii", "ignore").decode("ascii")
+    text = without_accents.lower().strip().replace("'", "")
+    text = re.sub(r"[.!?,;:]+", " ", text)
+    text = re.sub(r"\bu\b", "you", text)
+    text = re.sub(r"\b(?:pls|plz)\b", "please", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return _DANCE_WAKE_PREFIX.sub("", text).strip()
+
+
+def match_dance_intent(transcript: str) -> str | None:
+    """Return dance1 or dance3 when the user is asking Reachy to perform a dance."""
+    text = _normalize_dance_transcript(transcript)
+    if not text:
+        return None
+    if _DANCE_INFORMATIONAL_RE.search(text) or _DANCE_REFUSAL_RE.search(text):
+        return None
+    if _DANCE_REQUEST_RE.search(text) is None:
+        return None
+    if _DANCE_ENERGETIC_RE.search(text):
+        return "dance3"
+    return "dance1"
 
 
 def resolve_emotion_name(requested_emotion: object, available_emotions: list[str]) -> str | None:
@@ -272,7 +322,9 @@ class PlayEmotion(Tool):
         try:
             if self._library is None:
                 # Constructing this downloads the dataset, so it must not run at import.
-                self._library = RecordedMoves("pollen-robotics/reachy-mini-emotions-library")
+                if PlayEmotion._library is None:
+                    PlayEmotion._library = RecordedMoves("pollen-robotics/reachy-mini-emotions-library")
+                self._library = PlayEmotion._library
             library = self._library
             emotion_names = library.list_moves()
             if not emotion_names:

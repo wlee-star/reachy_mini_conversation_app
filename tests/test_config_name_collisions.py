@@ -154,6 +154,29 @@ def test_refresh_runtime_config_reloads_apex_status_url(monkeypatch: pytest.Monk
     assert config_mod.config.APEX_STATUS_URL == "http://192.168.0.143:8080/status"
 
 
+def test_refresh_runtime_config_reloads_reef_cache_max_age(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Instance-local .env reloads should pick up the Reef cache freshness threshold."""
+    monkeypatch.setenv("REEF_CACHE_MAX_AGE_SECONDS", "7200")
+    monkeypatch.setattr(config_mod.config, "REEF_CACHE_MAX_AGE_SECONDS", 3600)
+
+    config_mod.refresh_runtime_config_from_env()
+
+    assert config_mod.config.REEF_CACHE_MAX_AGE_SECONDS == 7200
+
+
+def test_refresh_runtime_config_reloads_hermes_timeouts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Instance-local .env reloads should pick up Hermes live-wait timeouts."""
+    monkeypatch.setenv("HERMES_REQUEST_TIMEOUT_SECONDS", "120")
+    monkeypatch.setenv("HERMES_REEF_REQUEST_TIMEOUT_SECONDS", "20")
+    monkeypatch.setattr(config_mod.config, "HERMES_REQUEST_TIMEOUT_SECONDS", 180)
+    monkeypatch.setattr(config_mod.config, "HERMES_REEF_REQUEST_TIMEOUT_SECONDS", 15)
+
+    config_mod.refresh_runtime_config_from_env()
+
+    assert config_mod.config.HERMES_REQUEST_TIMEOUT_SECONDS == 120
+    assert config_mod.config.HERMES_REEF_REQUEST_TIMEOUT_SECONDS == 20
+
+
 @pytest.mark.parametrize(
     ("configured_mode", "session_url", "direct_ws_url", "expected_mode", "expected_has_target"),
     [

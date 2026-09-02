@@ -62,7 +62,12 @@ from reachy_mini_conversation_app.startup_diagnostic import (
     deliver_boot_sequence,
     boot_sequence_already_delivered,
 )
-from reachy_mini_conversation_app.tools.play_emotion import PlayEmotion, is_success_emotion_request
+from reachy_mini_conversation_app.tools.play_emotion import (
+    PlayEmotion,
+    match_dance_intent,
+    is_dance_emotion_request,
+    is_success_emotion_request,
+)
 from reachy_mini_conversation_app.conversation_handler import ConversationHandler
 from reachy_mini_conversation_app.tools.home_assistant import (
     HomeAssistant,
@@ -119,8 +124,7 @@ _APEX_ALERT_PROMPT: Final[str] = (
     "percentage, unit, or salinity claim, and do not mention tools or Apex: {text}"
 )
 _HERMES_REEF_ALERT_PROMPT: Final[str] = (
-    "Speak this exact reef report to the user now. Do not call tools. "
-    "Do not mention files, Hermes, or that this was cached: {text}"
+    "Speak this exact reef report to the user now. Do not call tools. Do not mention files or tools: {text}"
 )
 _REEF_SOURCE_ALERT_PROMPT: Final[str] = (
     "Speak this exact sentence to the user now. Do not call tools. Do not add extra explanation: {text}"
@@ -190,6 +194,19 @@ def _hermes_result_text(tool_result: object) -> str:
     if isinstance(tool_result, str) and tool_result.strip():
         return tool_result.strip()
     return ""
+
+
+def _reef_trend_keys(result: object) -> list[str]:
+    """Return trend probe names from a Reef tool result without dropping them."""
+    if not isinstance(result, dict):
+        return []
+    keys = result.get("trend_keys")
+    if isinstance(keys, list) and all(isinstance(item, str) for item in keys):
+        return sorted(keys)
+    trends = result.get("trends")
+    if isinstance(trends, dict):
+        return sorted(str(key) for key in trends)
+    return []
 
 
 def _is_session_limit_error(exc: BaseException) -> bool:
@@ -356,6 +373,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._fast_ha_task: asyncio.Task[None] | None = None
         self._fast_bus_task: asyncio.Task[None] | None = None
         self._fast_apex_task: asyncio.Task[None] | None = None
+        self._fast_dance_task: asyncio.Task[None] | None = None
         self._fast_hermes_reef_task: asyncio.Task[None] | None = None
         self._bus_monitor_start_task: asyncio.Task[None] | None = None
         self._bus_spoke_turn: int | None = None
@@ -375,6 +393,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._turn_device_control_call_ids: set[str] = set()
         self._turn_screen_up_call_ids: set[str] = set()
         self._device_success_emotion_played = False
+        self._dance_emotion_played = False
 
     @staticmethod
     def _sanitize_tool_result_for_model(tool_name: str, tool_result: dict[str, Any]) -> dict[str, Any]:
@@ -621,6 +640,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self, transcript: str, intent: str, explicit_hermes_request: bool = False
     ) -> None:
         started = time.perf_counter()
+        originating_turn = self._turn_generation
         await self._suppress_unsolicited_realtime()
         try:
             result = await AskHermes()(self.deps, query=transcript)
@@ -629,23 +649,32 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             return
         spoken = _hermes_result_text(result)
         cache_used = bool(result.get("cache_used")) if isinstance(result, dict) else False
+        result_source = result.get("source") if isinstance(result, dict) else None
+        if result_source in {"live", "cache", "none"}:
+            router_source = result_source
+        else:
+            router_source = "hermes"
         source_type = "cached_trends" if intent == "trends" else "cached_report"
         if not cache_used:
             source_type = "live_trends" if intent == "trends" else "live_report"
         if intent == "trends":
-            trends = result.get("trends") if isinstance(result, dict) else None
-            trend_keys = sorted(str(key) for key in trends) if isinstance(trends, dict) else []
-            logger.info("[REEF_ROUTER] trend_keys=%s", trend_keys)
+            logger.info("[REEF_ROUTER] trend_keys=%s", _reef_trend_keys(result))
         _log_reef_router(
             intent=intent,
             route="ask_hermes",
-            source="hermes",
+            source=router_source,
             source_type=source_type,
             cache_used=cache_used,
             response_owner="ask_hermes",
             explicit_hermes_request=explicit_hermes_request,
         )
         if not spoken:
+            return
+        if originating_turn != self._turn_generation:
+            logger.info("[REEF] skipping late Hermes speech; a newer turn is active")
+            return
+        if self._hermes_spoke_turn == self._turn_generation:
+            logger.info("[REEF] skipping late Hermes speech; already spoken this turn")
             return
         self._hermes_spoke_turn = self._turn_generation
         self._record_reef_response("hermes", intent, "ask_hermes")
@@ -678,10 +707,11 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             raise RuntimeError(str(error))
 
     def _reset_device_success_turn_state(self) -> None:
-        """Clear per-turn device-control success tracking."""
+        """Clear per-turn device-control success and dance-emotion tracking."""
         self._turn_device_control_call_ids.clear()
         self._turn_screen_up_call_ids.clear()
         self._device_success_emotion_played = False
+        self._dance_emotion_played = False
 
     def _value_from_tool_args(self, args_json: str, key: str) -> object:
         try:
@@ -736,6 +766,57 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             logger.info("[SCREEN UP] success emotion completed")
         else:
             logger.info("Played device success emotion: %s", result.get("emotion"))
+
+    def _start_fast_dance_emotion(self, transcript: str) -> None:
+        emotion = match_dance_intent(transcript)
+        if emotion is None or self._dance_emotion_played:
+            return
+        logger.info('[EMOTION] Dance intent detected: "%s"', transcript)
+        self._dance_emotion_played = True
+        self._fast_dance_task = asyncio.create_task(
+            self._queue_dance_emotion(emotion),
+            name="dance-emotion-fast-path",
+        )
+
+    async def _play_dance_emotion(self, emotion: str) -> None:
+        """Queue the official dance emotion once for the current conversation turn."""
+        if self._dance_emotion_played:
+            return
+        self._dance_emotion_played = True
+        await self._queue_dance_emotion(emotion)
+
+    async def _queue_dance_emotion(self, emotion: str) -> None:
+        logger.info("[EMOTION] Playing recorded emotion: %s", emotion)
+        try:
+            result = await PlayEmotion()(self.deps, emotion=emotion, allow_random=False)
+        except Exception as exc:
+            logger.warning("[EMOTION] Failed to play recorded emotion %s: %s", emotion, exc)
+            return
+        if result.get("error"):
+            logger.warning("[EMOTION] Failed to play recorded emotion %s: %s", emotion, result["error"])
+            return
+        logger.info("[EMOTION] Queued recorded emotion: %s", result.get("emotion"))
+
+    async def _complete_skipped_dance_motion(self, call_id: str, tool_name: str) -> None:
+        """Finish a dance tool call without queuing a second animation."""
+        await self._handle_tool_result(
+            ToolNotification(
+                id=call_id,
+                tool_name=tool_name,
+                is_idle_tool_call=False,
+                status=ToolState.COMPLETED,
+                result={"status": "skipped", "emotion": "dance1"},
+            )
+        )
+
+    async def _skip_duplicate_dance_tool(self, call_id: str, tool_name: str, turn_generation: int) -> None:
+        """Skip LLM dance motion when this turn already queued the official dance emotion."""
+        await self._wait_for_response_done_before_tool_result()
+        if self._turn_generation != turn_generation:
+            await self._complete_skipped_dance_motion(call_id, tool_name)
+            return
+        logger.info("[EMOTION] Skipping %s; dance emotion already queued this turn", tool_name)
+        await self._complete_skipped_dance_motion(call_id, tool_name)
 
     async def _complete_skipped_success_emotion(self, call_id: str) -> None:
         """Finish a play_emotion(success) call without queuing a second animation."""
@@ -888,6 +969,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """Speak a buffered Hermes result after the interrupting turn has finished."""
         pending = self._pending_hermes_result
         if pending is None or pending.status != "buffered":
+            return
+        if self._hermes_spoke_turn is not None and self._hermes_spoke_turn >= pending.originating_turn_id:
+            logger.info("[REEF] skipping late Hermes speech; already spoken this turn")
+            pending.status = "delivered"
             return
         if not self._conversation_idle_for_buffered_hermes():
             return
@@ -1446,6 +1531,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 and bool(hermes_text)
                 and (result_is_stale or self._user_speech_in_progress)
             )
+            if (
+                completed_tool.tool_name == "ask_hermes"
+                and bool(hermes_text)
+                and self._hermes_spoke_turn is not None
+                and self._hermes_spoke_turn >= hermes_originating_turn
+            ):
+                logger.info("[REEF] skipping late Hermes speech; already spoken this turn")
+                hermes_should_buffer = False
+                if result_is_stale:
+                    send_result_to_model = False
             if send_result_to_model and result_is_stale and not hermes_should_buffer:
                 logger.warning(
                     "Ignoring stale tool result for '%s' (id=%s); a newer turn is active",
@@ -1791,6 +1886,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         self._start_fast_ha_command(transcript)
                         self._start_fast_bus_command(transcript)
                         self._start_fast_apex_command(transcript)
+                        self._start_fast_dance_emotion(transcript)
 
                         await self.output_queue.put(AdditionalOutputs({"role": "user", "content": transcript}))
                         self._emit_transcript("user", transcript, True)
@@ -1927,6 +2023,31 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                     call_id, args_json_str, self._tool_call_generation[call_id]
                                 ),
                                 name=f"success-emotion-{call_id}",
+                            )
+                            await self.output_queue.put(
+                                AdditionalOutputs(
+                                    {
+                                        "role": "assistant",
+                                        "content": (
+                                            f"🛠️ Used tool {tool_name} with args {args_json_str}. "
+                                            f"The tool is now running. Tool ID: {call_id}"
+                                        ),
+                                    },
+                                ),
+                            )
+                            continue
+                        if self._dance_emotion_played and (
+                            tool_name == "dance"
+                            or (
+                                tool_name == "play_emotion"
+                                and is_dance_emotion_request(self._value_from_tool_args(args_json_str, "emotion"))
+                            )
+                        ):
+                            asyncio.create_task(
+                                self._skip_duplicate_dance_tool(
+                                    call_id, tool_name, self._tool_call_generation[call_id]
+                                ),
+                                name=f"dance-emotion-skip-{call_id}",
                             )
                             await self.output_queue.put(
                                 AdditionalOutputs(
@@ -2106,6 +2227,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if self._fast_apex_task is not None:
             self._fast_apex_task.cancel()
             self._fast_apex_task = None
+        if self._fast_dance_task is not None:
+            self._fast_dance_task.cancel()
+            self._fast_dance_task = None
         if self._bus_monitor_start_task is not None:
             self._bus_monitor_start_task.cancel()
             self._bus_monitor_start_task = None

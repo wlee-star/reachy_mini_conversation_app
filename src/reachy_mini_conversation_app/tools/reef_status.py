@@ -9,6 +9,7 @@ from typing import Any
 import httpx
 
 from reachy_mini_conversation_app.config import config
+from reachy_mini_conversation_app.hermes_client import reef_cache_age_seconds, reef_cache_status_for_age
 from reachy_mini_conversation_app.tools.core_tools import Tool, ToolDependencies
 
 
@@ -126,8 +127,10 @@ def _snapshot_from_live_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "controller": _controller_name(controller),
         "cached_at": _reading_timestamp(payload, controller),
         "age_seconds": 0,
+        "cache_age_seconds": 0,
         "stale": False,
-        "source": "apex_status_http",
+        "source": "live",
+        "status": "success",
     }
 
 
@@ -173,24 +176,67 @@ def _load_cache() -> tuple[dict[str, Any] | None, str | None]:
         logger.warning("Reef cache %s must contain a JSON object", CACHE_PATH)
         return None, "Apex reef cache has an unexpected format."
     snapshot = {str(key): value for key, value in raw.items()}
-    snapshot.setdefault("source", "reef_cache_direct")
     if "probes" in snapshot:
         snapshot["probes"] = _normalize_probes(snapshot.get("probes"))
-    logger.info("[APEX] reef_status fallback invoked cache=%s", CACHE_PATH)
+    age_seconds = reef_cache_age_seconds(
+        generated_at=snapshot.get("cached_at") or snapshot.get("fetched_at"),
+        data_timestamp=snapshot.get("cached_at"),
+        path=CACHE_PATH,
+    )
+    snapshot["source"] = "cache"
+    snapshot["stale"] = True
+    snapshot["age_seconds"] = age_seconds
+    snapshot["cache_age_seconds"] = age_seconds
+    snapshot["status"] = reef_cache_status_for_age(age_seconds)
+    logger.info(
+        "[REEF] cached Apex snapshot found path=%s age_seconds=%s status=%s",
+        CACHE_PATH,
+        age_seconds,
+        snapshot["status"],
+    )
+    logger.info("[REEF] marking response stale=true source=cache")
     _log_reef_snapshot(snapshot, invoked_by="reef_cache")
     return snapshot, None
 
 
+def snapshot_provenance(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Return status/stale/source/cache_age_seconds for a Reef snapshot."""
+    stale = bool(snapshot.get("stale", False))
+    source_raw = snapshot.get("source")
+    source = source_raw if source_raw in {"live", "cache", "none"} else ("cache" if stale else "live")
+    age_raw = snapshot.get("cache_age_seconds", snapshot.get("age_seconds"))
+    age = float(age_raw) if isinstance(age_raw, (int, float)) else None
+    status_raw = snapshot.get("status")
+    if status_raw in {"success", "degraded", "stale", "error"}:
+        status = status_raw
+    elif source == "live" and not stale:
+        status = "success"
+    else:
+        status = reef_cache_status_for_age(age)
+    return {
+        "status": status,
+        "stale": stale,
+        "source": source,
+        "cache_age_seconds": age,
+    }
+
+
 async def _load_reef_snapshot() -> tuple[dict[str, Any] | None, str | None]:
+    live_error: str | None = None
     url = _status_url()
     if url is not None:
-        snapshot, error = await _fetch_live_status(url)
+        snapshot, live_error = await _fetch_live_status(url)
         if snapshot is not None:
+            logger.info("[REEF] Apex live request succeeded source=live")
             return snapshot, None
-        logger.warning("[APEX] live status failed (%s); trying reef cache", error)
+        logger.warning("[REEF] live Apex request failed (%s); checking Reef cache", live_error)
     else:
-        logger.info("[APEX] APEX_STATUS_URL unset; reading reef cache")
-    return _load_cache()
+        logger.info("[REEF] APEX_STATUS_URL unset; reading Reef cache")
+    cache, cache_error = _load_cache()
+    if cache is None:
+        logger.warning("[REEF] no usable cache; returning error")
+        return None, live_error or cache_error
+    return cache, None
 
 
 class ReefStatus(Tool):
@@ -201,7 +247,9 @@ class ReefStatus(Tool):
         "Get current reef tank snapshot (temperature, pH, ORP, ATO, outlets, alarms) "
         "from the local Apex /status URL when APEX_STATUS_URL is set, otherwise reef_cache.json. "
         "Use for live current numbers. Not for historical trends, threading, or ATO history "
-        "— use ask_hermes for those. Returns structured data."
+        "— use ask_hermes for those. Returns structured data. "
+        "source=live and stale=false is current Apex data. source=cache and stale=true is cached: "
+        "use the numbers but tell the user they are cached/stale, not live."
     )
     parameters_schema = {
         "type": "object",
@@ -224,7 +272,13 @@ class ReefStatus(Tool):
         logger.info("[APEX] reef_status tool invoked")
         cache, error = await _load_reef_snapshot()
         if cache is None:
-            return {"error": error or "Reef cache not found. Ensure reef_cache.py cron is running."}
+            logger.warning("[REEF] returning error source=none")
+            return {
+                "error": error or "Reef cache not found. Ensure reef_cache.py cron is running.",
+                "status": "error",
+                "stale": True,
+                "source": "none",
+            }
 
         probes_raw = cache.get("probes", {})
         probes = probes_raw if isinstance(probes_raw, dict) else {}
@@ -242,7 +296,7 @@ class ReefStatus(Tool):
                 "note": data.get("note"),
             }
 
-        source = cache.get("source")
+        provenance = snapshot_provenance(cache)
         result = {
             "reef_status": {
                 "probes": results,
@@ -253,9 +307,9 @@ class ReefStatus(Tool):
                 "controller": cache.get("controller"),
                 "cached_at": cache.get("cached_at"),
                 "age_seconds": cache.get("age_seconds"),
-                "stale": cache.get("stale", False),
+                "stale": provenance["stale"],
             },
-            "source": source if isinstance(source, str) else "reef_cache_direct",
+            **provenance,
         }
         logger.info("[APEX] reef_status tool result=%s", result)
         return result

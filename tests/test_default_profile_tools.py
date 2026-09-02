@@ -31,6 +31,8 @@ def test_default_profile_sends_tank_trends_to_ask_hermes() -> None:
     assert "do not call apex or reef_status first" in instructions.lower()
     assert "still on" in instructions.lower()
     assert "do not use ask_hermes for live reef status" in instructions.lower()
+    assert "source=cache" in instructions
+    assert "stale=true" in instructions
     assert "handle that new request" in instructions.lower()
 
 

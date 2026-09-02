@@ -21,8 +21,13 @@ from reachy_mini_conversation_app.hermes_client import (
     send_to_hermes,
     chat_completions_url,
     is_process_narration,
+    parse_reef_timestamp,
     get_hermes_session_id,
+    reef_cache_age_seconds,
     load_latest_reef_thread,
+    hermes_request_timeout_s,
+    reef_cache_status_for_age,
+    hermes_in_flight_request_id,
 )
 
 
@@ -34,6 +39,7 @@ API_KEY = "test-hermes-key"
 def _fresh_hermes_lock() -> None:
     """Each test gets its own lock so pytest-asyncio's per-test loops do not collide."""
     hermes_client._HERMES_REQUEST_LOCK = asyncio.Lock()
+    hermes_client._HERMES_IN_FLIGHT_REQUEST_ID = None
 
 
 def _configure_gateway(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -138,6 +144,46 @@ async def test_send_to_hermes_times_out(monkeypatch: pytest.MonkeyPatch) -> None
 
     with pytest.raises(HermesTimeoutError, match="timed out"):
         await send_to_hermes("when's the next 311", "session-abc")
+
+
+@pytest.mark.asyncio
+async def test_send_to_hermes_hard_timeout_releases_lock(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A hung POST that never raises httpx.TimeoutException is still cancelled."""
+    _configure_gateway(monkeypatch)
+    monkeypatch.setattr(hermes_client.config, "HERMES_REEF_REQUEST_TIMEOUT_SECONDS", 0.05)
+
+    class HungAsyncClient:
+        def __init__(self, **kwargs: object) -> None:
+            self.timeout = kwargs.get("timeout")
+
+        async def __aenter__(self) -> "HungAsyncClient":
+            return self
+
+        async def __aexit__(self, *_args: object) -> bool:
+            return False
+
+        async def post(
+            self,
+            url: str,
+            headers: dict[str, str] | None = None,
+            json: object | None = None,
+        ) -> httpx.Response:
+            del url, headers, json
+            await asyncio.sleep(5)
+            return _json_response(200, _completion_payload("too late"))
+
+    monkeypatch.setattr(hermes_client.httpx, "AsyncClient", HungAsyncClient)
+
+    with caplog.at_level("INFO"):
+        with pytest.raises(HermesTimeoutError, match="timed out"):
+            await send_to_hermes("reef tank trends", "session-abc")
+    assert hermes_is_busy() is False
+    assert hermes_in_flight_request_id() is None
+    assert "cancelling timed-out request" in caplog.text
+    assert "request cleanup complete" in caplog.text
+    assert "Reef request timed out" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -345,6 +391,7 @@ def test_load_latest_reef_thread_reads_summary_and_slopes(tmp_path: Path) -> Non
     assert snapshot["report"].startswith("Reef stable")
     assert snapshot["ato_hours_until_low"] == 204.0
     assert snapshot["source"] == "hermes"
+    assert isinstance(snapshot["cache_age_seconds"], float)
     handoff = snapshot["handoff"]
     assert isinstance(handoff, dict)
     for_reachy = handoff["for_reachy"]
@@ -403,3 +450,113 @@ async def test_send_to_hermes_appends_trend_instruction(monkeypatch: pytest.Monk
     assert "how is my reef tank trending?" in str(user_message["content"])
     assert HERMES_REEF_TREND_INSTRUCTION in str(user_message["content"])
     assert "Do not narrate files" in HERMES_REEF_TREND_INSTRUCTION
+
+
+def test_parse_reef_timestamp_accepts_z_suffix() -> None:
+    """Reefy JSONL timestamps use a trailing Z."""
+    parsed = parse_reef_timestamp("2026-08-31T04:00:04Z")
+    assert parsed is not None
+    assert parsed.year == 2026
+    assert parsed.month == 8
+    assert parse_reef_timestamp("not-a-date") is None
+
+
+def test_reef_cache_age_prefers_report_timestamp(tmp_path: Path) -> None:
+    """Cache age uses the report timestamp before file mtime."""
+    thread = tmp_path / "reef_thread.jsonl"
+    thread.write_text("x", encoding="utf-8")
+    age = reef_cache_age_seconds(generated_at="2026-09-02T10:00:00Z", path=str(thread))
+    assert age is not None
+    assert age >= 0
+
+
+def test_reef_cache_status_for_age_never_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cache fallbacks are degraded or stale, never success."""
+    monkeypatch.setattr(hermes_client.config, "REEF_CACHE_MAX_AGE_SECONDS", 3600)
+    assert reef_cache_status_for_age(120.0) == "degraded"
+    assert reef_cache_status_for_age(7200.0) == "stale"
+    assert reef_cache_status_for_age(None) == "stale"
+
+
+def test_hermes_request_timeout_is_shorter_for_reef(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Interactive Reef waits use the 15s cap, not the 180s delegated-task timeout."""
+    monkeypatch.setattr(hermes_client.config, "HERMES_REQUEST_TIMEOUT_SECONDS", 180)
+    monkeypatch.setattr(hermes_client.config, "HERMES_REEF_REQUEST_TIMEOUT_SECONDS", 15)
+    assert hermes_request_timeout_s(history_request=True) == 15
+    assert hermes_request_timeout_s(history_request=False) == 180
+
+
+@pytest.mark.asyncio
+async def test_send_to_hermes_uses_reef_timeout_for_trend_query(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reef trend POSTs use the interactive timeout on the HTTP client."""
+    _configure_gateway(monkeypatch)
+    monkeypatch.setattr(hermes_client.config, "HERMES_REEF_REQUEST_TIMEOUT_SECONDS", 15)
+    seen: list[object] = []
+
+    class RecordingAsyncClient:
+        def __init__(self, **kwargs: object) -> None:
+            seen.append(kwargs.get("timeout"))
+
+        async def __aenter__(self) -> "RecordingAsyncClient":
+            return self
+
+        async def __aexit__(self, *_args: object) -> bool:
+            return False
+
+        async def post(
+            self,
+            url: str,
+            headers: dict[str, str] | None = None,
+            json: object | None = None,
+        ) -> httpx.Response:
+            del url, headers, json
+            return _json_response(200, _completion_payload("ok"))
+
+    monkeypatch.setattr(hermes_client.httpx, "AsyncClient", RecordingAsyncClient)
+    await send_to_hermes("Can you tell me what my reef tank is trending at?", "session-abc")
+    assert seen == [15]
+
+
+@pytest.mark.asyncio
+async def test_send_to_hermes_timeout_allows_a_following_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After a timed-out Reef request, the lock is clear and the next call can run."""
+    _configure_gateway(monkeypatch)
+    monkeypatch.setattr(hermes_client.config, "HERMES_REEF_REQUEST_TIMEOUT_SECONDS", 0.05)
+    posts = 0
+
+    class FirstHungThenOkClient:
+        def __init__(self, **kwargs: object) -> None:
+            self.timeout = kwargs.get("timeout")
+
+        async def __aenter__(self) -> "FirstHungThenOkClient":
+            return self
+
+        async def __aexit__(self, *_args: object) -> bool:
+            return False
+
+        async def post(
+            self,
+            url: str,
+            headers: dict[str, str] | None = None,
+            json: object | None = None,
+        ) -> httpx.Response:
+            nonlocal posts
+            posts += 1
+            del url, headers, json
+            if posts == 1:
+                await asyncio.sleep(5)
+            return _json_response(200, _completion_payload("second succeeded"))
+
+    monkeypatch.setattr(hermes_client.httpx, "AsyncClient", FirstHungThenOkClient)
+
+    with pytest.raises(HermesTimeoutError):
+        await send_to_hermes("reef tank trends", "session-abc")
+    assert hermes_is_busy() is False
+    assert hermes_in_flight_request_id() is None
+
+    reply = await send_to_hermes("next 311 bus", "session-abc")
+    assert reply == "second succeeded"
+    assert posts == 2
+    assert hermes_is_busy() is False

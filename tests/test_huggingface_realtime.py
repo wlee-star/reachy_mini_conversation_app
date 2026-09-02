@@ -9,8 +9,11 @@ import pytest
 
 import reachy_mini_conversation_app.conversation_handler as conv_mod
 import reachy_mini_conversation_app.huggingface_realtime as hf_mod
+from reachy_mini_conversation_app import hermes_client
 from reachy_mini_conversation_app.config import config, get_default_voice
 from reachy_mini_conversation_app.streaming import AdditionalOutputs
+from reachy_mini_conversation_app.tools.apex import classify_reef_intent
+from reachy_mini_conversation_app.hermes_client import HermesTimeoutError
 from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
 from reachy_mini_conversation_app.huggingface_realtime import (
     _HERMES_SPEECH_FALLBACK,
@@ -32,6 +35,18 @@ def test_hermes_result_text_prefers_report_over_errors() -> None:
         _hermes_result_text({"status": "error", "trend_available": False})
         == "Historical reef data is currently unavailable."
     )
+    cached = "Reef stable - temp 24.0C (-0.012/6h)."
+    spoken = _hermes_result_text(
+        {
+            "status": "degraded",
+            "stale": True,
+            "source": "cache",
+            "report": cached,
+            "spoken": f"I couldn't reach the live Reef data, but I have a cached Hermes report from approximately 3 minutes ago. {cached}",
+        }
+    )
+    assert cached in spoken
+    assert "cached" in spoken.lower()
 
 
 @pytest.fixture(autouse=True)
@@ -493,6 +508,107 @@ async def test_success_emotion_tool_skipped_when_device_control_owns_turn(monkey
 
 
 @pytest.mark.asyncio
+async def test_start_fast_dance_emotion_plays_dance1_once(monkeypatch: Any, caplog: pytest.LogCaptureFixture) -> None:
+    """A spoken dance request queues official dance1 once and leaves conversation running."""
+    play_calls: list[dict[str, Any]] = []
+
+    class FakePlayEmotion:
+        async def __call__(self, deps: ToolDependencies, **kwargs: Any) -> dict[str, Any]:
+            play_calls.append(kwargs)
+            return {"status": "queued", "emotion": "dance1"}
+
+    monkeypatch.setattr(hf_mod, "PlayEmotion", FakePlayEmotion)
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    with caplog.at_level("INFO"):
+        handler._start_fast_dance_emotion("Reachy, can you dance?")
+        handler._start_fast_dance_emotion("Reachy, can you dance?")
+        assert handler._fast_dance_task is not None
+        await handler._fast_dance_task
+
+    assert play_calls == [{"emotion": "dance1", "allow_random": False}]
+    assert handler._dance_emotion_played is True
+    assert '[EMOTION] Dance intent detected: "Reachy, can you dance?"' in caplog.text
+    assert "[EMOTION] Playing recorded emotion: dance1" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_start_fast_dance_emotion_uses_dance3_when_energetic(monkeypatch: Any) -> None:
+    """Energetic dance requests may queue official dance3."""
+    play_calls: list[dict[str, Any]] = []
+
+    class FakePlayEmotion:
+        async def __call__(self, deps: ToolDependencies, **kwargs: Any) -> dict[str, Any]:
+            play_calls.append(kwargs)
+            return {"status": "queued", "emotion": "dance3"}
+
+    monkeypatch.setattr(hf_mod, "PlayEmotion", FakePlayEmotion)
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._start_fast_dance_emotion("Give me an energetic dance")
+    assert handler._fast_dance_task is not None
+    await handler._fast_dance_task
+
+    assert play_calls == [{"emotion": "dance3", "allow_random": False}]
+
+
+@pytest.mark.asyncio
+async def test_start_fast_dance_emotion_ignores_unrelated_speech(monkeypatch: Any) -> None:
+    """Talking about dance without asking Reachy to perform must not queue motion."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    play = AsyncMock()
+    monkeypatch.setattr(handler, "_queue_dance_emotion", play)
+
+    handler._start_fast_dance_emotion("I watched a dance video.")
+
+    assert handler._fast_dance_task is None
+    play.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_play_dance_emotion_queues_once(monkeypatch: Any) -> None:
+    """One user utterance must produce only one official dance trigger."""
+    play_calls: list[dict[str, Any]] = []
+
+    class FakePlayEmotion:
+        async def __call__(self, deps: ToolDependencies, **kwargs: Any) -> dict[str, Any]:
+            play_calls.append(kwargs)
+            return {"status": "queued", "emotion": "dance1"}
+
+    monkeypatch.setattr(hf_mod, "PlayEmotion", FakePlayEmotion)
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+
+    await handler._play_dance_emotion("dance1")
+    await handler._play_dance_emotion("dance1")
+
+    assert play_calls == [{"emotion": "dance1", "allow_random": False}]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_dance_tool_skipped_when_emotion_already_queued(monkeypatch: Any) -> None:
+    """LLM dance or play_emotion(dance) must not add a second dance animation."""
+
+    class FakeDanceTool:
+        def wants_spoken_followup(self, result: dict[str, Any] | None, error: str | None) -> bool:
+            return False
+
+    monkeypatch.setattr(hf_mod.core_tools, "get_tools", lambda: {"dance": FakeDanceTool()})
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler.output_queue = asyncio.Queue()
+    monkeypatch.setattr(handler, "_wait_for_response_done_before_tool_result", AsyncMock(return_value=True))
+    start_tool = AsyncMock()
+    monkeypatch.setattr(type(handler.tool_manager), "start_tool", start_tool)
+    handler._turn_generation = 1
+    handler._in_flight_tool_calls = {"call_dance"}
+    handler._dance_emotion_played = True
+
+    await handler._skip_duplicate_dance_tool("call_dance", "dance", 1)
+
+    start_tool.assert_not_awaited()
+    created_item = handler.connection.conversation.item.create.await_args.kwargs["item"]
+    assert created_item["output"] == json.dumps({"status": "skipped", "emotion": "dance1"})
+
+
+@pytest.mark.asyncio
 async def test_home_assistant_query_still_speaks(monkeypatch: Any) -> None:
     """HA reads still need a spoken follow-up so the user hears the answer."""
     monkeypatch.setattr(hf_mod.core_tools, "get_tools", lambda: {"home_assistant": HomeAssistant()})
@@ -681,14 +797,15 @@ async def test_start_fast_apex_command_routes_trends_to_hermes(monkeypatch: Any)
 
 
 @pytest.mark.asyncio
-async def test_hermes_reef_fast_path_speaks_cached_report(monkeypatch: Any, caplog: pytest.LogCaptureFixture) -> None:
-    """A valid Hermes cache is spoken through ask_hermes without a live gateway call."""
+async def test_hermes_reef_fast_path_speaks_live_report(monkeypatch: Any, caplog: pytest.LogCaptureFixture) -> None:
+    """Cache presence must not skip Hermes; the live report is spoken."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler.connection = AsyncMock()
     handler._turn_generation = 1
     create = AsyncMock()
     monkeypatch.setattr(handler, "_safe_response_create", create)
-    send = AsyncMock()
+    live_report = "Live Hermes Reef report: temp 24.1C, nitrate falling."
+    send = AsyncMock(return_value=live_report)
     monkeypatch.setattr("reachy_mini_conversation_app.hermes_client.send_to_hermes", send)
     monkeypatch.setattr(
         "reachy_mini_conversation_app.hermes_client.load_latest_reef_thread",
@@ -709,11 +826,11 @@ async def test_hermes_reef_fast_path_speaks_cached_report(monkeypatch: Any, capl
     with caplog.at_level("INFO"):
         await handler._run_fast_hermes_reef_command("Can you give me a reef trending report?", "trends")
 
-    send.assert_not_awaited()
+    send.assert_awaited()
     created = handler.connection.conversation.item.create
     created.assert_awaited_once()
     spoken_prompt = created.await_args.kwargs["item"]["content"][0]["text"]
-    assert "Reef stable - temp 24.0C (-0.012/6h)." in spoken_prompt
+    assert live_report in spoken_prompt
     create.assert_awaited_once_with(reason="say", response={"tool_choice": "none"})
     assert handler._hermes_spoke_turn == 1
     assert handler._suppress_unsolicited_response_turn == 1
@@ -722,9 +839,9 @@ async def test_hermes_reef_fast_path_speaks_cached_report(monkeypatch: Any, capl
     assert handler._last_reef_response_route == "ask_hermes"
     assert "[REEF_ROUTER] intent=trends" in caplog.text
     assert "[REEF_ROUTER] route=ask_hermes" in caplog.text
-    assert "[REEF_ROUTER] source=hermes" in caplog.text
-    assert "[REEF_ROUTER] source_type=cached_trends" in caplog.text
-    assert "[REEF_ROUTER] cache_used=true" in caplog.text
+    assert "[REEF_ROUTER] source=live" in caplog.text
+    assert "[REEF_ROUTER] source_type=live_trends" in caplog.text
+    assert "[REEF_ROUTER] cache_used=false" in caplog.text
     assert "[REEF_ROUTER] response_owner=ask_hermes" in caplog.text
     assert "[REEF_ROUTER] normal_llm_bypass=true" in caplog.text
     assert "[REEF_ROUTER] explicit_hermes_request=false" in caplog.text
@@ -735,16 +852,15 @@ async def test_hermes_reef_fast_path_speaks_cached_report(monkeypatch: Any, capl
 
 
 @pytest.mark.asyncio
-async def test_explicit_hermes_report_uses_ask_hermes_cache(
-    monkeypatch: Any, caplog: pytest.LogCaptureFixture
-) -> None:
-    """The exact spoken workflow hard-routes to ask_hermes and keeps the cache."""
+async def test_explicit_hermes_report_calls_live_hermes(monkeypatch: Any, caplog: pytest.LogCaptureFixture) -> None:
+    """The exact spoken workflow hard-routes to ask_hermes and still calls Hermes."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler.connection = AsyncMock()
     handler._turn_generation = 1
     create = AsyncMock()
     monkeypatch.setattr(handler, "_safe_response_create", create)
-    send = AsyncMock()
+    live_report = "Live Hermes Reef Tank report: temp 24.1C."
+    send = AsyncMock(return_value=live_report)
     monkeypatch.setattr("reachy_mini_conversation_app.hermes_client.send_to_hermes", send)
     monkeypatch.setattr(
         "reachy_mini_conversation_app.hermes_client.load_latest_reef_thread",
@@ -758,19 +874,214 @@ async def test_explicit_hermes_report_uses_ask_hermes_cache(
             True,
         )
 
-    send.assert_not_awaited()
+    send.assert_awaited()
     spoken_prompt = handler.connection.conversation.item.create.await_args.kwargs["item"]["content"][0]["text"]
-    assert "Reef stable - temp 24.0C (-0.012/6h)." in spoken_prompt
+    assert live_report in spoken_prompt
     assert handler._last_reef_response_source == "hermes"
     assert handler._last_reef_response_type == "detailed_report"
     assert handler._last_reef_response_route == "ask_hermes"
     assert "[REEF_ROUTER] intent=detailed_report" in caplog.text
     assert "[REEF_ROUTER] route=ask_hermes" in caplog.text
     assert "[REEF_ROUTER] explicit_hermes_request=true" in caplog.text
-    assert "[REEF_ROUTER] source=hermes" in caplog.text
-    assert "[REEF_ROUTER] source_type=cached_report" in caplog.text
-    assert "[REEF_ROUTER] cache_used=true" in caplog.text
+    assert "[REEF_ROUTER] source=live" in caplog.text
+    assert "[REEF_ROUTER] source_type=live_report" in caplog.text
+    assert "[REEF_ROUTER] cache_used=false" in caplog.text
     assert "skipping competing ask_hermes" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_hermes_reef_fast_path_speaks_stale_cache_on_timeout(
+    monkeypatch: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """If live Hermes times out, the cached Reef report is still spoken as stale."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler._turn_generation = 1
+    create = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", create)
+
+    async def _send(_text: str, _session_id: str, request_id: str | None = None) -> str:
+        raise HermesTimeoutError("timed out")
+
+    monkeypatch.setattr("reachy_mini_conversation_app.hermes_client.send_to_hermes", _send)
+    cached = "Reef stable - temp 24.0C (-0.012/6h)."
+    monkeypatch.setattr(
+        "reachy_mini_conversation_app.hermes_client.load_latest_reef_thread",
+        lambda path=None: {
+            "report": cached,
+            "source": "hermes",
+            "cache_age_seconds": 180.0,
+            "trends": {"Tmp": {"trend_6h": -0.012, "trend_str": "-0.012/6h"}},
+        },
+    )
+
+    with caplog.at_level("INFO"):
+        await handler._run_fast_hermes_reef_command("What did Hermes report about my Reef?", "detailed_report")
+
+    spoken_prompt = handler.connection.conversation.item.create.await_args.kwargs["item"]["content"][0]["text"]
+    assert cached in spoken_prompt
+    assert "cached" in spoken_prompt.lower()
+    assert "[REEF_ROUTER] cache_used=true" in caplog.text
+    assert "[REEF_ROUTER] source=cache" in caplog.text
+    assert "[REEF_ROUTER] source_type=cached_report" in caplog.text
+
+
+TREND_QUERY = "Can you tell me what my reef tank is trending at?"
+_TREND_CACHE = {
+    "report": "Reef trends: Tmp -0.012/6h, pH +0.012/6h, ORP -0.471/6h, FS100 +0.472/6h, LLSATO -0.071/6h.",
+    "source": "hermes",
+    "cache_age_seconds": 1018.0,
+    "trends": {
+        "FS100": {"trend_6h": 0.4716, "trend_str": "+0.472/6h"},
+        "LLSATO": {"trend_6h": -0.071, "trend_str": "-0.071/6h"},
+        "ORP": {"trend_6h": -0.4714, "trend_str": "-0.471/6h"},
+        "Tmp": {"trend_6h": -0.012, "trend_str": "-0.012/6h"},
+        "pH": {"trend_6h": 0.0118, "trend_str": "+0.012/6h"},
+    },
+}
+
+
+@pytest.mark.asyncio
+async def test_reef_trend_query_routes_and_speaks_cache_when_hermes_pending(
+    monkeypatch: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The exact spoken trend question must reach Reachy with the cached Hermes report."""
+    route = classify_reef_intent(TREND_QUERY)
+    assert route is not None
+    assert route.intent == "trends"
+    assert route.route == "ask_hermes"
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler._turn_generation = 1
+    create = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", create)
+    send = AsyncMock(side_effect=AssertionError("pending request must not start a second Hermes call"))
+    monkeypatch.setattr("reachy_mini_conversation_app.hermes_client.send_to_hermes", send)
+    monkeypatch.setattr("reachy_mini_conversation_app.hermes_client.hermes_is_busy", lambda: True)
+    monkeypatch.setattr(
+        "reachy_mini_conversation_app.hermes_client.load_latest_reef_thread",
+        lambda path=None: dict(_TREND_CACHE),
+    )
+
+    with caplog.at_level("INFO"):
+        await handler._run_fast_hermes_reef_command(TREND_QUERY, "trends")
+
+    send.assert_not_awaited()
+    spoken_prompt = handler.connection.conversation.item.create.await_args.kwargs["item"]["content"][0]["text"]
+    assert _TREND_CACHE["report"] in spoken_prompt
+    assert "FS100" in spoken_prompt
+    assert "LLSATO" in spoken_prompt
+    assert "ORP" in spoken_prompt
+    assert handler._hermes_spoke_turn == 1
+    assert handler._last_reef_response_source == "hermes"
+    assert handler._last_reef_response_type == "trends"
+    assert "[REEF_ROUTER] intent=trends" in caplog.text
+    assert "[REEF_ROUTER] route=ask_hermes" in caplog.text
+    assert "[REEF_ROUTER] source=cache" in caplog.text
+    assert "[REEF_ROUTER] source_type=cached_trends" in caplog.text
+    assert "[REEF_ROUTER] cache_used=true" in caplog.text
+    assert "[REEF_ROUTER] response_owner=ask_hermes" in caplog.text
+    assert "trend_keys=" in caplog.text
+    assert "FS100" in caplog.text
+    assert "LLSATO" in caplog.text
+    assert "ORP" in caplog.text
+    assert "Tmp" in caplog.text
+    assert "pH" in caplog.text
+    assert "returning cached Reef report rather than empty result" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_start_fast_apex_command_routes_exact_trend_question(monkeypatch: Any) -> None:
+    """The user's exact trend question is owned by ask_hermes, not live Apex."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    apex_run = AsyncMock()
+    hermes_run = AsyncMock()
+    monkeypatch.setattr(handler, "_run_fast_apex_command", apex_run)
+    monkeypatch.setattr(handler, "_run_fast_hermes_reef_command", hermes_run)
+
+    handler._start_fast_apex_command(TREND_QUERY)
+    assert handler._fast_hermes_reef_task is not None
+    await handler._fast_hermes_reef_task
+
+    apex_run.assert_not_awaited()
+    hermes_run.assert_awaited_once()
+    assert hermes_run.await_args.args[0] == TREND_QUERY
+    assert hermes_run.await_args.args[1] == "trends"
+
+
+@pytest.mark.asyncio
+async def test_late_live_hermes_result_is_not_spoken_after_cache_fallback(
+    monkeypatch: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """If cache was already spoken while Hermes was pending, a late live result must not also speak."""
+    hermes_client._HERMES_REQUEST_LOCK = asyncio.Lock()
+    hermes_client._HERMES_IN_FLIGHT_REQUEST_ID = None
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler._turn_generation = 1
+    create = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", create)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    live_report = "LATE LIVE REPORT that must not be spoken"
+
+    async def _send(_text: str, _session_id: str, request_id: str | None = None) -> str:
+        async with hermes_client._HERMES_REQUEST_LOCK:
+            started.set()
+            await release.wait()
+        return live_report
+
+    monkeypatch.setattr("reachy_mini_conversation_app.hermes_client.send_to_hermes", _send)
+    monkeypatch.setattr(
+        "reachy_mini_conversation_app.hermes_client.load_latest_reef_thread",
+        lambda path=None: dict(_TREND_CACHE),
+    )
+
+    with caplog.at_level("INFO"):
+        first = asyncio.create_task(handler._run_fast_hermes_reef_command(TREND_QUERY, "trends"))
+        await started.wait()
+        await handler._run_fast_hermes_reef_command(TREND_QUERY, "trends")
+        release.set()
+        await first
+
+    spoken = [
+        call.kwargs["item"]["content"][0]["text"]
+        for call in handler.connection.conversation.item.create.await_args_list
+    ]
+    assert any(str(_TREND_CACHE["report"]) in text for text in spoken)
+    assert all(live_report not in text for text in spoken)
+    assert "skipping late Hermes speech" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_fast_path_skips_speech_when_turn_advances_during_hermes_wait(
+    monkeypatch: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A Hermes result from an earlier turn must not be spoken after a newer turn starts."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler._turn_generation = 1
+    create = AsyncMock()
+    monkeypatch.setattr(handler, "_safe_response_create", create)
+
+    async def _send(_text: str, _session_id: str, request_id: str | None = None) -> str:
+        handler._turn_generation = 2
+        return "Live report after turn change"
+
+    monkeypatch.setattr("reachy_mini_conversation_app.hermes_client.send_to_hermes", _send)
+    monkeypatch.setattr(
+        "reachy_mini_conversation_app.hermes_client.load_latest_reef_thread",
+        lambda path=None: dict(_TREND_CACHE),
+    )
+
+    with caplog.at_level("INFO"):
+        await handler._run_fast_hermes_reef_command(TREND_QUERY, "trends")
+
+    handler.connection.conversation.item.create.assert_not_awaited()
+    create.assert_not_awaited()
+    assert "newer turn is active" in caplog.text
+    assert handler._hermes_spoke_turn is None
 
 
 @pytest.mark.asyncio

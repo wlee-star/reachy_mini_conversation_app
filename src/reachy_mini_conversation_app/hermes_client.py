@@ -7,6 +7,7 @@ import uuid
 import asyncio
 import logging
 from typing import Any
+from datetime import datetime, timezone
 
 import httpx
 
@@ -18,10 +19,10 @@ REEF_THREAD_PATH = os.path.expanduser("~/reef-monitor/reef_thread.jsonl")
 _CHAT_COMPLETIONS_SUFFIX = "/v1/chat/completions"
 HISTORY_UNAVAILABLE = "Historical reef data is currently unavailable."
 
-# Hermes can load a large system prompt and run multi-step tool loops; delegated
-# queries measured 45-90s. Cap at 180s so a hung gateway cannot stall a turn for 5 minutes.
-HERMES_REQUEST_TIMEOUT_S = 180.0
+# Non-Reef delegated queries can take 45-90s; config.HERMES_REQUEST_TIMEOUT_SECONDS
+# caps them at 180s. Interactive Reef waits use config.HERMES_REEF_REQUEST_TIMEOUT_SECONDS (15s).
 _HERMES_REQUEST_LOCK = asyncio.Lock()
+_HERMES_IN_FLIGHT_REQUEST_ID: str | None = None
 HERMES_CHAT_MODEL = "hermes-agent"
 HERMES_SESSION_HEADER = "X-Hermes-Session-Id"
 # Layered on Hermes's own system prompt so the agent skips essays and extra skills.
@@ -144,6 +145,18 @@ def hermes_is_busy() -> bool:
     return _HERMES_REQUEST_LOCK.locked()
 
 
+def hermes_in_flight_request_id() -> str | None:
+    """Return the request id currently holding the Hermes lock, if any."""
+    return _HERMES_IN_FLIGHT_REQUEST_ID
+
+
+def hermes_request_timeout_s(*, history_request: bool) -> float:
+    """Return the live-wait timeout for a Hermes call."""
+    if history_request:
+        return float(config.HERMES_REEF_REQUEST_TIMEOUT_SECONDS)
+    return float(config.HERMES_REQUEST_TIMEOUT_SECONDS)
+
+
 def is_trend_query(text: str) -> bool:
     """Return whether the utterance asks for historical trends rather than a live snapshot."""
     lowered = text.lower()
@@ -251,15 +264,70 @@ def load_latest_reef_thread(path: str | None = None) -> dict[str, Any] | None:
     if latest is None:
         logger.info("[HERMES] reef_thread empty path=%s", thread_path)
         return None
+    latest["cache_age_seconds"] = reef_cache_age_seconds(
+        generated_at=latest.get("generated_at"),
+        data_timestamp=latest.get("data_timestamp"),
+        path=thread_path,
+    )
     logger.info(
-        "[HERMES] reef_thread loaded path=%s generated_at=%s data_timestamp=%s ato_hours=%s trend_keys=%s",
+        "[HERMES] reef_thread loaded path=%s generated_at=%s data_timestamp=%s age_seconds=%s ato_hours=%s trend_keys=%s",
         thread_path,
         latest.get("generated_at"),
         latest.get("data_timestamp"),
+        latest.get("cache_age_seconds"),
         latest.get("ato_hours_until_low"),
         sorted(str(key) for key in latest["trends"]),
     )
     return latest
+
+
+def parse_reef_timestamp(raw: object) -> datetime | None:
+    """Parse an ISO-8601 report timestamp, including a trailing Z."""
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    text = raw.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def reef_cache_age_seconds(
+    *,
+    generated_at: object = None,
+    data_timestamp: object = None,
+    path: str | None = None,
+) -> float | None:
+    """Return cache age in seconds from a report timestamp, else the file mtime."""
+    now = datetime.now(timezone.utc)
+    for raw in (generated_at, data_timestamp):
+        parsed = parse_reef_timestamp(raw)
+        if parsed is not None:
+            return max(0.0, (now - parsed).total_seconds())
+    if path:
+        try:
+            return max(0.0, time.time() - os.path.getmtime(path))
+        except OSError:
+            return None
+    return None
+
+
+def reef_cache_max_age_seconds() -> float:
+    """Return the configured Reef cache freshness threshold in seconds."""
+    return float(config.REEF_CACHE_MAX_AGE_SECONDS)
+
+
+def reef_cache_status_for_age(age_seconds: float | None) -> str:
+    """Classify a cache fallback as degraded or stale. Never success."""
+    max_age = reef_cache_max_age_seconds()
+    if age_seconds is not None and age_seconds <= max_age:
+        return "degraded"
+    return "stale"
 
 
 def reef_history_query(user_query: str, cache: dict[str, Any] | None) -> str:
@@ -310,6 +378,7 @@ def _reply_from_payload(payload: object) -> str:
 
 async def send_to_hermes(text: str, session_id: str, request_id: str | None = None) -> str:
     """POST a user message to Hermes /v1/chat/completions and return the assistant text."""
+    global _HERMES_IN_FLIGHT_REQUEST_ID
     utterance = text.strip()
     if not utterance:
         raise HermesRequestError("Cannot send an empty utterance to the Hermes Gateway.")
@@ -334,32 +403,70 @@ async def send_to_hermes(text: str, session_id: str, request_id: str | None = No
         ],
     }
 
+    timeout_s = hermes_request_timeout_s(history_request=history_request)
     started = time.monotonic()
     logger.info(
-        "[HERMES] request started request_id=%s url=%s history=%s query_chars=%s session=%s",
+        "[HERMES] request started request_id=%s url=%s history=%s query_chars=%s session=%s timeout=%.1f",
         hermes_request_id,
         gateway_url,
         history_request,
         len(user_content),
         session_id,
+        timeout_s,
     )
+    if history_request:
+        logger.info("[HERMES] Reef request started request_id=%s timeout=%.1f", hermes_request_id, timeout_s)
     http_status: int | None = None
     payload: object | None = None
     try:
         async with _HERMES_REQUEST_LOCK:
-            async with httpx.AsyncClient(timeout=HERMES_REQUEST_TIMEOUT_S) as http_client:
-                response = await http_client.post(gateway_url, headers=headers, json=body)
-                http_status = response.status_code
-                response.raise_for_status()
-                payload = response.json()
+            _HERMES_IN_FLIGHT_REQUEST_ID = hermes_request_id
+            try:
+                async with httpx.AsyncClient(timeout=timeout_s) as http_client:
+                    try:
+                        response = await asyncio.wait_for(
+                            http_client.post(gateway_url, headers=headers, json=body),
+                            timeout=timeout_s,
+                        )
+                    except TimeoutError:
+                        elapsed = time.monotonic() - started
+                        logger.warning(
+                            "[HERMES] request timed out/failed request_id=%s elapsed=%.1fs history=%s",
+                            hermes_request_id,
+                            elapsed,
+                            history_request,
+                        )
+                        if history_request:
+                            logger.warning(
+                                "[HERMES] Reef request timed out request_id=%s elapsed=%.1fs",
+                                hermes_request_id,
+                                elapsed,
+                            )
+                        logger.info("[HERMES] cancelling timed-out request request_id=%s", hermes_request_id)
+                        raise
+                    http_status = response.status_code
+                    response.raise_for_status()
+                    payload = response.json()
+            finally:
+                _HERMES_IN_FLIGHT_REQUEST_ID = None
+                logger.info("[HERMES] request cleanup complete request_id=%s", hermes_request_id)
+    except TimeoutError as exc:
+        raise HermesTimeoutError("Hermes Gateway timed out.") from exc
     except httpx.TimeoutException as exc:
+        elapsed = time.monotonic() - started
         logger.warning(
-            "[HERMES] gateway timed out after %.1fs request_id=%s url=%s: %s",
-            HERMES_REQUEST_TIMEOUT_S,
+            "[HERMES] request timed out/failed request_id=%s elapsed=%.1fs history=%s",
             hermes_request_id,
-            gateway_url,
-            exc,
+            elapsed,
+            history_request,
         )
+        if history_request:
+            logger.warning(
+                "[HERMES] Reef request timed out request_id=%s elapsed=%.1fs",
+                hermes_request_id,
+                elapsed,
+            )
+        logger.info("[HERMES] cancelling timed-out request request_id=%s", hermes_request_id)
         raise HermesTimeoutError("Hermes Gateway timed out.") from exc
     except httpx.HTTPStatusError as exc:
         http_status = exc.response.status_code
@@ -385,6 +492,7 @@ async def send_to_hermes(text: str, session_id: str, request_id: str | None = No
     if payload is None:
         raise HermesRequestError("Hermes Gateway returned an empty body.")
     reply = _reply_from_payload(payload)
+    logger.info("[HERMES] response received request_id=%s", hermes_request_id)
     logger.info(
         "[HERMES] gateway reply request_id=%s http_status=%s chars=%s process_narration=%s elapsed=%.1fs prefix=%s",
         hermes_request_id,

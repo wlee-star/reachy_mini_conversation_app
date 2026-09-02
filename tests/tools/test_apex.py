@@ -56,7 +56,10 @@ async def test_apex_status_reads_existing_cache(tmp_path: Path, monkeypatch: pyt
 
     result = await Apex()(_deps(), action="get_apex_status")
 
-    assert result["source"] == "reef_cache_direct"
+    assert result["source"] == "cache"
+    assert result["stale"] is True
+    assert result["status"] != "success"
+    assert result["apex_status"]["stale"] is True
     assert result["apex_status"]["controller"] == "apex"
     assert result["apex_status"]["water_parameters"]["temperature"]["value"] == 26.1
     assert result["apex_status"]["equipment"]["ato"] == {"level": "normal"}
@@ -72,7 +75,9 @@ async def test_water_parameters_can_be_filtered(tmp_path: Path, monkeypatch: pyt
     result = await Apex()(_deps(), action="get_water_parameters", include=["ph"])
 
     assert result["water_parameters"] == {"ph": {"value": 8.1, "type": "ph", "status": "ok"}}
-    assert result["age_seconds"] == 12
+    assert result["stale"] is True
+    assert result["source"] == "cache"
+    assert result["cache_age_seconds"] is not None
 
 
 @pytest.mark.asyncio
@@ -89,7 +94,7 @@ async def test_equipment_status_returns_cache_equipment(tmp_path: Path, monkeypa
         "controller": "apex",
         "outlets": [],
     }
-    assert result["source"] == "reef_cache_direct"
+    assert result["source"] == "cache"
 
 
 @pytest.mark.asyncio
@@ -112,7 +117,12 @@ async def test_apex_reports_missing_cache(tmp_path: Path, monkeypatch: pytest.Mo
 
     result = await Apex()(_deps(), action="get_apex_status")
 
-    assert result == {"error": "Reef cache not found. Ensure reef_cache.py cron is running."}
+    assert result == {
+        "error": "Reef cache not found. Ensure reef_cache.py cron is running.",
+        "status": "error",
+        "stale": True,
+        "source": "none",
+    }
 
 
 @pytest.mark.asyncio
@@ -124,7 +134,12 @@ async def test_apex_reports_malformed_cache(tmp_path: Path, monkeypatch: pytest.
 
     result = await Apex()(_deps(), action="get_apex_status")
 
-    assert result == {"error": "Apex reef cache could not be read."}
+    assert result == {
+        "error": "Apex reef cache could not be read.",
+        "status": "error",
+        "stale": True,
+        "source": "none",
+    }
 
 
 class _FakeResponse:
@@ -180,7 +195,9 @@ async def test_apex_reads_live_status_url(monkeypatch: pytest.MonkeyPatch, tmp_p
     result = await Apex()(_deps(), action="get_apex_status")
 
     assert _FakeAsyncClient.requested_urls == ["http://192.168.0.143:8080/status"]
-    assert result["source"] == "apex_status_http"
+    assert result["source"] == "live"
+    assert result["status"] == "success"
+    assert result["stale"] is False
     assert result["apex_status"]["controller"] == "Cade_S3_1200_P"
     assert result["apex_status"]["water_parameters"]["Tmp"]["value"] == 24.2
     assert result["apex_status"]["equipment"]["outlets"][0]["name"] == "VarSpd1_I1"
@@ -211,7 +228,9 @@ async def test_apex_keeps_raw_llsato_from_live_status(monkeypatch: pytest.Monkey
     result = await Apex()(_deps(), action="get_apex_status")
 
     assert _FakeAsyncClient.requested_urls == ["http://192.168.0.143:8080/status"]
-    assert result["source"] == "apex_status_http"
+    assert result["source"] == "live"
+    assert result["status"] == "success"
+    assert result["stale"] is False
     assert result["apex_status"]["cached_at"] == "2026-08-31T03:22:00.869566Z"
     assert result["apex_status"]["water_parameters"]["LLSATO"]["value"] == 2.9
     assert result["apex_status"]["equipment"]["ato"]["llsato"] == 2.9
@@ -220,6 +239,27 @@ async def test_apex_keeps_raw_llsato_from_live_status(monkeypatch: pytest.Monkey
     assert "85" not in spoken
     assert "%" not in spoken
     assert "salinity" not in spoken.lower()
+
+
+@pytest.mark.asyncio
+async def test_apex_live_failure_returns_stale_cache(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Live Apex failure returns cached data marked stale, never success."""
+    cache_path = tmp_path / "reef_cache.json"
+    _write_cache(cache_path)
+    monkeypatch.setattr(reef_status_mod.config, "APEX_STATUS_URL", "http://192.168.0.143:8080/status")
+    monkeypatch.setattr(reef_status_mod, "CACHE_PATH", str(cache_path))
+    _FakeAsyncClient.requested_urls = []
+    _FakeAsyncClient.response = _FakeResponse(503, {"error": "down"})
+    monkeypatch.setattr(reef_status_mod.httpx, "AsyncClient", _FakeAsyncClient)
+
+    result = await Apex()(_deps(), action="get_apex_status")
+
+    assert result["source"] == "cache"
+    assert result["status"] != "success"
+    assert result["stale"] is True
+    assert result["apex_status"]["stale"] is True
+    assert result["apex_status"]["water_parameters"]["temperature"]["value"] == 26.1
+    assert result["cache_age_seconds"] is not None
 
 
 @pytest.mark.parametrize(
@@ -298,6 +338,7 @@ def test_match_apex_intent_leaves_trends_to_hermes() -> None:
         ("Analyze my reef tank", "detailed_report", "ask_hermes", None),
         ("Give me a reef tank analysis", "detailed_report", "ask_hermes", None),
         ("How is my reef tank trending?", "trends", "ask_hermes", None),
+        ("Can you tell me what my reef tank is trending at?", "trends", "ask_hermes", None),
         ("What are my reef tank trends?", "trends", "ask_hermes", None),
         ("What are my reef trends?", "trends", "ask_hermes", None),
         ("Can you give me a reef trending report?", "trends", "ask_hermes", None),

@@ -8,8 +8,10 @@ from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
 from reachy_mini_conversation_app.tools.play_emotion import (
     EMOTION_INTENTS,
     PlayEmotion,
+    match_dance_intent,
     resolve_emotion_name,
     random_curated_emotion,
+    is_dance_emotion_request,
     is_success_emotion_request,
 )
 
@@ -71,6 +73,24 @@ def test_resolve_emotion_name_maps_success_intent() -> None:
     assert resolve_emotion_name("success", ["success1", "success2", "confused1"]) == "success1"
 
 
+def test_is_dance_emotion_request() -> None:
+    """Only the curated dance intent and move IDs count as a dance request."""
+    assert is_dance_emotion_request("dance") is True
+    assert is_dance_emotion_request("dance1") is True
+    assert is_dance_emotion_request("dance2") is True
+    assert is_dance_emotion_request("dance3") is True
+    assert is_dance_emotion_request("success") is False
+    assert is_dance_emotion_request("random") is False
+
+
+def test_resolve_emotion_name_maps_dance_intent_to_dance1() -> None:
+    """A dance request should play the official dance1 emotion when available."""
+    available = ["dance1", "dance2", "dance3", "confused1"]
+    assert resolve_emotion_name("dance", available) == "dance1"
+    assert resolve_emotion_name("dance1", available) == "dance1"
+    assert resolve_emotion_name("dance3", available) == "dance3"
+
+
 def test_resolve_emotion_name_returns_none_for_random_or_unknown() -> None:
     """Let the caller choose a random fallback when there is no resolved match."""
     assert resolve_emotion_name("random", AVAILABLE_EMOTIONS) is None
@@ -130,7 +150,6 @@ def test_resolve_emotion_name_does_not_accept_bad_exact_moves(bad_move: str) -> 
     [
         "contempt1",
         "curious1",
-        "dance1",
         "furious1",
         "helpful2",
         "impatient1",
@@ -263,3 +282,70 @@ async def test_play_emotion_allow_random_false_returns_error(monkeypatch: pytest
 
     assert result == {"error": "Emotion 'success' is not available"}
     movement_manager.queue_move.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "transcript",
+    [
+        "Can you dance?",
+        "Can Reachy dance?",
+        "Dance for me",
+        "Show me some dance moves",
+        "Do a dance",
+        "Let's dance",
+        "Dance please",
+        "Show off your dance moves",
+        "Can you show me how you dance?",
+        "Give me an energetic dance",
+        "Dance!",
+        "can you dance",
+        "CAN YOU DANCE?",
+        "hey Reachy, could you show me some dance moves?",
+        "reachy dance please",
+        "do u dance?",
+        "Show me a dance.",
+        "Do some dancing.",
+        "I want to see you dance.",
+        "Give me a dance.",
+        "Do your dance.",
+        "Can you do some moves?",
+        "Show me some moves.",
+        "Do an energetic dance.",
+        "Give me a crazy dance.",
+        "Show me your best dance moves.",
+    ],
+)
+def test_match_dance_intent_triggers_for_requests(transcript: str) -> None:
+    """Spoken requests for Reachy to dance should resolve to an official dance emotion."""
+    assert match_dance_intent(transcript) in {"dance1", "dance3"}
+
+
+@pytest.mark.parametrize(
+    "transcript",
+    [
+        "I watched a dance video.",
+        "What is dancing?",
+        "Tell me about dance.",
+        "Do you know the history of dance?",
+        "I don't want you to dance.",
+        "Do you know what dancing is?",
+        "I watched a dance video yesterday.",
+    ],
+)
+def test_match_dance_intent_ignores_non_requests(transcript: str) -> None:
+    """Talking about dance without asking Reachy to perform must not queue a dance."""
+    assert match_dance_intent(transcript) is None
+
+
+def test_match_dance_intent_uses_dance1_by_default() -> None:
+    """A plain dance request should play dance1, not a random or energetic variant."""
+    assert match_dance_intent("Can you dance?") == "dance1"
+    assert match_dance_intent("Reachy, can you dance?") == "dance1"
+
+
+def test_match_dance_intent_uses_dance3_when_energetic() -> None:
+    """Explicit energetic or 'best' dance requests may use dance3."""
+    assert match_dance_intent("Give me an energetic dance") == "dance3"
+    assert match_dance_intent("Do an energetic dance.") == "dance3"
+    assert match_dance_intent("Give me a crazy dance.") == "dance3"
+    assert match_dance_intent("Show me your best dance moves.") == "dance3"

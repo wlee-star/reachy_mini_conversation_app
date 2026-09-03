@@ -213,11 +213,14 @@ def snapshot_provenance(snapshot: dict[str, Any]) -> dict[str, Any]:
         status = "success"
     else:
         status = reef_cache_status_for_age(age)
+    live = source == "live" and not stale and status == "success"
     return {
         "status": status,
         "stale": stale,
         "source": source,
         "cache_age_seconds": age,
+        "live": live,
+        "degraded": not live,
     }
 
 
@@ -278,6 +281,8 @@ class ReefStatus(Tool):
                 "status": "error",
                 "stale": True,
                 "source": "none",
+                "live": False,
+                "degraded": True,
             }
 
         probes_raw = cache.get("probes", {})

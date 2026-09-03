@@ -112,6 +112,8 @@ Copy `.env.example` to `.env`. The example file selects local mode and `ws://127
 | `HERMES_API_KEY` | Bearer token sent as `Authorization: Bearer …`. Must match Hermes `API_SERVER_KEY`. Do not commit a real key. |
 | `HERMES_REQUEST_TIMEOUT_SECONDS` | Live-wait timeout for non-Reef Hermes delegated tasks. Defaults to `180`. |
 | `HERMES_REEF_REQUEST_TIMEOUT_SECONDS` | Live-wait timeout for interactive Reef trend/history checks. Defaults to `15`. If Hermes exceeds this, the validated `reef_thread.jsonl` cache is returned rather than waiting approximately two minutes. |
+| `HERMES_CIRCUIT_FAILURE_THRESHOLD` | Consecutive Hermes failures before the client stops calling the gateway for a cooldown. Defaults to `2`. Does not disable Home Assistant, bus, reef cache, or robot movement. |
+| `HERMES_CIRCUIT_COOLDOWN_SECONDS` | How long an open Hermes circuit stays fail-fast before one probe request. Defaults to `60`. |
 | `HA_URL` | Optional local Home Assistant base URL, for example `http://homeassistant.local:8123`. Used by the local `home_assistant` tool for simple state reads, light on/off, and scene activation without Hermes. |
 | `HA_TOKEN` | Home Assistant long-lived access token for the local `home_assistant` tool. Do not commit a real token. |
 | `HA_BUS_ENTITY_ID` | Optional Home Assistant entity for bus arrivals. Defaults to `sensor.route_311_at_rockwall_cres`. |

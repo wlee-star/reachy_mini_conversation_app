@@ -14,6 +14,7 @@ from reachy_mini_conversation_app.hermes_client import (
     HISTORY_UNAVAILABLE,
     HermesRequestError,
     HermesTimeoutError,
+    HermesCircuitOpenError,
     HermesNotConfiguredError,
 )
 from reachy_mini_conversation_app.tools.ask_hermes import AskHermes
@@ -57,6 +58,7 @@ def _fresh_hermes_lock() -> None:
     """Each test gets its own lock so pytest-asyncio's per-test loops do not collide."""
     hermes_client._HERMES_REQUEST_LOCK = asyncio.Lock()
     hermes_client._HERMES_IN_FLIGHT_REQUEST_ID = None
+    hermes_client.reset_hermes_circuit()
 
 
 def test_ask_hermes_description_keeps_simple_local_tools_out() -> None:
@@ -103,7 +105,8 @@ async def test_ask_hermes_reports_missing_config(monkeypatch: pytest.MonkeyPatch
 
     result = await AskHermes()(_deps(), query="reef status")
 
-    assert result == {"error": "Hermes Gateway is not configured"}
+    assert result["error"] == "Hermes Gateway is not configured"
+    assert result["failure_category"] == "HERMES_NOT_CONFIGURED"
 
 
 @pytest.mark.asyncio
@@ -117,7 +120,8 @@ async def test_ask_hermes_reports_request_failure(monkeypatch: pytest.MonkeyPatc
 
     result = await AskHermes()(_deps(), query="turn on the tank lights")
 
-    assert result == {"error": "I couldn't reach the household data service."}
+    assert result["error"] == "I couldn't reach the household data service."
+    assert result["failure_category"] == "HERMES_HTTP_ERROR"
 
 
 @pytest.mark.asyncio
@@ -131,7 +135,8 @@ async def test_ask_hermes_reports_timeout(monkeypatch: pytest.MonkeyPatch) -> No
 
     result = await AskHermes()(_deps(), query="reef status")
 
-    assert result == {"error": "That check took too long. Ask me again if you still want it."}
+    assert result["error"] == "That check took too long. Ask me again if you still want it."
+    assert result["failure_category"] == "HERMES_TIMEOUT"
 
 
 @pytest.mark.asyncio
@@ -662,6 +667,36 @@ async def test_ask_hermes_after_timeout_can_run_again(
     assert second["status"] == "success"
     assert second["stale"] is False
     assert second["source"] == "live"
+    assert second["live"] is True
+    assert second["degraded"] is False
     assert second["cache_used"] is False
     assert second["report"] == "Live Reef report: temp 24.1C."
     assert posts == 2
+
+
+@pytest.mark.asyncio
+async def test_ask_hermes_circuit_open_uses_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An open Hermes circuit still returns a validated cache, never as live."""
+    thread = tmp_path / "reef_thread.jsonl"
+    cached = "Reef stable - temp 24.0C (-0.012/6h); ATO 2.9 (~204h until refill)."
+    _write_reef_thread(thread, summary=cached)
+
+    async def _send(_text: str, _session_id: str, request_id: str | None = None) -> str:
+        raise HermesCircuitOpenError("Hermes Gateway circuit is open.")
+
+    monkeypatch.setattr(hermes_client, "REEF_THREAD_PATH", str(thread))
+    monkeypatch.setattr(hermes_client, "send_to_hermes", _send)
+
+    result = await AskHermes()(_deps(), query=TREND_QUERY)
+
+    assert result["status"] != "success"
+    assert result["source"] == "cache"
+    assert result["live"] is False
+    assert result["degraded"] is True
+    assert result["stale"] is True
+    assert result["cache_used"] is True
+    assert result["failure_category"] == "HERMES_CIRCUIT_OPEN"
+    assert "cached" in result["spoken"].lower()

@@ -131,6 +131,7 @@ _OPPOSITE_CONTROL_ACTION = {
     "set_bedroom_lamp": "turn_light_off",
 }
 _recent_control_results: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+_HA_UNCONFIRMED_ERROR = "I couldn't confirm that the Home Assistant action completed."
 
 
 class HomeAssistantConfigError(RuntimeError):
@@ -320,12 +321,15 @@ async def _request_json(
     url: str,
     *,
     json_body: dict[str, object] | None = None,
+    control: bool = False,
 ) -> tuple[object | None, str | None]:
     try:
         response = await http_client.request(method, url, json=json_body)
         response.raise_for_status()
     except httpx.TimeoutException:
         logger.warning("Home Assistant request timed out")
+        if control:
+            return None, _HA_UNCONFIRMED_ERROR
         return None, "Home Assistant is currently unavailable."
     except httpx.HTTPStatusError as exc:
         status_code = exc.response.status_code
@@ -335,8 +339,13 @@ async def _request_json(
         if status_code == 404:
             return None, "Home Assistant could not find that entity or service."
         return None, "Home Assistant rejected the request."
+    except httpx.ConnectError as exc:
+        logger.warning("Home Assistant request failed: %s", exc)
+        return None, "Home Assistant is currently unavailable."
     except httpx.RequestError as exc:
         logger.warning("Home Assistant request failed: %s", exc)
+        if control:
+            return None, _HA_UNCONFIRMED_ERROR
         return None, "Home Assistant is currently unavailable."
 
     if not response.content:
@@ -345,7 +354,28 @@ async def _request_json(
         return response.json(), None
     except ValueError:
         logger.warning("Home Assistant returned malformed JSON")
+        if control:
+            return None, _HA_UNCONFIRMED_ERROR
         return None, "Home Assistant returned an unexpected response."
+
+
+def _ha_control_error(error: str, *, service: str, entity_id: str) -> dict[str, Any]:
+    if error != _HA_UNCONFIRMED_ERROR:
+        return {"error": error}
+    spoken = (
+        "I couldn't confirm that the bedroom light changed."
+        if entity_id == _BEDROOM_LAMP_ENTITY_ID
+        else "I couldn't confirm that the device changed."
+    )
+    logger.warning("[HA] action unconfirmed action=%s target=%s confirmation=uncertain", service, entity_id)
+    return {
+        "status": "uncertain",
+        "confirmation": "uncertain",
+        "service": service,
+        "entity_id": entity_id,
+        "error": spoken,
+        "spoken": spoken,
+    }
 
 
 def _normalize_fast_ha_transcript(transcript: str) -> str:
@@ -685,9 +715,16 @@ class HomeAssistant(Tool):
             else:
                 result = await self._activate_scene(http_client, base_url, kwargs)
 
-        if action in _CONTROL_ACTIONS and isinstance(result, dict) and result.get("status") == "success":
+        if (
+            action in _CONTROL_ACTIONS
+            and isinstance(result, dict)
+            and result.get("status") in {"success", "uncertain"}
+        ):
             entity_id = result.get("entity_id")
-            cache_id = _control_result_cache_key(action, kwargs, result)
+            remembered = result if result.get("status") == "success" else None
+            cache_id = _control_result_cache_key(action, kwargs, remembered)
+            if cache_id is None and isinstance(entity_id, str):
+                cache_id = entity_id
             if isinstance(entity_id, str) and cache_id is not None:
                 _remember_control_result(action, cache_id, entity_id, result)
         return result
@@ -735,10 +772,11 @@ class HomeAssistant(Tool):
             "POST",
             f"{base_url}/api/services/light/{service}",
             json_body={"entity_id": entity_id},
+            control=True,
         )
         if error is not None:
-            return {"error": error}
-        logger.info("[HA] service call succeeded: light.%s %s", service, entity_id)
+            return _ha_control_error(error, service=f"light.{service}", entity_id=entity_id)
+        logger.info("[HA] service call succeeded: light.%s %s confirmation=confirmed", service, entity_id)
         return {"status": "success", "service": f"light.{service}", "entity_id": entity_id}
 
     async def _activate_scene(
@@ -759,10 +797,11 @@ class HomeAssistant(Tool):
             "POST",
             f"{base_url}/api/services/scene/turn_on",
             json_body={"entity_id": scene_id},
+            control=True,
         )
         if error is not None:
-            return {"error": error}
-        logger.info("[HA] service call succeeded: scene.turn_on %s", scene_id)
+            return _ha_control_error(error, service="scene.turn_on", entity_id=scene_id)
+        logger.info("[HA] service call succeeded: scene.turn_on %s confirmation=confirmed", scene_id)
         return {"status": "success", "service": "scene.turn_on", "entity_id": scene_id}
 
     async def _call_switch_service(
@@ -785,10 +824,11 @@ class HomeAssistant(Tool):
             "POST",
             f"{base_url}/api/services/switch/{service}",
             json_body={"entity_id": entity_id},
+            control=True,
         )
         if error is not None:
-            return {"error": error}
-        logger.info("[HA] service call succeeded: switch.%s %s", service, entity_id)
+            return _ha_control_error(error, service=f"switch.{service}", entity_id=entity_id)
+        logger.info("[HA] service call succeeded: switch.%s %s confirmation=confirmed", service, entity_id)
         return {"status": "success", "service": f"switch.{service}", "entity_id": entity_id}
 
     async def _press_button(
@@ -809,10 +849,11 @@ class HomeAssistant(Tool):
             "POST",
             f"{base_url}/api/services/button/press",
             json_body={"entity_id": entity_id},
+            control=True,
         )
         if error is not None:
-            return {"error": error}
-        logger.info("[HA] service call succeeded: button.press %s", entity_id)
+            return _ha_control_error(error, service="button.press", entity_id=entity_id)
+        logger.info("[HA] service call succeeded: button.press %s confirmation=confirmed", entity_id)
         return {"status": "success", "service": "button.press", "entity_id": entity_id}
 
     async def _get_bus_arrival(
@@ -933,11 +974,12 @@ class HomeAssistant(Tool):
             "POST",
             f"{base_url}/api/services/light/turn_on",
             json_body=payload,
+            control=True,
         )
         if error is not None:
             logger.warning("[HA] service call failed: light.turn_on %s %s", entity_id, error)
-            return {"error": error}
-        logger.info("[HA] bedroom lamp set succeeded")
+            return _ha_control_error(error, service="light.turn_on", entity_id=entity_id)
+        logger.info("[HA] bedroom lamp set succeeded confirmation=confirmed")
         return {
             "status": "success",
             "service": "light.turn_on",

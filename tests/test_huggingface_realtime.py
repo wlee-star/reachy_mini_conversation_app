@@ -1017,6 +1017,7 @@ async def test_late_live_hermes_result_is_not_spoken_after_cache_fallback(
     """If cache was already spoken while Hermes was pending, a late live result must not also speak."""
     hermes_client._HERMES_REQUEST_LOCK = asyncio.Lock()
     hermes_client._HERMES_IN_FLIGHT_REQUEST_ID = None
+    hermes_client.reset_hermes_circuit()
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler.connection = AsyncMock()
     handler._turn_generation = 1

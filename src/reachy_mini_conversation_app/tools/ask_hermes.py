@@ -8,6 +8,7 @@ from reachy_mini_conversation_app.hermes_client import (
     HISTORY_UNAVAILABLE,
     HermesClientError,
     HermesTimeoutError,
+    HermesCircuitOpenError,
     HermesNotConfiguredError,
 )
 from reachy_mini_conversation_app.tools.core_tools import Tool, ToolDependencies
@@ -22,11 +23,27 @@ def _reason_from_hermes_error(exc: HermesClientError) -> str:
         return "not_configured"
     if isinstance(exc, HermesTimeoutError):
         return "timeout"
+    if isinstance(exc, HermesCircuitOpenError):
+        return "circuit_open"
     if "HTTP " in message:
         return f"gateway_http_{message.rsplit('HTTP ', 1)[-1].rstrip('.')}"
     if "malformed JSON" in message:
         return "gateway_malformed_json"
     return "gateway_error"
+
+
+def _failure_category(reason: str) -> str:
+    if reason.startswith("gateway_http_"):
+        return "HERMES_HTTP_ERROR"
+    mapping = {
+        "timeout": "HERMES_TIMEOUT",
+        "not_configured": "HERMES_NOT_CONFIGURED",
+        "circuit_open": "HERMES_CIRCUIT_OPEN",
+        "empty_or_narration": "HERMES_INVALID_RESPONSE",
+        "gateway_malformed_json": "HERMES_INVALID_RESPONSE",
+        "gateway_error": "HERMES_CONNECTION_ERROR",
+    }
+    return mapping.get(reason, "HERMES_ERROR")
 
 
 def _cached_report_text(cache: dict[str, Any] | None) -> str | None:
@@ -93,6 +110,8 @@ def _live_history_result(
         "status": "success",
         "stale": False,
         "source": "live",
+        "live": True,
+        "degraded": False,
         "generated_at": cache.get("generated_at") if cache else None,
         "data_timestamp": cache.get("data_timestamp") if cache else None,
         "report": report,
@@ -129,10 +148,12 @@ def _cached_history_result(
     logger.info("[REEF] cache age=%s request_id=%s", age_seconds, request_id)
     logger.info("[REEF] returning cached report to Reachy request_id=%s status=%s", request_id, status)
     logger.info("[REEF] stale=true source=cache cache_used=true request_id=%s trend_keys=%s", request_id, trend_keys)
-    return {
+    result = {
         "status": status,
         "stale": True,
         "source": "cache",
+        "live": False,
+        "degraded": True,
         "generated_at": cache.get("generated_at"),
         "data_timestamp": cache.get("data_timestamp"),
         "report": report,
@@ -146,6 +167,9 @@ def _cached_history_result(
         "trends": trends,
         "trend_keys": trend_keys,
     }
+    if reason != "already_running":
+        result["failure_category"] = _failure_category(reason)
+    return result
 
 
 def _history_error(request_id: str, reason: str, cache: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -154,10 +178,12 @@ def _history_error(request_id: str, reason: str, cache: dict[str, Any] | None = 
     logger.warning("[REEF] live request failed request_id=%s reason=%s", request_id, reason)
     logger.warning("[REEF] no usable cache request_id=%s", request_id)
     logger.warning("[REEF] returning error request_id=%s source=none", request_id)
-    return {
+    result = {
         "status": "error",
         "stale": True,
         "source": "none",
+        "live": False,
+        "degraded": True,
         "reason": reason,
         "generated_at": generated_at,
         "data_timestamp": data_timestamp,
@@ -169,6 +195,9 @@ def _history_error(request_id: str, reason: str, cache: dict[str, Any] | None = 
         "cache_used": False,
         "cache_age_seconds": None,
     }
+    if reason != "already_running":
+        result["failure_category"] = _failure_category(reason)
+    return result
 
 
 def _fallback_to_cache_or_error(
@@ -272,24 +301,31 @@ class AskHermes(Tool):
                 hermes_client.get_hermes_session_id(),
                 request_id=request_id,
             )
-        except HermesNotConfiguredError:
+        except HermesNotConfiguredError as exc:
             logger.warning("[HERMES] ask_hermes not configured request_id=%s", request_id)
             if history_request:
                 return _fallback_to_cache_or_error(request_id, "not_configured", cache)
-            return {"error": "Hermes Gateway is not configured"}
-        except HermesTimeoutError:
+            return {
+                "error": "Hermes Gateway is not configured",
+                "failure_category": exc.category,
+            }
+        except HermesTimeoutError as exc:
             logger.warning("[HERMES] request timed out/failed request_id=%s", request_id)
             if history_request:
                 return _fallback_to_cache_or_error(request_id, "timeout", cache)
             return {
                 "error": "That check took too long. Ask me again if you still want it.",
+                "failure_category": exc.category,
             }
         except HermesClientError as exc:
             reason = _reason_from_hermes_error(exc)
             logger.warning("[HERMES] request timed out/failed request_id=%s reason=%s: %s", request_id, reason, exc)
             if history_request:
                 return _fallback_to_cache_or_error(request_id, reason, cache)
-            return {"error": "I couldn't reach the household data service."}
+            return {
+                "error": "I couldn't reach the household data service.",
+                "failure_category": exc.category,
+            }
 
         if history_request and hermes_client.is_process_narration(reply):
             logger.warning("[HERMES] result rejected as process narration request_id=%s", request_id)

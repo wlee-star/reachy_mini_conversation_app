@@ -36,6 +36,8 @@ async def test_reef_status_reads_live_status_url(monkeypatch: pytest.MonkeyPatch
     assert result["source"] == "live"
     assert result["status"] == "success"
     assert result["stale"] is False
+    assert result["live"] is True
+    assert result["degraded"] is False
     assert result["reef_status"]["stale"] is False
     assert result["reef_status"]["probes"]["Tmp"]["value"] == 24.2
     assert result["reef_status"]["ato"]["llsato"] == 12.3
@@ -93,6 +95,8 @@ async def test_reef_status_live_failure_returns_stale_cache(monkeypatch: pytest.
     assert result["source"] == "cache"
     assert result["status"] != "success"
     assert result["stale"] is True
+    assert result["live"] is False
+    assert result["degraded"] is True
     assert result["reef_status"]["stale"] is True
     assert result["reef_status"]["probes"]["Tmp"]["value"] == 24.0
     assert result["reef_status"]["ato"]["llsato"] == 2.9

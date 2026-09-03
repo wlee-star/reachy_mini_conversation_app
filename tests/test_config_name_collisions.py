@@ -177,6 +177,19 @@ def test_refresh_runtime_config_reloads_hermes_timeouts(monkeypatch: pytest.Monk
     assert config_mod.config.HERMES_REEF_REQUEST_TIMEOUT_SECONDS == 20
 
 
+def test_refresh_runtime_config_reloads_hermes_circuit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Instance-local .env reloads should pick up Hermes circuit breaker settings."""
+    monkeypatch.setenv("HERMES_CIRCUIT_FAILURE_THRESHOLD", "3")
+    monkeypatch.setenv("HERMES_CIRCUIT_COOLDOWN_SECONDS", "90")
+    monkeypatch.setattr(config_mod.config, "HERMES_CIRCUIT_FAILURE_THRESHOLD", 2)
+    monkeypatch.setattr(config_mod.config, "HERMES_CIRCUIT_COOLDOWN_SECONDS", 60)
+
+    config_mod.refresh_runtime_config_from_env()
+
+    assert config_mod.config.HERMES_CIRCUIT_FAILURE_THRESHOLD == 3
+    assert config_mod.config.HERMES_CIRCUIT_COOLDOWN_SECONDS == 90
+
+
 @pytest.mark.parametrize(
     ("configured_mode", "session_url", "direct_ws_url", "expected_mode", "expected_has_target"),
     [

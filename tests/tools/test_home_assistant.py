@@ -415,6 +415,19 @@ def test_device_control_success_requires_confirmed_service_result() -> None:
     assert is_device_control_success({"status": "accepted", "entity_id": "switch.lamp_3"}, None) is False
     assert is_device_control_success({"error": "Home Assistant could not find that entity or service."}, None) is False
     assert is_device_control_success({"minutes": 4, "route": "311"}, None) is False
+    assert (
+        is_device_control_success(
+            {
+                "status": "uncertain",
+                "confirmation": "uncertain",
+                "service": "light.turn_on",
+                "entity_id": "light.lounge",
+                "error": "I couldn't confirm that the device changed.",
+            },
+            None,
+        )
+        is False
+    )
 
 
 def test_screen_up_success_requires_confirmed_button_press() -> None:
@@ -704,4 +717,42 @@ async def test_set_bedroom_lamp_ignores_non_numeric_kelvin() -> None:
     assert result["brightness_pct"] == 100
     assert _FakeAsyncClient.requests == [
         ("POST", _BEDROOM_TURN_ON, {"entity_id": _BEDROOM_ENTITY, "brightness_pct": 100})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_bedroom_light_timeout_is_uncertain_and_not_repeated() -> None:
+    """A timed-out bedroom control is uncertain and is not sent to HA a second time."""
+    request = httpx.Request("POST", _BEDROOM_TURN_ON)
+    _FakeAsyncClient.error = httpx.TimeoutException("timeout", request=request)
+
+    first = await HomeAssistant()(_deps(), action="set_bedroom_lamp", brightness_pct=50)
+    second = await HomeAssistant()(_deps(), action="set_bedroom_lamp", brightness_pct=50)
+
+    assert first["status"] == "uncertain"
+    assert first["confirmation"] == "uncertain"
+    assert first["spoken"] == "I couldn't confirm that the bedroom light changed."
+    assert is_device_control_success(first, None) is False
+    assert second == first
+    assert _FakeAsyncClient.requests == [
+        ("POST", _BEDROOM_TURN_ON, {"entity_id": _BEDROOM_ENTITY, "brightness_pct": 50})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_light_timeout_is_uncertain_not_success() -> None:
+    """A timed-out light service call does not claim success and is not retried."""
+    request = httpx.Request("POST", "http://ha.local/api/services/light/turn_on")
+    _FakeAsyncClient.error = httpx.TimeoutException("timeout", request=request)
+
+    first = await HomeAssistant()(_deps(), action="turn_light_on", entity_id="light.lounge")
+    second = await HomeAssistant()(_deps(), action="turn_light_on", entity_id="light.lounge")
+
+    assert first["status"] == "uncertain"
+    assert first["confirmation"] == "uncertain"
+    assert "couldn't confirm" in first["spoken"]
+    assert is_device_control_success(first, None) is False
+    assert second == first
+    assert _FakeAsyncClient.requests == [
+        ("POST", "http://ha.local/api/services/light/turn_on", {"entity_id": "light.lounge"})
     ]

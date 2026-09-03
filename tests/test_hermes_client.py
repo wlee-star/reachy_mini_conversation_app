@@ -15,13 +15,16 @@ from reachy_mini_conversation_app.hermes_client import (
     HERMES_REEF_VOICE_SYSTEM_PROMPT,
     HermesRequestError,
     HermesTimeoutError,
+    HermesCircuitOpenError,
     HermesNotConfiguredError,
     hermes_is_busy,
     is_trend_query,
     send_to_hermes,
     chat_completions_url,
+    hermes_circuit_state,
     is_process_narration,
     parse_reef_timestamp,
+    reset_hermes_circuit,
     get_hermes_session_id,
     reef_cache_age_seconds,
     load_latest_reef_thread,
@@ -40,6 +43,7 @@ def _fresh_hermes_lock() -> None:
     """Each test gets its own lock so pytest-asyncio's per-test loops do not collide."""
     hermes_client._HERMES_REQUEST_LOCK = asyncio.Lock()
     hermes_client._HERMES_IN_FLIGHT_REQUEST_ID = None
+    reset_hermes_circuit()
 
 
 def _configure_gateway(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -560,3 +564,233 @@ async def test_send_to_hermes_timeout_allows_a_following_request(
     assert reply == "second succeeded"
     assert posts == 2
     assert hermes_is_busy() is False
+
+
+@pytest.mark.asyncio
+async def test_send_to_hermes_retries_http_5xx_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """HTTP 5xx is retried once, then classified as HERMES_HTTP_ERROR."""
+    _configure_gateway(monkeypatch)
+    posts: list[tuple[str, dict[str, str] | None, object | None]] = []
+    monkeypatch.setattr(
+        hermes_client.httpx,
+        "AsyncClient",
+        _fake_async_client(response=_json_response(503, {"error": "unavailable"}), posts=posts),
+    )
+
+    with pytest.raises(HermesRequestError, match="HTTP 503") as exc_info:
+        await send_to_hermes("turn on the tank lights", "session-abc")
+    assert exc_info.value.category == "HERMES_HTTP_ERROR"
+    assert len(posts) == 2
+
+
+@pytest.mark.asyncio
+async def test_send_to_hermes_does_not_retry_http_4xx(monkeypatch: pytest.MonkeyPatch) -> None:
+    """HTTP 4xx fails immediately without a second POST."""
+    _configure_gateway(monkeypatch)
+    posts: list[tuple[str, dict[str, str] | None, object | None]] = []
+    monkeypatch.setattr(
+        hermes_client.httpx,
+        "AsyncClient",
+        _fake_async_client(response=_json_response(400, {"error": "bad request"}), posts=posts),
+    )
+
+    with pytest.raises(HermesRequestError, match="HTTP 400") as exc_info:
+        await send_to_hermes("turn on the tank lights", "session-abc")
+    assert exc_info.value.category == "HERMES_HTTP_ERROR"
+    assert len(posts) == 1
+
+
+@pytest.mark.asyncio
+async def test_send_to_hermes_retries_connection_error_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A connection failure is retried once, then the second attempt can succeed."""
+    _configure_gateway(monkeypatch)
+    posts = 0
+
+    class FlakyAsyncClient:
+        def __init__(self, **kwargs: object) -> None:
+            self.timeout = kwargs.get("timeout")
+
+        async def __aenter__(self) -> "FlakyAsyncClient":
+            return self
+
+        async def __aexit__(self, *_args: object) -> bool:
+            return False
+
+        async def post(
+            self,
+            url: str,
+            headers: dict[str, str] | None = None,
+            json: object | None = None,
+        ) -> httpx.Response:
+            nonlocal posts
+            posts += 1
+            del url, headers, json
+            if posts == 1:
+                raise httpx.ConnectError("connection refused", request=httpx.Request("POST", GATEWAY_URL))
+            return _json_response(200, _completion_payload("recovered"))
+
+    monkeypatch.setattr(hermes_client.httpx, "AsyncClient", FlakyAsyncClient)
+
+    reply = await send_to_hermes("next 311 bus", "session-abc")
+    assert reply == "recovered"
+    assert posts == 2
+
+
+@pytest.mark.asyncio
+async def test_send_to_hermes_empty_reply_is_invalid(monkeypatch: pytest.MonkeyPatch) -> None:
+    """HTTP 200 with an empty assistant string is HERMES_INVALID_RESPONSE."""
+    _configure_gateway(monkeypatch)
+    monkeypatch.setattr(
+        hermes_client.httpx,
+        "AsyncClient",
+        _fake_async_client(response=_json_response(200, _completion_payload("   "))),
+    )
+
+    with pytest.raises(HermesRequestError, match="missing a non-empty reply") as exc_info:
+        await send_to_hermes("reef status", "session-abc")
+    assert exc_info.value.category == "HERMES_INVALID_RESPONSE"
+
+
+@pytest.mark.asyncio
+async def test_send_to_hermes_does_not_retry_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A timeout is not retried; that would double the live wait."""
+    _configure_gateway(monkeypatch)
+    posts: list[tuple[str, dict[str, str] | None, object | None]] = []
+    monkeypatch.setattr(
+        hermes_client.httpx,
+        "AsyncClient",
+        _fake_async_client(error=httpx.TimeoutException("timed out"), posts=posts),
+    )
+
+    with pytest.raises(HermesTimeoutError) as exc_info:
+        await send_to_hermes("when's the next 311", "session-abc")
+    assert exc_info.value.category == "HERMES_TIMEOUT"
+    assert len(posts) == 1
+
+
+@pytest.mark.asyncio
+async def test_hermes_circuit_opens_after_repeated_failures(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two consecutive timeouts open the circuit so the next call fails fast."""
+    _configure_gateway(monkeypatch)
+    monkeypatch.setattr(hermes_client.config, "HERMES_CIRCUIT_FAILURE_THRESHOLD", 2)
+    monkeypatch.setattr(hermes_client.config, "HERMES_CIRCUIT_COOLDOWN_SECONDS", 60)
+    monkeypatch.setattr(
+        hermes_client.httpx,
+        "AsyncClient",
+        _fake_async_client(error=httpx.TimeoutException("timed out")),
+    )
+
+    with pytest.raises(HermesTimeoutError):
+        await send_to_hermes("reef tank trends", "session-abc")
+    with pytest.raises(HermesTimeoutError):
+        await send_to_hermes("reef tank trends", "session-abc")
+    assert hermes_circuit_state() == "open"
+
+    with pytest.raises(HermesCircuitOpenError) as exc_info:
+        await send_to_hermes("reef tank trends", "session-abc")
+    assert exc_info.value.category == "HERMES_CIRCUIT_OPEN"
+    assert hermes_is_busy() is False
+
+
+@pytest.mark.asyncio
+async def test_hermes_circuit_recovers_after_cooldown(monkeypatch: pytest.MonkeyPatch) -> None:
+    """After cooldown, one successful probe closes the circuit."""
+    _configure_gateway(monkeypatch)
+    monkeypatch.setattr(hermes_client.config, "HERMES_CIRCUIT_FAILURE_THRESHOLD", 1)
+    monkeypatch.setattr(hermes_client.config, "HERMES_CIRCUIT_COOLDOWN_SECONDS", 0)
+    posts = 0
+
+    class RecoveringAsyncClient:
+        def __init__(self, **kwargs: object) -> None:
+            self.timeout = kwargs.get("timeout")
+
+        async def __aenter__(self) -> "RecoveringAsyncClient":
+            return self
+
+        async def __aexit__(self, *_args: object) -> bool:
+            return False
+
+        async def post(
+            self,
+            url: str,
+            headers: dict[str, str] | None = None,
+            json: object | None = None,
+        ) -> httpx.Response:
+            nonlocal posts
+            posts += 1
+            del url, headers, json
+            if posts == 1:
+                raise httpx.TimeoutException("timed out")
+            return _json_response(200, _completion_payload("back online"))
+
+    monkeypatch.setattr(hermes_client.httpx, "AsyncClient", RecoveringAsyncClient)
+
+    with pytest.raises(HermesTimeoutError):
+        await send_to_hermes("reef tank trends", "session-abc")
+    assert hermes_circuit_state() == "open"
+
+    reply = await send_to_hermes("reef tank trends", "session-abc")
+    assert reply == "back online"
+    assert hermes_circuit_state() == "closed"
+    assert posts == 2
+
+
+@pytest.mark.asyncio
+async def test_five_consecutive_hermes_successes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Five successful Hermes calls stay closed and return content."""
+    _configure_gateway(monkeypatch)
+    posts: list[tuple[str, dict[str, str] | None, object | None]] = []
+    monkeypatch.setattr(
+        hermes_client.httpx,
+        "AsyncClient",
+        _fake_async_client(response=_json_response(200, _completion_payload("ok")), posts=posts),
+    )
+
+    for index in range(5):
+        reply = await send_to_hermes(f"reef check {index}", "session-abc")
+        assert reply == "ok"
+    assert len(posts) == 5
+    assert hermes_circuit_state() == "closed"
+
+
+@pytest.mark.asyncio
+async def test_send_to_hermes_cancelled_releases_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cancelling an in-flight request cleans up and does not retry."""
+    _configure_gateway(monkeypatch)
+    started = asyncio.Event()
+    posts = 0
+
+    class SlowAsyncClient:
+        def __init__(self, **kwargs: object) -> None:
+            self.timeout = kwargs.get("timeout")
+
+        async def __aenter__(self) -> "SlowAsyncClient":
+            return self
+
+        async def __aexit__(self, *_args: object) -> bool:
+            return False
+
+        async def post(
+            self,
+            url: str,
+            headers: dict[str, str] | None = None,
+            json: object | None = None,
+        ) -> httpx.Response:
+            nonlocal posts
+            posts += 1
+            del url, headers, json
+            started.set()
+            await asyncio.sleep(5)
+            return _json_response(200, _completion_payload("too late"))
+
+    monkeypatch.setattr(hermes_client.httpx, "AsyncClient", SlowAsyncClient)
+
+    task = asyncio.create_task(send_to_hermes("next 311 bus", "session-abc"))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert posts == 1
+    assert hermes_is_busy() is False
+    assert hermes_in_flight_request_id() is None
+    assert hermes_circuit_state() == "closed"

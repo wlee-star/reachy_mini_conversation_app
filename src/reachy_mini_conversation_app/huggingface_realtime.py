@@ -43,6 +43,8 @@ from reachy_mini_conversation_app.prompts import (
     get_session_greeting_prompt,
 )
 from reachy_mini_conversation_app.streaming import AdditionalOutputs, audio_to_int16
+from reachy_mini_conversation_app.activation import ActivationSession, wake_reminder_text
+from reachy_mini_conversation_app.local_time import match_time_intent, current_local_time
 from reachy_mini_conversation_app.tools.apex import (
     Apex,
     ReefRoute,
@@ -115,8 +117,13 @@ _HERMES_RETRY_PROMPT: Final[str] = (
     "Speak the previous check result now in one or two short sentences. Do not mention tools or files."
 )
 _BUS_ALERT_PROMPT: Final[str] = (
-    "Speak this exact bus update to the user now, in one or two short sentences, "
-    "without mentioning tools, Home Assistant, or that this is a reminder: {text}"
+    "Speak this exact bus update to the user now. Do not rephrase. Do not replace "
+    "'due now' with 'here', 'arrived', or 'arrived now'. Do not mention tools, "
+    "Home Assistant, or that this is a reminder: {text}"
+)
+_TIME_ALERT_PROMPT: Final[str] = (
+    "Speak this exact time to the user now, in one short sentence. "
+    "Do not change the numbers, do not convert the timezone, and do not mention tools: {text}"
 )
 _APEX_ALERT_PROMPT: Final[str] = (
     "Speak this exact reef update to the user now, in one or two short sentences. "
@@ -124,10 +131,15 @@ _APEX_ALERT_PROMPT: Final[str] = (
     "percentage, unit, or salinity claim, and do not mention tools or Apex: {text}"
 )
 _HERMES_REEF_ALERT_PROMPT: Final[str] = (
-    "Speak this exact reef report to the user now. Do not call tools. Do not mention files or tools: {text}"
+    "Speak this exact reef report to the user now. Keep any 'not current' or 'cached' "
+    "disclaimer verbatim. Do not invent, estimate, or update reef numbers. Do not call "
+    "tools. Do not mention files or tools: {text}"
 )
 _REEF_SOURCE_ALERT_PROMPT: Final[str] = (
     "Speak this exact sentence to the user now. Do not call tools. Do not add extra explanation: {text}"
+)
+_WAKE_REMINDER_PROMPT: Final[str] = (
+    "Speak this exact sentence to the user now, then stop. Do not call tools. Do not add extra explanation: {text}"
 )
 _COMPETING_REEF_TOOLS: Final[frozenset[str]] = frozenset({"apex", "reef_status"})
 _HERMES_SPEECH_REASONS: Final[frozenset[str]] = frozenset(
@@ -373,12 +385,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._fast_ha_task: asyncio.Task[None] | None = None
         self._fast_bus_task: asyncio.Task[None] | None = None
         self._fast_apex_task: asyncio.Task[None] | None = None
+        self._fast_time_task: asyncio.Task[None] | None = None
         self._fast_dance_task: asyncio.Task[None] | None = None
         self._fast_hermes_reef_task: asyncio.Task[None] | None = None
         self._bus_monitor_start_task: asyncio.Task[None] | None = None
         self._bus_spoke_turn: int | None = None
         self._apex_spoke_turn: int | None = None
         self._hermes_spoke_turn: int | None = None
+        self._time_spoke_turn: int | None = None
         self._reef_router_owns_turn: int | None = None
         self._reef_router_route: ReefRoute | None = None
         self._last_reef_response_source: str | None = None
@@ -394,6 +408,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._turn_screen_up_call_ids: set[str] = set()
         self._device_success_emotion_played = False
         self._dance_emotion_played = False
+        self._activation = ActivationSession()
+        self._user_turn_authorized = False
+        self._wake_reminder_task: asyncio.Task[None] | None = None
 
     @staticmethod
     def _sanitize_tool_result_for_model(tool_name: str, tool_result: dict[str, Any]) -> dict[str, Any]:
@@ -522,6 +539,35 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             (time.perf_counter() - started) * 1000,
         )
 
+    def _start_fast_time_command(self, transcript: str) -> None:
+        if not match_time_intent(transcript):
+            return
+        self._claim_deterministic_route()
+        self._fast_time_task = asyncio.create_task(self._run_fast_time_command(), name="time-fast-path")
+
+    async def _speak_time_update(self, text: str) -> None:
+        """Speak the exact system-clock time through the existing realtime session."""
+        try:
+            await self.say(_TIME_ALERT_PROMPT.format(text=text), **_TOOL_FOLLOWUP_CREATE_KWARGS)
+        except Exception as exc:
+            logger.warning("[TIME] fast-path speech failed: %s", exc)
+
+    async def _run_fast_time_command(self) -> None:
+        started = time.perf_counter()
+        result = current_local_time()
+        spoken = result.get("spoken")
+        if not isinstance(spoken, str) or not spoken:
+            return
+        logger.info("[TIME] current local_datetime=%s", result.get("local_datetime"))
+        logger.info("[TIME] source=system_clock supplied_to_speech=%s", spoken)
+        self._time_spoke_turn = self._turn_generation
+        self._suppress_unsolicited_response_turn = self._turn_generation
+        if not self._response_done_event.is_set() and self._active_response_reason is None:
+            logger.info("[TIME] cancelling unsolicited realtime response before time speech")
+            await self._cancel_active_realtime_response()
+        await self._speak_time_update(spoken)
+        logger.info("[TIME] fast-path finished in %.0f ms", (time.perf_counter() - started) * 1000)
+
     def _claim_deterministic_route(self) -> None:
         """Own this turn as soon as a deterministic reef/bus/HA route is known."""
         self._suppress_unsolicited_response_turn = self._turn_generation
@@ -649,16 +695,36 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             return
         spoken = _hermes_result_text(result)
         cache_used = bool(result.get("cache_used")) if isinstance(result, dict) else False
+        fresh = bool(result.get("fresh")) if isinstance(result, dict) else False
         result_source = result.get("source") if isinstance(result, dict) else None
-        if result_source in {"live", "cache", "none"}:
-            router_source = result_source
+        request_kind = result.get("request_kind") if isinstance(result, dict) else None
+        if cache_used or result_source == "cache":
+            router_source = "cache"
+            source_type = "cached_trends" if intent == "trends" else "cached_report"
+        elif result_source == "none":
+            router_source = "none"
+            source_type = "cached_trends" if intent == "trends" else "cached_report"
+        elif request_kind == "reef_history":
+            router_source = "hermes"
+            source_type = "historical_trends" if intent == "trends" else "historical_report"
+        elif fresh:
+            router_source = "hermes"
+            source_type = "current_trends" if intent == "trends" else "current_report"
         else:
             router_source = "hermes"
-        source_type = "cached_trends" if intent == "trends" else "cached_report"
-        if not cache_used:
-            source_type = "live_trends" if intent == "trends" else "live_report"
+            source_type = "stale_trends" if intent == "trends" else "stale_report"
         if intent == "trends":
             logger.info("[REEF_ROUTER] trend_keys=%s", _reef_trend_keys(result))
+        if isinstance(result, dict):
+            logger.info("[REEF_ROUTER] request_kind=%s", request_kind)
+            logger.info("[REEF_ROUTER] data_source=%s", result.get("data_source"))
+            logger.info("[REEF_ROUTER] data_timestamp=%s", result.get("data_timestamp"))
+            logger.info("[REEF_ROUTER] report_timestamp=%s", result.get("report_timestamp"))
+            logger.info("[REEF_ROUTER] requested_at=%s", result.get("requested_at"))
+            logger.info("[REEF_ROUTER] retrieved_at=%s", result.get("retrieved_at"))
+            logger.info("[REEF_ROUTER] age_seconds=%s", result.get("age_seconds"))
+            logger.info("[REEF_ROUTER] fresh=%s", str(fresh).lower())
+            logger.info("[REEF_ROUTER] status=%s", result.get("status"))
         _log_reef_router(
             intent=intent,
             route="ask_hermes",
@@ -712,6 +778,56 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._turn_screen_up_call_ids.clear()
         self._device_success_emotion_played = False
         self._dance_emotion_played = False
+
+    def _handle_completed_user_transcript(self, transcript: str) -> None:
+        """Apply Wally activation, then start deterministic routes only when authorized."""
+        self._user_speech_in_progress = False
+        self._turn_user_done_at = time.perf_counter()
+        self._turn_response_created_at = None
+        self._turn_first_audio_at = None
+        self._turn_tool_received_at = None
+        if self._turn_speech_stopped_at is not None:
+            logger.info(
+                "Turn latency: STT %.0f ms after speech_stopped",
+                (self._turn_user_done_at - self._turn_speech_stopped_at) * 1000,
+            )
+        self._turn_generation += 1
+        self._in_flight_tool_calls.clear()
+        self._tool_batch_needs_response = False
+        self._reset_device_success_turn_state()
+        self._reset_active_response_audio_state()
+        self._delivered_assistant_transcript_ids.clear()
+        self._suppress_unsolicited_response_turn = None
+        self._drop_active_response_output = False
+        self._reef_router_owns_turn = None
+        self._reef_router_route = None
+        decision = self._activation.evaluate(transcript)
+        self._user_turn_authorized = decision.authorized
+        if not decision.authorized:
+            self._claim_deterministic_route()
+            if self._wake_reminder_task is not None and not self._wake_reminder_task.done():
+                self._wake_reminder_task.cancel()
+            self._wake_reminder_task = asyncio.create_task(
+                self._reject_unactivated_speech(),
+                name="wally-wake-reminder",
+            )
+            return
+        logger.info("Wally processing request")
+        command = decision.command_text or transcript
+        self._start_fast_ha_command(command)
+        self._start_fast_bus_command(command)
+        self._start_fast_apex_command(command)
+        self._start_fast_time_command(command)
+        self._start_fast_dance_emotion(command)
+
+    async def _reject_unactivated_speech(self) -> None:
+        """Block model/tool side effects and remind the user to say Wally."""
+        await self._suppress_unsolicited_realtime()
+        reminder = wake_reminder_text()
+        try:
+            await self.say(_WAKE_REMINDER_PROMPT.format(text=reminder), **_TOOL_FOLLOWUP_CREATE_KWARGS)
+        except Exception as exc:
+            logger.warning("Wally wake reminder failed: %s", exc)
 
     def _value_from_tool_args(self, args_json: str, key: str) -> object:
         try:
@@ -1486,7 +1602,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 completed_tool.tool_name,
                 completed_tool.id,
             )
-            if completed_tool.tool_name in {"apex", "reef_status", "monitor_bus", "ask_hermes"}:
+            if completed_tool.tool_name in {"apex", "reef_status", "monitor_bus", "ask_hermes", "get_time"}:
                 logger.info("[TOOL] %s result passed to model: %s", completed_tool.tool_name, tool_result_for_model)
             logger.debug("Tool '%s' model-visible result: %s", completed_tool.tool_name, tool_result_for_model)
         else:
@@ -1646,6 +1762,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             hermes_already_spoken = (
                 self._hermes_spoke_turn == self._turn_generation and completed_tool.tool_name == "ask_hermes"
             )
+            time_already_spoken = (
+                self._time_spoke_turn == self._turn_generation and completed_tool.tool_name == "get_time"
+            )
 
             # Always surface errors, skip the spoken follow-up for tools that opt out.
             if (
@@ -1653,6 +1772,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 and not bus_already_spoken
                 and not apex_already_spoken
                 and not hermes_already_spoken
+                and not time_already_spoken
                 and (tool is None or tool.wants_spoken_followup(completed_tool.result, completed_tool.error))
             ):
                 self._tool_batch_needs_response = True
@@ -1725,6 +1845,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     if event.type == "input_audio_buffer.speech_started":
                         self._mark_activity("user_speech_started")
                         self._user_speech_in_progress = True
+                        self._user_turn_authorized = self._activation.is_active()
                         self._turn_speech_started_at = time.perf_counter()
                         self._turn_speech_stopped_at = None
                         self._turn_user_done_at = None
@@ -1863,30 +1984,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             self._user_speech_in_progress = False
                             continue
 
-                        self._user_speech_in_progress = False
-                        self._turn_user_done_at = time.perf_counter()
-                        self._turn_response_created_at = None
-                        self._turn_first_audio_at = None
-                        self._turn_tool_received_at = None
-                        if self._turn_speech_stopped_at is not None:
-                            logger.info(
-                                "Turn latency: STT %.0f ms after speech_stopped",
-                                (self._turn_user_done_at - self._turn_speech_stopped_at) * 1000,
-                            )
-                        self._turn_generation += 1
-                        self._in_flight_tool_calls.clear()
-                        self._tool_batch_needs_response = False
-                        self._reset_device_success_turn_state()
-                        self._reset_active_response_audio_state()
-                        self._delivered_assistant_transcript_ids.clear()
-                        self._suppress_unsolicited_response_turn = None
-                        self._drop_active_response_output = False
-                        self._reef_router_owns_turn = None
-                        self._reef_router_route = None
-                        self._start_fast_ha_command(transcript)
-                        self._start_fast_bus_command(transcript)
-                        self._start_fast_apex_command(transcript)
-                        self._start_fast_dance_emotion(transcript)
+                        self._handle_completed_user_transcript(transcript)
 
                         await self.output_queue.put(AdditionalOutputs({"role": "user", "content": transcript}))
                         self._emit_transcript("user", transcript, True)
@@ -1974,6 +2072,22 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                         "output": json.dumps(
                                             {"status": "skipped", "reason": "deterministic_reef_route"}
                                         ),
+                                    },
+                                )
+                            continue
+
+                        if not self._user_turn_authorized:
+                            logger.info(
+                                "Wally activation required; skipping tool %s call_id=%s",
+                                tool_name,
+                                call_id,
+                            )
+                            if self.connection:
+                                await self.connection.conversation.item.create(
+                                    item={
+                                        "type": "function_call_output",
+                                        "call_id": call_id,
+                                        "output": json.dumps({"error": "Wally activation required"}),
                                     },
                                 )
                             continue

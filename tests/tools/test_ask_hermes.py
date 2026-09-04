@@ -2,6 +2,7 @@
 
 import time
 import asyncio
+from typing import Any
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock
@@ -34,6 +35,22 @@ def _iso(delta: timedelta) -> str:
     return (datetime.now(timezone.utc) - delta).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _fresh_live_cache(*, age_seconds: float = 12.0) -> dict[str, Any]:
+    timestamp = _iso(timedelta(seconds=age_seconds))
+    return {
+        "cached_at": timestamp,
+        "data_timestamp": timestamp,
+        "age_seconds": age_seconds,
+        "probes": {"Tmp": {"value": 24.5, "status": "ok"}},
+        "ato": {"value": 13.4, "status": "HIGH"},
+        "source": "reef_monitor",
+    }
+
+
+def _stale_live_cache() -> dict[str, Any]:
+    return _fresh_live_cache(age_seconds=1201.0)
+
+
 def _write_reef_thread(path: Path, *, generated_at: str | None = None, summary: str | None = None) -> None:
     ts = generated_at or _iso(timedelta(minutes=5))
     report = summary or "Reef stable - temp 24.0C (-0.012/6h); ATO 2.9 (~204h until refill)."
@@ -54,11 +71,12 @@ def _write_reef_thread(path: Path, *, generated_at: str | None = None, summary: 
 
 
 @pytest.fixture(autouse=True)
-def _fresh_hermes_lock() -> None:
-    """Each test gets its own lock so pytest-asyncio's per-test loops do not collide."""
+def _fresh_hermes_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each test gets its own lock and must not read the real reef-monitor cache."""
     hermes_client._HERMES_REQUEST_LOCK = asyncio.Lock()
     hermes_client._HERMES_IN_FLIGHT_REQUEST_ID = None
     hermes_client.reset_hermes_circuit()
+    monkeypatch.setattr(hermes_client, "load_reef_live_cache", lambda path=None: None)
 
 
 def test_ask_hermes_description_keeps_simple_local_tools_out() -> None:
@@ -70,16 +88,48 @@ def test_ask_hermes_description_keeps_simple_local_tools_out() -> None:
     assert "do not use apex or reef_status" in description.lower()
     assert "already running" in description.lower()
     assert "live reef tank status" in description.lower()
-    assert "source=live" in description
+    assert "source=hermes" in description
     assert "source=cache" in description
     assert "stale=true" in description
+    assert "fresh=true" in description
+
+
+@pytest.mark.asyncio
+async def test_ask_hermes_latest_report_attempts_live_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A latest-Hermes-report question must call Hermes, not answer from cache alone."""
+    posts: list[str] = []
+
+    async def _send(text: str, _session_id: str, request_id: str | None = None, **_kwargs: object) -> str:
+        posts.append(text)
+        return "Hermes latest Reef report: temp 24.1C."
+
+    monkeypatch.setattr(hermes_client, "load_latest_reef_thread", lambda path=None: None)
+    monkeypatch.setattr(hermes_client, "load_reef_live_cache", lambda path=None: _fresh_live_cache())
+    monkeypatch.setattr(hermes_client, "send_to_hermes", _send)
+
+    result = await AskHermes()(_deps(), query="What's the latest Hermes report?")
+
+    assert posts, "latest report must call Hermes"
+    assert "Reef current request:" in posts[0]
+    assert "Reef historical request:" not in posts[0]
+    assert result["status"] == "success"
+    assert result["fresh"] is True
+    assert result["latest"] is True
+    assert result["source"] == "hermes"
+    assert result["data_source"] == "reef_monitor"
+    assert result["data_timestamp"]
+    assert result["report_timestamp"]
+    assert result["requested_at"]
+    assert result["retrieved_at"]
+    assert result["age_seconds"] == 12.0
+    assert result["report"] == "Hermes latest Reef report: temp 24.1C."
 
 
 @pytest.mark.asyncio
 async def test_ask_hermes_returns_gateway_reply(monkeypatch: pytest.MonkeyPatch) -> None:
     """A successful Hermes call is returned as reply text."""
 
-    async def _send(text: str, session_id: str, request_id: str | None = None) -> str:
+    async def _send(text: str, session_id: str, request_id: str | None = None, **_kwargs: object) -> str:
         assert text == "what's the reef temperature"
         assert session_id
         assert request_id
@@ -98,7 +148,7 @@ async def test_ask_hermes_returns_gateway_reply(monkeypatch: pytest.MonkeyPatch)
 async def test_ask_hermes_reports_missing_config(monkeypatch: pytest.MonkeyPatch) -> None:
     """Missing gateway config becomes a tool error dict, not an exception."""
 
-    async def _send(_text: str, _session_id: str, request_id: str | None = None) -> str:
+    async def _send(_text: str, _session_id: str, request_id: str | None = None, **_kwargs: object) -> str:
         raise HermesNotConfiguredError("missing")
 
     monkeypatch.setattr(hermes_client, "send_to_hermes", _send)
@@ -113,7 +163,7 @@ async def test_ask_hermes_reports_missing_config(monkeypatch: pytest.MonkeyPatch
 async def test_ask_hermes_reports_request_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     """Gateway failures degrade to an error payload for the conversation loop."""
 
-    async def _send(_text: str, _session_id: str, request_id: str | None = None) -> str:
+    async def _send(_text: str, _session_id: str, request_id: str | None = None, **_kwargs: object) -> str:
         raise HermesRequestError("HTTP 503")
 
     monkeypatch.setattr(hermes_client, "send_to_hermes", _send)
@@ -128,7 +178,7 @@ async def test_ask_hermes_reports_request_failure(monkeypatch: pytest.MonkeyPatc
 async def test_ask_hermes_reports_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     """A gateway timeout becomes a spoken-ready error, not a crash."""
 
-    async def _send(_text: str, _session_id: str, request_id: str | None = None) -> str:
+    async def _send(_text: str, _session_id: str, request_id: str | None = None, **_kwargs: object) -> str:
         raise HermesTimeoutError("timed out")
 
     monkeypatch.setattr(hermes_client, "send_to_hermes", _send)
@@ -151,7 +201,7 @@ async def test_ask_hermes_reports_already_running(monkeypatch: pytest.MonkeyPatc
     """A second non-Reef ask_hermes while one is in flight returns immediately so the robot can speak."""
     posts: list[str] = []
 
-    async def _send(_text: str, _session_id: str, request_id: str | None = None) -> str:
+    async def _send(_text: str, _session_id: str, request_id: str | None = None, **_kwargs: object) -> str:
         posts.append("sent")
         return "should not run"
 
@@ -170,7 +220,7 @@ async def test_ask_hermes_pending_without_cache_is_controlled_error(monkeypatch:
     """A stuck Hermes Reef request with no cache must not hang; it returns a controlled error."""
     posts: list[str] = []
 
-    async def _send(_text: str, _session_id: str, request_id: str | None = None) -> str:
+    async def _send(_text: str, _session_id: str, request_id: str | None = None, **_kwargs: object) -> str:
         posts.append("sent")
         return "should not run"
 
@@ -195,12 +245,13 @@ async def test_ask_hermes_live_reef_report_reaches_tool_result(monkeypatch: pyte
     live_report = "Hermes live Reef report: temp 24.1C, nitrate falling, ATO 2.9."
     posts: list[str] = []
 
-    async def _send(text: str, _session_id: str, request_id: str | None = None) -> str:
+    async def _send(text: str, _session_id: str, request_id: str | None = None, **_kwargs: object) -> str:
         posts.append(text)
         assert request_id
         return live_report
 
     monkeypatch.setattr(hermes_client, "load_latest_reef_thread", lambda path=None: None)
+    monkeypatch.setattr(hermes_client, "load_reef_live_cache", lambda path=None: _fresh_live_cache())
     monkeypatch.setattr(hermes_client, "send_to_hermes", _send)
 
     result = await AskHermes()(_deps(), query="What did Hermes report about my Reef?")
@@ -208,11 +259,19 @@ async def test_ask_hermes_live_reef_report_reaches_tool_result(monkeypatch: pyte
     assert posts, "Hermes must be called"
     assert result["status"] == "success"
     assert result["stale"] is False
-    assert result["source"] == "live"
+    assert result["fresh"] is True
+    assert result["latest"] is True
+    assert result["source"] == "hermes"
+    assert result["data_source"] == "reef_monitor"
     assert result["report"] == live_report
+    assert result["data_timestamp"]
+    assert result["report_timestamp"]
+    assert result["requested_at"]
+    assert result["retrieved_at"]
     assert result["cache_used"] is False
     assert result["trend_keys"] == []
     assert _hermes_result_text(result) == live_report
+    assert "latest" not in live_report.lower() or result["latest"] is True
 
 
 @pytest.mark.asyncio
@@ -226,13 +285,15 @@ async def test_ask_hermes_cache_does_not_bypass_live_hermes(
     live_report = "Live Hermes Reef report: temp 24.1C and nitrate falling."
     posts: list[str] = []
 
-    async def _send(text: str, _session_id: str, request_id: str | None = None) -> str:
+    async def _send(text: str, _session_id: str, request_id: str | None = None, **_kwargs: object) -> str:
         posts.append(text)
-        assert "Reef trend/history request" in text
-        assert "24.0C" in text
+        assert "Reef current request" in text
+        assert "only data source" not in text
+        assert "24.5" in text
         return live_report
 
     monkeypatch.setattr(hermes_client, "REEF_THREAD_PATH", str(thread))
+    monkeypatch.setattr(hermes_client, "load_reef_live_cache", lambda path=None: _fresh_live_cache())
     monkeypatch.setattr(hermes_client, "send_to_hermes", _send)
 
     result = await AskHermes()(_deps(), query="What is my reef tank report?")
@@ -240,7 +301,8 @@ async def test_ask_hermes_cache_does_not_bypass_live_hermes(
     assert posts, "cache must not bypass Hermes"
     assert result["status"] == "success"
     assert result["stale"] is False
-    assert result["source"] == "live"
+    assert result["source"] == "hermes"
+    assert result["data_source"] == "reef_monitor"
     assert result["cache_used"] is False
     assert set(result["trend_keys"]) == set(_TREND_KEYS)
     assert result["report"] == live_report
@@ -258,7 +320,7 @@ async def test_ask_hermes_timeout_returns_stale_cache(
     _write_reef_thread(thread, summary=cached)
     posts: list[str] = []
 
-    async def _send(_text: str, _session_id: str, request_id: str | None = None) -> str:
+    async def _send(_text: str, _session_id: str, request_id: str | None = None, **_kwargs: object) -> str:
         posts.append("sent")
         raise HermesTimeoutError("timed out")
 
@@ -270,13 +332,18 @@ async def test_ask_hermes_timeout_returns_stale_cache(
     assert posts == ["sent"]
     assert result["status"] != "success"
     assert result["stale"] is True
+    assert result["fresh"] is False
+    assert result["latest"] is False
     assert result["source"] == "cache"
     assert result["report"] == cached
+    assert result["report_timestamp"]
+    assert result["retrieved_at"]
     assert result["cache_used"] is True
     assert set(result["trend_keys"]) == set(_TREND_KEYS)
     spoken = _hermes_result_text(result)
     assert cached in spoken
     assert "cached" in spoken.lower()
+    assert "latest" not in spoken.lower()
 
 
 @pytest.mark.asyncio
@@ -289,7 +356,7 @@ async def test_ask_hermes_error_returns_stale_cache(
     cached = "Reef stable - temp 24.0C (-0.012/6h); ATO 2.9 (~204h until refill)."
     _write_reef_thread(thread, summary=cached)
 
-    async def _send(_text: str, _session_id: str, request_id: str | None = None) -> str:
+    async def _send(_text: str, _session_id: str, request_id: str | None = None, **_kwargs: object) -> str:
         raise HermesRequestError("Hermes Gateway returned HTTP 503.")
 
     monkeypatch.setattr(hermes_client, "REEF_THREAD_PATH", str(thread))
@@ -316,7 +383,7 @@ async def test_ask_hermes_error_with_old_cache_is_stale(
     _write_reef_thread(thread, generated_at=_iso(timedelta(hours=5)), summary=cached)
     monkeypatch.setattr(hermes_client.config, "REEF_CACHE_MAX_AGE_SECONDS", 3600)
 
-    async def _send(_text: str, _session_id: str, request_id: str | None = None) -> str:
+    async def _send(_text: str, _session_id: str, request_id: str | None = None, **_kwargs: object) -> str:
         raise HermesRequestError("Hermes Gateway returned HTTP 503.")
 
     monkeypatch.setattr(hermes_client, "REEF_THREAD_PATH", str(thread))
@@ -326,18 +393,22 @@ async def test_ask_hermes_error_with_old_cache_is_stale(
 
     assert result["status"] == "stale"
     assert result["stale"] is True
+    assert result["fresh"] is False
+    assert result["latest"] is False
     assert result["source"] == "cache"
     assert result["report"] == cached
     assert result["cache_age_seconds"] is not None
     assert result["cache_age_seconds"] > 3600
-    assert cached in _hermes_result_text(result)
+    spoken = _hermes_result_text(result)
+    assert cached in spoken
+    assert "latest" not in spoken.lower()
 
 
 @pytest.mark.asyncio
 async def test_ask_hermes_error_without_cache_is_not_success(monkeypatch: pytest.MonkeyPatch) -> None:
     """Hermes failure with no cache is an error, never success."""
 
-    async def _send(_text: str, _session_id: str, request_id: str | None = None) -> str:
+    async def _send(_text: str, _session_id: str, request_id: str | None = None, **_kwargs: object) -> str:
         raise HermesRequestError("Hermes Gateway returned HTTP 404.")
 
     monkeypatch.setattr(hermes_client, "load_latest_reef_thread", lambda path=None: None)
@@ -356,8 +427,8 @@ async def test_ask_hermes_error_without_cache_is_not_success(monkeypatch: pytest
 async def test_ask_hermes_rejects_process_narration_without_cache(monkeypatch: pytest.MonkeyPatch) -> None:
     """A file/process error is not spoken as a trend when the Reefy cache is missing."""
 
-    async def _send(text: str, _session_id: str, request_id: str | None = None) -> str:
-        assert "Reef trend/history request" in text
+    async def _send(text: str, _session_id: str, request_id: str | None = None, **_kwargs: object) -> str:
+        assert "Reef current request" in text
         assert request_id
         return "It seems there is an issue with accessing the file content."
 
@@ -383,7 +454,7 @@ async def test_ask_hermes_process_narration_falls_back_to_cache(
     cached = "Reef stable - temp 24.0C (-0.012/6h); ATO 2.9 (~204h until refill)."
     _write_reef_thread(thread, summary=cached)
 
-    async def _send(_text: str, _session_id: str, request_id: str | None = None) -> str:
+    async def _send(_text: str, _session_id: str, request_id: str | None = None, **_kwargs: object) -> str:
         return "It seems there is an issue with accessing the file content."
 
     monkeypatch.setattr(hermes_client, "REEF_THREAD_PATH", str(thread))
@@ -401,7 +472,7 @@ async def test_ask_hermes_process_narration_falls_back_to_cache(
 async def test_ask_hermes_history_error_does_not_use_live_apex(monkeypatch: pytest.MonkeyPatch) -> None:
     """If Hermes fails and the Reefy cache is missing, say history is unavailable."""
 
-    async def _send(_text: str, _session_id: str, request_id: str | None = None) -> str:
+    async def _send(_text: str, _session_id: str, request_id: str | None = None, **_kwargs: object) -> str:
         raise HermesRequestError("Hermes Gateway returned HTTP 404.")
 
     monkeypatch.setattr(hermes_client, "load_latest_reef_thread", lambda path=None: None)
@@ -421,7 +492,7 @@ async def test_ask_hermes_history_error_does_not_use_live_apex(monkeypatch: pyte
 async def test_ask_hermes_gateway_404_without_cache_is_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
     """A gateway 404 without cache must not be replaced by live Apex numbers."""
 
-    async def _send(_text: str, _session_id: str, request_id: str | None = None) -> str:
+    async def _send(_text: str, _session_id: str, request_id: str | None = None, **_kwargs: object) -> str:
         raise HermesRequestError("Hermes Gateway returned HTTP 404.")
 
     monkeypatch.setattr(hermes_client, "load_latest_reef_thread", lambda path=None: None)
@@ -442,20 +513,24 @@ async def test_ask_hermes_accepts_genuine_trend_without_apex_fallback(
 ) -> None:
     """A real historical trend is spoken as-is and does not call Apex."""
 
-    async def _send(text: str, _session_id: str, request_id: str | None = None) -> str:
-        assert "Reef trend/history request: how is my reef tank trending?" in text
+    async def _send(text: str, _session_id: str, request_id: str | None = None, **_kwargs: object) -> str:
+        assert "Reef current request: how is my reef tank trending?" in text
+        assert "Reef historical request:" not in text
         assert request_id
         return "Nitrate has been falling from 20 to 8 over the recorded period, while temperature stayed near 26."
 
     monkeypatch.setattr(hermes_client, "load_latest_reef_thread", lambda path=None: None)
+    monkeypatch.setattr(hermes_client, "load_reef_live_cache", lambda path=None: _fresh_live_cache())
     monkeypatch.setattr(hermes_client, "send_to_hermes", _send)
 
     result = await AskHermes()(_deps(), query="how is my reef tank trending?")
 
     assert result["status"] == "success"
     assert result["stale"] is False
+    assert result["fresh"] is True
     assert result["trend_available"] is True
-    assert result["source"] == "live"
+    assert result["source"] == "hermes"
+    assert result["data_source"] == "reef_monitor"
     assert "Nitrate has been falling" in result["report"]
     assert "Nitrate has been falling" in _hermes_result_text(result)
 
@@ -472,7 +547,7 @@ async def test_ask_hermes_pending_with_cache_returns_cached_report(
     _write_reef_thread(thread, summary=cached)
     posts: list[str] = []
 
-    async def _send(_text: str, _session_id: str, request_id: str | None = None) -> str:
+    async def _send(_text: str, _session_id: str, request_id: str | None = None, **_kwargs: object) -> str:
         posts.append("sent")
         return "should not run"
 
@@ -512,7 +587,7 @@ async def test_ask_hermes_second_request_uses_cache_while_first_is_pending(
     release = asyncio.Event()
     posts: list[str] = []
 
-    async def _send(_text: str, _session_id: str, request_id: str | None = None) -> str:
+    async def _send(_text: str, _session_id: str, request_id: str | None = None, **_kwargs: object) -> str:
         posts.append("sent")
         async with hermes_client._HERMES_REQUEST_LOCK:
             started.set()
@@ -520,6 +595,7 @@ async def test_ask_hermes_second_request_uses_cache_while_first_is_pending(
         return "Live Hermes Reef report: temp 24.1C, nitrate falling."
 
     monkeypatch.setattr(hermes_client, "REEF_THREAD_PATH", str(thread))
+    monkeypatch.setattr(hermes_client, "load_reef_live_cache", lambda path=None: _fresh_live_cache())
     monkeypatch.setattr(hermes_client, "send_to_hermes", _send)
 
     first = asyncio.create_task(AskHermes()(_deps(), query=TREND_QUERY))
@@ -539,7 +615,7 @@ async def test_ask_hermes_second_request_uses_cache_while_first_is_pending(
     first_result = await first
     assert first_result["status"] == "success"
     assert first_result["stale"] is False
-    assert first_result["source"] == "live"
+    assert first_result["source"] == "hermes"
     assert first_result["cache_used"] is False
     assert "nitrate falling" in first_result["report"]
     assert set(first_result["trend_keys"]) == set(_TREND_KEYS)
@@ -611,6 +687,7 @@ async def test_ask_hermes_after_timeout_can_run_again(
     cached = "Reef stable - temp 24.0C (-0.012/6h)."
     _write_reef_thread(thread, summary=cached)
     monkeypatch.setattr(hermes_client, "REEF_THREAD_PATH", str(thread))
+    monkeypatch.setattr(hermes_client, "load_reef_live_cache", lambda path=None: _fresh_live_cache())
     monkeypatch.setattr(hermes_client.config, "HERMES_GATEWAY_URL", "http://127.0.0.1:8642/v1/chat/completions")
     monkeypatch.setattr(hermes_client.config, "HERMES_API_KEY", "test-hermes-key")
     monkeypatch.setattr(hermes_client.config, "HERMES_REEF_REQUEST_TIMEOUT_SECONDS", 0.05)
@@ -666,7 +743,7 @@ async def test_ask_hermes_after_timeout_can_run_again(
     second = await AskHermes()(_deps(), query=TREND_QUERY)
     assert second["status"] == "success"
     assert second["stale"] is False
-    assert second["source"] == "live"
+    assert second["source"] == "hermes"
     assert second["live"] is True
     assert second["degraded"] is False
     assert second["cache_used"] is False
@@ -684,7 +761,7 @@ async def test_ask_hermes_circuit_open_uses_cache(
     cached = "Reef stable - temp 24.0C (-0.012/6h); ATO 2.9 (~204h until refill)."
     _write_reef_thread(thread, summary=cached)
 
-    async def _send(_text: str, _session_id: str, request_id: str | None = None) -> str:
+    async def _send(_text: str, _session_id: str, request_id: str | None = None, **_kwargs: object) -> str:
         raise HermesCircuitOpenError("Hermes Gateway circuit is open.")
 
     monkeypatch.setattr(hermes_client, "REEF_THREAD_PATH", str(thread))
@@ -700,3 +777,104 @@ async def test_ask_hermes_circuit_open_uses_cache(
     assert result["cache_used"] is True
     assert result["failure_category"] == "HERMES_CIRCUIT_OPEN"
     assert "cached" in result["spoken"].lower()
+
+
+@pytest.mark.asyncio
+async def test_ask_hermes_http_200_with_old_live_cache_is_stale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hermes HTTP success with old underlying data must not be labelled fresh/latest."""
+    posts: list[str] = []
+
+    async def _send(text: str, _session_id: str, request_id: str | None = None, **_kwargs: object) -> str:
+        posts.append(text)
+        assert "Reef current request:" in text
+        assert request_id
+        return "Temperature 24.5C +0.034/6h; ATO +0.718/6h."
+
+    monkeypatch.setattr(hermes_client, "load_latest_reef_thread", lambda path=None: None)
+    monkeypatch.setattr(hermes_client, "load_reef_live_cache", lambda path=None: _stale_live_cache())
+    monkeypatch.setattr(hermes_client, "send_to_hermes", _send)
+
+    result = await AskHermes()(_deps(), query=TREND_QUERY)
+
+    assert posts, "Hermes must still be called"
+    assert result["status"] == "stale"
+    assert result["fresh"] is False
+    assert result["latest"] is False
+    assert result["stale"] is True
+    assert result["live"] is False
+    assert result["source"] == "hermes"
+    assert result["cache_used"] is False
+    assert result["data_source"] == "reef_monitor"
+    assert result["request_kind"] == "reef_current"
+    assert result["age_seconds"] == 1201.0
+    assert result["data_timestamp"]
+    assert result["report_timestamp"]
+    assert result["requested_at"]
+    assert result["retrieved_at"]
+    spoken = _hermes_result_text(result)
+    assert "not current" in spoken.lower()
+    assert "Temperature 24.5C" in spoken
+
+
+@pytest.mark.asyncio
+async def test_ask_hermes_historical_query_uses_history_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit historical reef questions stay on reef_history and reef_thread data."""
+    thread = tmp_path / "reef_thread.jsonl"
+    cached = "Reef history: temp rose 0.2C over 6h."
+    _write_reef_thread(thread, summary=cached)
+    posts: list[str] = []
+    sessions: list[str] = []
+
+    async def _send(text: str, session_id: str, request_id: str | None = None, **_kwargs: object) -> str:
+        posts.append(text)
+        sessions.append(session_id)
+        assert "Reef historical request:" in text
+        assert "Reef current request:" not in text
+        assert cached in text
+        return cached
+
+    monkeypatch.setattr(hermes_client, "REEF_THREAD_PATH", str(thread))
+    monkeypatch.setattr(hermes_client, "send_to_hermes", _send)
+
+    result = await AskHermes()(_deps(), query="How has my reef tank changed over the last 6 hours?")
+
+    assert posts
+    assert result["status"] == "success"
+    assert result["fresh"] is False
+    assert result["latest"] is False
+    assert result["request_kind"] == "reef_history"
+    assert result["data_source"] == "reef_thread_cache"
+    assert result["report"] == cached
+    assert sessions[0]
+
+
+@pytest.mark.asyncio
+async def test_ask_hermes_trending_does_not_use_history_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A current trending question must use reef_current, not history=True."""
+    kinds: list[str] = []
+
+    async def _send(text: str, _session_id: str, request_id: str | None = None, **kwargs: object) -> str:
+        kinds.append(str(kwargs.get("request_kind")))
+        assert "Reef current request:" in text
+        assert "Reef historical request:" not in text
+        assert request_id
+        return "Temperature 24.5C +0.034/6h."
+
+    monkeypatch.setattr(hermes_client, "load_latest_reef_thread", lambda path=None: None)
+    monkeypatch.setattr(hermes_client, "load_reef_live_cache", lambda path=None: _fresh_live_cache())
+    monkeypatch.setattr(hermes_client, "send_to_hermes", _send)
+
+    result = await AskHermes()(_deps(), query="Wally, can you tell me where my reef tank is trending at?")
+
+    assert kinds == ["reef_current"]
+    assert result["request_kind"] == "reef_current"
+    assert result["fresh"] is True
+    assert result["status"] == "success"
+    assert result["data_source"] == "reef_monitor"

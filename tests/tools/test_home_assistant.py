@@ -232,6 +232,10 @@ async def test_get_bus_arrival_parses_route_departure_attributes() -> None:
             [{"action": "turn_switch_on", "entity_id": "switch.lamp_3"}],
         ),
         (
+            "Wally, turn on lamp three.",
+            [{"action": "turn_switch_on", "entity_id": "switch.lamp_3"}],
+        ),
+        (
             "I reach a turn on lamp three.",
             [{"action": "turn_switch_on", "entity_id": "switch.lamp_3"}],
         ),

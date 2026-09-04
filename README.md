@@ -16,6 +16,8 @@ tags:
 
 Conversational app for the Reachy Mini robot combining realtime voice, vision, personality-aware tools, and choreographed motion.
 
+The conversational assistant is **Wally**. **Reachy Mini** is the robot Wally runs on and controls. Spoken requests require the wake name `Wally` (or an active follow-up session) before tools or other side effects run. `Reachy` / `Reachy Mini` is not a wake name.
+
 ![Reachy Mini Dance](docs/assets/reachy_mini_dance.gif)
 
 ## Table of contents
@@ -41,7 +43,7 @@ Conversational app for the Reachy Mini robot combining realtime voice, vision, p
 
 ## Architecture
 
-The app connects the user, AI services, and robot hardware:
+The app connects the user, AI services, and robot hardware. Wally is the assistant identity sitting above the realtime backend; Reachy Mini remains the robot and SDK.
 
 <p align="center">
   <img src="docs/assets/conversation_app_arch.svg" alt="Architecture Diagram" width="600"/>
@@ -108,7 +110,7 @@ Copy `.env.example` to `.env`. The example file selects local mode and `ws://127
 | `HF_REALTIME_WS_URL` | Direct websocket endpoint for speech-to-speech. Accepts `ws://127.0.0.1:8765/v1` or `ws://127.0.0.1:8765/v1/realtime`. Used when `HF_REALTIME_CONNECTION_MODE=local`. |
 | `HF_TOKEN` | Optional token for Hugging Face Hub downloads and private Space tools. Local realtime endpoints receive only this explicitly configured token. Not used for cloud conversation when mode is `local`. |
 | `HERMES_CONFIG_PATH` | Optional path to a Hermes Agent `config.yaml` / `mcp_servers.yaml`. HTTP MCP servers listed there can be imported into `installed_local_mcp.json`. |
-| `HERMES_GATEWAY_URL` | Optional Hermes Agent API base for advanced delegated tasks. For a local Hermes gateway this is `http://127.0.0.1:8642/v1/chat/completions`. A host:port value such as `http://127.0.0.1:8642` is normalized to that chat-completions path. When set with `HERMES_API_KEY`, the `ask_hermes` tool POSTs OpenAI chat-completions (`{"model","messages"}`) and reads `choices[0].message.content`. Reef trend/history queries call Hermes live first and attach the latest `~/reef-monitor/reef_thread.jsonl` report as context. If Hermes is unavailable or exceeds `HERMES_REEF_REQUEST_TIMEOUT_SECONDS`, the cached report is still returned with `stale=true` and `source=cache`. Session continuity uses header `X-Hermes-Session-Id`. A second `ask_hermes` while one is in flight returns the cache immediately (or a controlled error if no cache), instead of queueing behind the in-flight request. |
+| `HERMES_GATEWAY_URL` | Optional Hermes Agent API base for advanced delegated tasks. For a local Hermes gateway this is `http://127.0.0.1:8642/v1/chat/completions`. A host:port value such as `http://127.0.0.1:8642` is normalized to that chat-completions path. When set with `HERMES_API_KEY`, the `ask_hermes` tool POSTs OpenAI chat-completions (`{"model","messages"}`) and reads `choices[0].message.content`. Current reef trend/latest-report queries call Hermes with the 1-minute `~/reef-monitor/reef_cache.json` snapshot and do not treat `reef_thread.jsonl` as the only source. Historical reef questions still attach the latest `~/reef-monitor/reef_thread.jsonl` report. Freshness is computed from the actual data timestamp against the reef-monitor 60-second live-cache cadence; HTTP 200 is not treated as fresh. If Hermes is unavailable or exceeds `HERMES_REEF_REQUEST_TIMEOUT_SECONDS`, the thread report is still returned with `stale=true` and `source=cache`. Session continuity uses header `X-Hermes-Session-Id`; current reef requests use a fresh session. A second `ask_hermes` while one is in flight returns the cache immediately (or a controlled error if no cache), instead of queueing behind the in-flight request. |
 | `HERMES_API_KEY` | Bearer token sent as `Authorization: Bearer …`. Must match Hermes `API_SERVER_KEY`. Do not commit a real key. |
 | `HERMES_REQUEST_TIMEOUT_SECONDS` | Live-wait timeout for non-Reef Hermes delegated tasks. Defaults to `180`. |
 | `HERMES_REEF_REQUEST_TIMEOUT_SECONDS` | Live-wait timeout for interactive Reef trend/history checks. Defaults to `15`. If Hermes exceeds this, the validated `reef_thread.jsonl` cache is returned rather than waiting approximately two minutes. |
@@ -118,8 +120,13 @@ Copy `.env.example` to `.env`. The example file selects local mode and `ws://127
 | `HA_TOKEN` | Home Assistant long-lived access token for the local `home_assistant` tool. Do not commit a real token. |
 | `HA_BUS_ENTITY_ID` | Optional Home Assistant entity for bus arrivals. Defaults to `sensor.route_311_at_rockwall_cres`. |
 | `APEX_STATUS_URL` | Optional Neptune Apex Fusion status URL, for example `http://192.168.0.143:8080/status`. Used by the local `apex` and `reef_status` tools. Live Apex data is `source=live` and `stale=false`. If unset or unreachable, they fall back to `~/reef-monitor/reef_cache.json` with `stale=true` and `source=cache`. |
-| `REEF_CACHE_MAX_AGE_SECONDS` | Optional freshness threshold for Reef/Hermes cache fallbacks. Defaults to `3600`. Cache younger than this is `status=degraded`; older cache is `status=stale`. Cached data is never returned as `status=success`. |
-| `REACHY_MINI_APP_TIMEOUT_MINUTES` | Minutes of inactivity before Reachy goes to sleep and the app stops. Defaults to `1440` (one day); set to `0` to disable. |
+| `REEF_CACHE_MAX_AGE_SECONDS` | Optional age threshold for Reef/Hermes *fallback* cache classification. Defaults to `3600`. Fallback cache younger than this is `status=degraded`; older fallback cache is `status=stale`. Cached fallbacks are never returned as `status=success`. Current Hermes freshness uses the reef-monitor live-cache cadence (60 seconds), not this fallback threshold. |
+| `ASSISTANT_NAME` | Spoken identity of the conversational assistant. Defaults to `Wally`. |
+| `WAKE_NAME` | Wake/activation name required at the start of a user request. Defaults to `Wally`. `Reachy` and `Reachy Mini` are not wake names. |
+| `ROBOT_NAME` | Display name of the physical robot. Defaults to `Reachy Mini`. Does not rename SDK classes, packages, or hardware interfaces. |
+| `ACTIVE_SESSION_TIMEOUT_SECONDS` | Follow-up window after a valid Wally activation. Defaults to `30`. After timeout, the user must say Wally again before tools run. |
+| `LOCAL_TIMEZONE` | IANA timezone for Wally's local clock and startup time context. Defaults to `Australia/Sydney`. Current time always comes from the system clock in this zone, not the LLM. |
+| `REACHY_MINI_APP_TIMEOUT_MINUTES` | Minutes of inactivity before Reachy Mini goes to sleep and the app stops. Defaults to `1440` (one day); set to `0` to disable. |
 
 ### Hugging Face Connection Modes
 
@@ -194,7 +201,7 @@ reachy-mini-conversation-app
 
 The app runs in console mode. Add `--ui` to serve the web interface at http://127.0.0.1:7860/.
 
-On each application boot, Reachy greets Walter using `Australia/Sydney` local time, announces startup diagnostics, checks the AI stack and the connected Reachy Mini daemon (simulator or physical robot), then speaks a short readiness report. The spoken sequence runs once per process and does not repeat on realtime reconnects. Optional integrations that are unset are reported as not configured, not as failures.
+On each application boot, Wally greets Walter using `Australia/Sydney` local time, announces startup diagnostics, checks the AI stack and the connected Reachy Mini daemon (simulator or physical robot), then speaks a short readiness report. The spoken sequence runs once per process and does not repeat on realtime reconnects. Optional integrations that are unset are reported as not configured, not as failures.
 
 ### Local AI control dashboard
 
@@ -266,17 +273,18 @@ Every bundled profile enables `head_tracking` by default; users can still disabl
 | `idle_do_nothing` | Explicitly remain idle during an idle turn. Not intended for normal conversation turns. | Core install only. |
 | `move_head` | Queue a head pose change (left/right/up/down/front). | Core install only. |
 | `head_tracking` | Follow the user's face with the head, or stop following. | Core install only. Requires a daemon with the `vision` extra and a camera. |
-| `go_to_sleep` | Run Reachy's sleep movement and stop the current app after an explicit user request. | Core install only. |
+| `go_to_sleep` | Run Reachy Mini's sleep movement and stop the current app after an explicit user request. | Core install only. |
 | `sweep_look` | Sweep Reachy's head left, right, and back to center. | Shared tool, enabled by default in the default profile. |
 | `remember` | Save one short, stable fact about the user for future sessions. | Core install only. Stored in the app instance data directory. |
 | `forget` | Remove a saved memory fact by matching a short query. | Core install only. |
+| `get_time` | Return the current local date and time from the system clock in `LOCAL_TIMEZONE` (default `Australia/Sydney`). Startup diagnostics store the timezone context; later time questions re-read the clock. The LLM must speak the returned `local_time` exactly. | Core install only. |
 | `home_assistant` | Read Home Assistant entity state, turn lights on/off, activate scenes, and read bus arrivals directly over the local LAN. A confirmed control result plays the existing `success` emotion and a short spoken confirmation. | Set `HA_URL` and `HA_TOKEN`; optionally set `HA_BUS_ENTITY_ID`. |
-| `monitor_bus` | Query the live Home Assistant Route 311 sensor (current and following services), then optionally watch that specific service in the background for 15/10/7/5-minute and arrival alerts. The 10-minute alert also queues Reachy's official `helpful1` emotion once per watched service. Switching or continuous watches require an explicit user request. Arrival times are interpreted in `Australia/Sydney`. Does not add a second bus API. Active watches persist in `bus_monitors.v1.json`. | Same Home Assistant config as `home_assistant`. |
+| `monitor_bus` | Query the live Home Assistant Route 311 sensor (current and following services), then optionally watch that specific service in the background for 15/10/7/5-minute and due-now alerts. A disappearing service is reported as an unconfirmed feed loss, not an arrival. The 10-minute alert also queues Reachy Mini's official `helpful1` emotion once per watched service. Switching or continuous watches require an explicit user request. Arrival times are interpreted in `Australia/Sydney`. Does not add a second bus API. Active watches persist in `bus_monitors.v1.json`. | Same Home Assistant config as `home_assistant`. |
 | `apex` | Read current Neptune Apex / reef status from `APEX_STATUS_URL` (`/status` JSON) for water parameters, equipment, alarms, and alerts. Current reef stats, status, readings, pH, temperature, and ATO questions call this tool immediately and speak the raw probe values. Report, trend, and analysis questions do not use this path. Live reads are `source=live`; cache fallback is `stale=true`. | Set `APEX_STATUS_URL`. Falls back to `~/reef-monitor/reef_cache.json`. |
 | `reef_status` | Legacy fast-path reef status reader; same live `/status` URL or cache as `apex`. | Set `APEX_STATUS_URL`, or keep the reef cache producer. |
-| `ask_hermes` | Forward advanced delegated tasks to the Hermes Gateway, such as other buses/trains (not live Route 311), research, multi-step household tasks, or reef report/trend/analysis. Live Hermes results are `source=live`. If Hermes is unavailable or exceeds the Reef live-wait timeout, the Reefy `reef_thread.jsonl` cache is returned with `stale=true` and `source=cache`. Direct `apex__*` / `home_assistant__*` MCP tools are not registered while this tool is on. | Set `HERMES_GATEWAY_URL` and `HERMES_API_KEY`. Optional `HERMES_REEF_REQUEST_TIMEOUT_SECONDS` (default 15). |
+| `ask_hermes` | Forward advanced delegated tasks to the Hermes Gateway, such as other buses/trains (not live Route 311), research, multi-step household tasks, or reef report/trend/analysis. Current reef results are `source=hermes` and `fresh=true` only when the underlying reef-monitor data timestamp is within 60 seconds. HTTP 200 with old data is `status=stale`. If Hermes is unavailable or exceeds the Reef live-wait timeout, the Reefy `reef_thread.jsonl` cache is returned with `stale=true` and `source=cache`. Direct `apex__*` / `home_assistant__*` MCP tools are not registered while this tool is on. | Set `HERMES_GATEWAY_URL` and `HERMES_API_KEY`. Optional `HERMES_REEF_REQUEST_TIMEOUT_SECONDS` (default 15). |
 
-Weather, web search, and time are no longer enabled on the default profile. The bundled Hugging Face Tool Spaces remain installable from Tools if you accept cloud MCP calls. For other local HTTP MCP servers (time, weather), register them in `external_content/installed_local_mcp.json` and enable the `{alias}__{tool}` IDs per personality. Simple Apex and Home Assistant operations use local Python tools; Hermes remains available through `ask_hermes` for advanced delegation.
+Weather and web search are no longer enabled on the default profile. Local time uses the built-in `get_time` tool and the system clock, not the hosted Hugging Face time Space. The bundled Hugging Face Tool Spaces remain installable from Tools if you accept cloud MCP calls. For other local HTTP MCP servers (weather), register them in `external_content/installed_local_mcp.json` and enable the `{alias}__{tool}` IDs per personality. Simple Apex and Home Assistant operations use local Python tools; Hermes remains available through `ask_hermes` for advanced delegation.
 
 > [!NOTE]
 > `remember`/`forget` facts are stored in `memory.v1.json` inside the app's instance data directory (`~/.local/share/reachy_mini_conversation_app/` by default, or the instance path used by the desktop launcher). `forget` only removes facts matched by query. To reset all remembered facts, delete this file. Active Route 311 watches persist in `bus_monitors.v1.json` in the same directory.
@@ -306,7 +314,7 @@ Built-in motion content is published as open Hugging Face datasets:
 - Emotions: [`pollen-robotics/reachy-mini-emotions-library`](https://huggingface.co/datasets/pollen-robotics/reachy-mini-emotions-library)
 - Dances: [`pollen-robotics/reachy-mini-dances-library`](https://huggingface.co/datasets/pollen-robotics/reachy-mini-dances-library)
 
-Spoken requests for Reachy to dance queue the official `dance1` emotion from the emotions library immediately; conversation continues as usual.
+Spoken requests for Wally to dance queue the official Reachy Mini `dance1` emotion from the emotions library immediately; conversation continues as usual. The request must be activated with `Wally` unless a follow-up session is already open.
 
 <details>
 <summary>Custom profiles</summary>

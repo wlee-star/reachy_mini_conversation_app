@@ -4,6 +4,7 @@ import logging
 import unicodedata
 from typing import TYPE_CHECKING, Any, Dict
 
+from reachy_mini_conversation_app.activation import strip_transcript_name_prefix
 from reachy_mini_conversation_app.tools.core_tools import Tool, ToolDependencies
 
 
@@ -170,7 +171,6 @@ _INTENT_TO_MOVES: dict[str, tuple[str, ...]] = {
 _ALLOWED_MOVE_NAMES: frozenset[str] = frozenset(_CURATED_DEFAULT_MOVES).union(*_INTENT_TO_MOVES.values())
 _SUCCESS_EMOTION_KEYS: frozenset[str] = frozenset({"success", "success1", "success2"})
 _DANCE_EMOTION_KEYS: frozenset[str] = frozenset({"dance", "dance1", "dance2", "dance3"})
-_DANCE_WAKE_PREFIX = re.compile(r"^(?:hey |hi |hello |ok |okay )?(?:reachy|erichi|richie|rishi|ricci|ritchie)\s+")
 _DANCE_INFORMATIONAL_RE = re.compile(
     r"\b(?:what is|whats|what are|tell me about|history of|watched|watching|know what|definition of)\b"
 )
@@ -180,7 +180,7 @@ _DANCE_REQUEST_RE = re.compile(
     r"(?:"
     r"^(?:please )?danc(?:e|es|ing)?(?: for me)?(?: please)?$"
     r"|lets danc"
-    r"|(?:can|could|will|would) (?:you |reachy )?(?:please )?danc"
+    r"|(?:can|could|will|would) (?:you |reachy |wally )?(?:please )?danc"
     r"|(?:can|could|will|would) you (?:please )?(?:show me )?how (?:you |to )?danc"
     r"|do you (?:know how (?:to |you )?|wanna |want to )?danc"
     r"|(?:i )?(?:want to|wanna) (?:see |watch )?(?:you )?danc"
@@ -231,11 +231,11 @@ def _normalize_dance_transcript(transcript: str) -> str:
     text = re.sub(r"\bu\b", "you", text)
     text = re.sub(r"\b(?:pls|plz)\b", "please", text)
     text = re.sub(r"\s+", " ", text).strip()
-    return _DANCE_WAKE_PREFIX.sub("", text).strip()
+    return strip_transcript_name_prefix(text)
 
 
 def match_dance_intent(transcript: str) -> str | None:
-    """Return dance1 or dance3 when the user is asking Reachy to perform a dance."""
+    """Return dance1 or dance3 when the user is asking the robot to perform a dance."""
     text = _normalize_dance_transcript(transcript)
     if not text:
         return None

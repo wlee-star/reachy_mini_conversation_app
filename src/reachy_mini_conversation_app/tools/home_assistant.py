@@ -7,6 +7,7 @@ from urllib.parse import quote
 import httpx
 
 from reachy_mini_conversation_app.config import config
+from reachy_mini_conversation_app.activation import strip_transcript_name_prefix
 from reachy_mini_conversation_app.tools.core_tools import Tool, ToolDependencies
 
 
@@ -42,9 +43,6 @@ _LAMP_NUMBER_WORDS = {
     "3": "3",
 }
 _FAST_QUESTION_PREFIX = re.compile(r"^(?:is|are|was|whats|what is|did you|have you)\b")
-_FAST_WAKE_PREFIX = re.compile(
-    r"^(?:hey |ok |okay )?(?:reachy|erichi|richie|rishi|ricci|ritchie|i reach a|i reachy|reach it)\s+"
-)
 _FAST_POLITE_PREFIX = re.compile(r"^(?:please |can you |could you |would you )+")
 _FAST_LAMP_TURN = re.compile(r"(?:turn|switch)\s+(on|off)\s+(?:the\s+)?(?:lamp|light)\s+(one|two|three|[123])\b")
 _FAST_LAMP_TURN_NOUN_FIRST = re.compile(
@@ -390,7 +388,7 @@ def _normalize_fast_ha_transcript(transcript: str) -> str:
     text = text.replace("tune off", "turn off")
     text = text.replace("tun on", "turn on")
     text = text.replace("tun off", "turn off")
-    text = _FAST_WAKE_PREFIX.sub("", text)
+    text = strip_transcript_name_prefix(text)
     text = _FAST_POLITE_PREFIX.sub("", text)
     return re.sub(r"\s+", " ", text).strip()
 

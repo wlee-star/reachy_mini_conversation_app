@@ -12,6 +12,7 @@ import time
 import uuid
 import asyncio
 import logging
+from enum import Enum
 from typing import Any, Callable, Awaitable
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -93,6 +94,17 @@ _CLOCK_RE = re.compile(r"\b(\d{1,2}:\d{2})(?::\d{2})?\b")
 NotifyFn = Callable[[str], Awaitable[None]]
 PlayHelpful1Fn = Callable[[], Awaitable[None]]
 TEN_MINUTE_EMOTION = "helpful1"
+
+
+class BusServiceState(str, Enum):
+    """Authoritative Route 311 service state. Zero minutes is not ARRIVED."""
+
+    UPCOMING = "UPCOMING"
+    ARRIVING = "ARRIVING"
+    ARRIVED = "ARRIVED"
+    SERVICE_GONE = "SERVICE_GONE"
+    NO_SERVICE = "NO_SERVICE"
+    UNKNOWN = "UNKNOWN"
 
 
 @dataclass(frozen=True)
@@ -427,9 +439,39 @@ def format_urgent_alert(arrival: BusArrival, following: BusArrival | None = None
     return spoken
 
 
-def format_arrival_alert(arrival: BusArrival | None) -> str:
-    """Build the one-shot terminal notice for the watched service."""
-    return f"The {route_label(arrival)} has arrived."
+def classify_bus_state(
+    arrival: BusArrival | None,
+    *,
+    snapshot: LiveBusSnapshot | None = None,
+    reason: str | None = None,
+    arrival_confirmed: bool = False,
+) -> BusServiceState:
+    """Classify the live 311 state without treating a 0-minute ETA as arrival."""
+    if arrival_confirmed:
+        return BusServiceState.ARRIVED
+    if reason == "service_gone":
+        return BusServiceState.SERVICE_GONE
+    if snapshot is not None and (snapshot.error or snapshot.stale):
+        return BusServiceState.UNKNOWN
+    if arrival is None:
+        return BusServiceState.NO_SERVICE
+    if arrival.minutes <= 1:
+        return BusServiceState.ARRIVING
+    return BusServiceState.UPCOMING
+
+
+def format_service_gone_alert(arrival: BusArrival | None) -> str:
+    """Speak a lost-feed state without claiming the bus arrived."""
+    return f"The live {route_label(arrival)} feed has lost that service. I can't confirm that it has arrived."
+
+
+def format_arrival_alert(arrival: BusArrival | None, *, confirmed: bool = False) -> str:
+    """Build the terminal notice for the watched service."""
+    if confirmed:
+        return f"The {route_label(arrival)} has arrived."
+    if arrival is None or arrival.minutes > 0:
+        return format_service_gone_alert(arrival)
+    return f"The {route_label(arrival)} is due now."
 
 
 def format_monitoring_started(arrival: BusArrival, *, switched: bool = False) -> str:
@@ -571,6 +613,40 @@ def _arrival_diagnostic(arrival: BusArrival) -> dict[str, Any]:
         "realtime": arrival.realtime,
         "service_id": arrival.service_id,
     }
+
+
+def _arrival_payload(arrival: BusArrival) -> dict[str, Any]:
+    return {
+        "route": arrival.route,
+        "stop": arrival.stop,
+        "direction": arrival.destination,
+        "realtime": arrival.realtime,
+        "next_minutes": arrival.minutes,
+        "eta_display": arrival.eta_display,
+        "scheduled_at": arrival.scheduled_at,
+        "service_id": arrival.service_id,
+        "destination": arrival.destination,
+    }
+
+
+def _log_bus_state(
+    arrival: BusArrival | None,
+    *,
+    previous_state: BusServiceState | None,
+    new_state: BusServiceState,
+    arrival_confirmed: bool,
+    reason: str,
+) -> None:
+    logger.info("[BUS] route=%s", arrival.route if arrival is not None else DEFAULT_ROUTE)
+    logger.info("[BUS] stop=%s", arrival.stop if arrival is not None else None)
+    logger.info("[BUS] direction=%s", arrival.destination if arrival is not None else None)
+    logger.info("[BUS] realtime=%s", arrival.realtime if arrival is not None else None)
+    logger.info("[BUS] next_minutes=%s", arrival.minutes if arrival is not None else None)
+    logger.info("[BUS] eta_display=%s", arrival.eta_display if arrival is not None else None)
+    logger.info("[BUS] previous_state=%s", previous_state.value if previous_state is not None else None)
+    logger.info("[BUS] new_state=%s", new_state.value)
+    logger.info("[BUS] arrival_confirmed=%s", arrival_confirmed)
+    logger.info("[BUS] reason=%s", reason)
 
 
 def _sydney_iso(value: float | None) -> str | None:
@@ -889,6 +965,7 @@ class BusMonitorManager:
             decision_latency,
             snapshot.ha_query_latency_s + decision_latency,
         )
+        service_state = classify_bus_state(arrival, snapshot=snapshot)
         result: dict[str, Any] = {
             "spoken": spoken,
             "offer": kind,
@@ -899,6 +976,9 @@ class BusMonitorManager:
             "already_spoken": self.query_already_spoken(),
             "timezone": SYDNEY_TIMEZONE,
             "last_updated": _sydney_iso(snapshot.last_updated_s),
+            "service_state": service_state.value,
+            "arrival_confirmed": False,
+            "arrivals": [_arrival_payload(item) for item in snapshot.arrivals],
         }
         if snapshot.error:
             result["error"] = snapshot.error
@@ -908,8 +988,10 @@ class BusMonitorManager:
             result["error"] = "Bus arrival data unavailable"
         else:
             result["minutes"] = arrival.minutes
+            result["next_minutes"] = arrival.minutes
             result["route"] = arrival.route
             result["stop"] = arrival.stop
+            result["direction"] = arrival.destination
             result["destination"] = arrival.destination
             result["eta_display"] = arrival.eta_display
             result["scheduled_at"] = arrival.scheduled_at
@@ -921,6 +1003,13 @@ class BusMonitorManager:
                 result["following_destination"] = following.destination
                 result["following_eta_display"] = following.eta_display
                 result["following_service_id"] = following.service_id
+        _log_bus_state(
+            arrival,
+            previous_state=None,
+            new_state=service_state,
+            arrival_confirmed=False,
+            reason="query",
+        )
         logger.info("[BUS] tool_result=%s", result)
         return result
 
@@ -1307,7 +1396,30 @@ class BusMonitorManager:
             )
             return
         arrival = find_monitored_arrival(monitor, snapshot)
+        previous_eta = monitor.latest_live_eta
+        previous_state = classify_bus_state(
+            BusArrival(
+                minutes=previous_eta if previous_eta is not None else -1,
+                entity_id=monitor.entity_id,
+                route=monitor.route,
+                destination=monitor.destination,
+                eta_display=monitor.eta_display,
+                service_id=monitor.service_id,
+                stop=monitor.stop,
+                scheduled_at=monitor.scheduled_at,
+            )
+            if previous_eta is not None
+            else None
+        )
         if arrival is None:
+            new_state = classify_bus_state(None, snapshot=snapshot, reason="service_gone")
+            _log_bus_state(
+                None,
+                previous_state=previous_state,
+                new_state=new_state,
+                arrival_confirmed=False,
+                reason="service_gone",
+            )
             await self._finish_watch(
                 reason="service_gone",
                 spoken=format_arrival_alert(None),
@@ -1315,7 +1427,6 @@ class BusMonitorManager:
             )
             return
         following = find_following_arrival(monitor, snapshot)
-        previous_eta = monitor.latest_live_eta
         alerts = evaluate_alerts(monitor, arrival)
         helpful1_sent = (
             monitor.preparation_alert_sent
@@ -1336,6 +1447,14 @@ class BusMonitorManager:
             notify_started = time.perf_counter()
             spoken = self._spoken_for_alert(alert, arrival, following)
             if alert == "arrival":
+                new_state = classify_bus_state(arrival, arrival_confirmed=False)
+                _log_bus_state(
+                    arrival,
+                    previous_state=previous_state,
+                    new_state=new_state,
+                    arrival_confirmed=False,
+                    reason="eta_zero",
+                )
                 await self._finish_watch(
                     reason="eta_zero",
                     spoken=spoken,

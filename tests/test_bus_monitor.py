@@ -11,12 +11,14 @@ from reachy_mini_conversation_app import bus_monitor as bus_monitor_mod
 from reachy_mini_conversation_app.bus_monitor import (
     BusArrival,
     BusMonitorState,
+    BusServiceState,
     LiveBusSnapshot,
     BusMonitorManager,
     same_service,
     evaluate_alerts,
     extract_arrivals,
     match_bus_intent,
+    classify_bus_state,
     format_urgent_alert,
     format_arrival_alert,
     format_initial_spoken,
@@ -350,10 +352,11 @@ async def test_start_follows_live_eta_changes_and_alerts_once(monkeypatch: pytes
     assert any("15 minutes away" in item or "14 minutes away" in item for item in alerts)
     assert any("You better get ready to leave" in item for item in alerts)
     assert any("5 minutes away" in item and "Please leave now" in item for item in alerts)
-    assert any("has arrived" in item for item in alerts)
+    assert any("is due now" in item for item in alerts)
     assert sum("You have time to get ready" in item for item in alerts) == 1
     assert sum("Please leave now" in item and "5 minutes away" in item for item in alerts) == 1
-    assert sum("has arrived" in item for item in alerts) == 1
+    assert sum("is due now" in item for item in alerts) == 1
+    assert not any("has arrived" in item for item in alerts)
     assert manager.status()["status"] == "idle"
 
 
@@ -493,8 +496,11 @@ def test_urgent_message_is_deterministic() -> None:
     assert format_seven_minute_alert(_arrival(7)) == (
         "The 311 is now about 7 minutes away. You better get ready to leave."
     )
-    assert format_arrival_alert(_arrival(0)) == "The 311 has arrived."
-    assert format_arrival_alert(None) == "The 311 has arrived."
+    assert format_arrival_alert(_arrival(0)) == "The 311 is due now."
+    assert format_arrival_alert(None) == (
+        "The live 311 feed has lost that service. I can't confirm that it has arrived."
+    )
+    assert format_arrival_alert(_arrival(0), confirmed=True) == "The 311 has arrived."
 
 
 def test_extract_arrivals_keeps_zero_minute_eta() -> None:
@@ -560,7 +566,8 @@ async def test_live_failure_22_15_5_terminal_then_next_28(monkeypatch: pytest.Mo
     assert sum("You have time to get ready" in item for item in alerts) == 1
     assert sum("You better get ready to leave" in item for item in alerts) == 1
     assert sum("5 minutes away" in item and "Please leave now" in item for item in alerts) == 1
-    assert sum("has arrived" in item for item in alerts) == 1
+    assert sum("is due now" in item for item in alerts) == 1
+    assert not any("has arrived" in item for item in alerts)
     queried = await manager.query()
     assert queried["minutes"] == 28
     assert "28 minutes away" in queried["spoken"]
@@ -595,7 +602,8 @@ async def test_skipping_zero_from_one_minute_to_next_service(monkeypatch: pytest
     await manager.start()
     await _wait_until_idle(manager)
     assert sum("Please leave now" in item and "5 minutes away" in item for item in alerts) == 1
-    assert sum("has arrived" in item for item in alerts) == 1
+    assert sum("can't confirm that it has arrived" in item for item in alerts) == 1
+    assert not any(item == "The 311 has arrived." for item in alerts)
     assert manager.status()["status"] == "idle"
 
 
@@ -626,7 +634,8 @@ async def test_skipping_zero_from_five_minutes_to_next_service(
     await manager.start()
     await _wait_until_idle(manager)
     assert sum("Please leave now" in item and "5 minutes away" in item for item in alerts) == 1
-    assert sum("has arrived" in item for item in alerts) == 1
+    assert sum("can't confirm that it has arrived" in item for item in alerts) == 1
+    assert not any(item == "The 311 has arrived." for item in alerts)
     queried = await manager.query()
     assert queried["minutes"] == 28
     assert manager.monitor_active() is False
@@ -673,7 +682,8 @@ async def test_zero_minute_alert_is_sent_once(monkeypatch: pytest.MonkeyPatch, t
     await manager.start()
     await _wait_until_idle(manager)
     await asyncio.sleep(0.08)
-    assert sum("has arrived" in item for item in alerts) == 1
+    assert sum("is due now" in item for item in alerts) == 1
+    assert not any("has arrived" in item for item in alerts)
 
 
 @pytest.mark.asyncio
@@ -744,7 +754,8 @@ async def test_resume_after_urgent_does_not_repeat_or_follow_next_bus(
 
     monkeypatch.setattr(bus_monitor_mod, "fetch_live_snapshot", _next_bus)
     await restored._poll_once()
-    assert any("has arrived" in item for item in alerts)
+    assert any("can't confirm that it has arrived" in item for item in alerts)
+    assert not any("The 311 has arrived." in item for item in alerts)
     assert restored.status()["status"] == "idle"
     await restored.cancel()
 
@@ -805,7 +816,8 @@ async def test_empty_schedule_completes_the_watch(monkeypatch: pytest.MonkeyPatc
     manager.attach(instance_path=tmp_path, notify=_notify, persist_path=tmp_path / "bus.json")
     await manager.start()
     await _wait_until_idle(manager)
-    assert any("has arrived" in item for item in alerts)
+    assert any("can't confirm that it has arrived" in item for item in alerts)
+    assert not any("The 311 has arrived." in item for item in alerts)
     assert manager.status()["status"] == "idle"
 
 
@@ -966,7 +978,8 @@ async def test_missed_threshold_poll_sequence(monkeypatch: pytest.MonkeyPatch, t
     assert sum(item.endswith("10 minutes away.") or "now about 9 minutes away." in item for item in alerts) == 1
     assert sum("You better get ready to leave" in item for item in alerts) == 1
     assert sum("Please leave now" in item for item in alerts) == 1
-    assert sum("has arrived" in item for item in alerts) == 1
+    assert sum("is due now" in item for item in alerts) == 1
+    assert not any("has arrived" in item for item in alerts)
 
 
 @pytest.mark.asyncio
@@ -995,7 +1008,8 @@ async def test_four_minute_start_skips_retrospective_alerts(monkeypatch: pytest.
     await _wait_until_idle(manager)
     assert not any("You have time to get ready" in item for item in alerts)
     assert not any("You better get ready to leave" in item for item in alerts)
-    assert any("has arrived" in item for item in alerts)
+    assert any("can't confirm that it has arrived" in item for item in alerts)
+    assert not any("The 311 has arrived." in item for item in alerts)
 
 
 @pytest.mark.asyncio
@@ -1085,7 +1099,8 @@ async def test_following_bus_does_not_replace_monitored_service(
     assert started["service_id"] == "trip-a"
     await _wait_until_idle(manager)
     assert any("18 minutes away" in item or "17 minutes away" in item for item in alerts)
-    assert any("has arrived" in item for item in alerts)
+    assert any("can't confirm that it has arrived" in item for item in alerts)
+    assert not any("The 311 has arrived." in item for item in alerts)
     assert manager.status()["status"] == "idle"
 
 
@@ -1119,7 +1134,8 @@ async def test_continuous_handoff_requires_explicit_request(monkeypatch: pytest.
         await asyncio.sleep(0.03)
     assert manager._monitor is not None
     assert manager._monitor.service_id == "trip-b"
-    assert any("has arrived" in item and "9:05" in item for item in alerts)
+    assert any("can't confirm that it has arrived" in item and "9:05" in item for item in alerts)
+    assert not any(item.startswith("The 311 has arrived") for item in alerts)
     await manager.cancel()
 
 
@@ -1322,3 +1338,78 @@ async def test_ten_minute_prep_threshold_also_plays_helpful1(monkeypatch: pytest
     assert played == ["helpful1"]
     assert any("10 minutes away" in item for item in alerts)
     assert any("You have time to get ready" in item for item in alerts)
+
+
+def test_zero_minutes_is_arriving_not_arrived() -> None:
+    """A 0-minute ETA is due/arriving, not a confirmed arrival."""
+    arrival = _arrival(0)
+    assert classify_bus_state(arrival) is BusServiceState.ARRIVING
+    assert format_arrival_alert(arrival) == "The 311 is due now."
+    assert format_arrival_alert(arrival, confirmed=False) != "The 311 has arrived."
+
+
+def test_service_gone_is_not_arrived() -> None:
+    """A vanished service is an unconfirmed feed loss, not an arrival."""
+    assert classify_bus_state(None, reason="service_gone") is BusServiceState.SERVICE_GONE
+    spoken = format_arrival_alert(None)
+    assert "can't confirm" in spoken
+    assert spoken != "The 311 has arrived."
+
+
+@pytest.mark.asyncio
+async def test_query_reports_twelve_minutes_and_route_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 12-minute live 311 is reported as 12 minutes with route, stop, and direction."""
+
+    async def _live() -> LiveBusSnapshot:
+        return _snapshot(12, service_ids=["trip-12"], eta_displays=["12:00"])
+
+    monkeypatch.setattr(bus_monitor_mod, "fetch_live_snapshot", _live)
+    result = await bus_monitor_mod.get_bus_monitor().query()
+    assert result["route"] == "311"
+    assert result["stop"] == "Macleay St @ Rockwall Cres"
+    assert result["direction"] == "Central"
+    assert result["next_minutes"] == 12
+    assert result["minutes"] == 12
+    assert result["eta_display"] == "12:00"
+    assert result["realtime"] is True
+    assert result["service_state"] == BusServiceState.UPCOMING.value
+    assert result["arrival_confirmed"] is False
+    assert "12 minutes away" in result["spoken"]
+    assert "has arrived" not in result["spoken"]
+
+
+@pytest.mark.asyncio
+async def test_query_does_not_treat_zero_minutes_as_arrived(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Asking about a due-now 311 must not claim it has arrived."""
+
+    async def _live() -> LiveBusSnapshot:
+        return _snapshot(0, service_ids=["due"])
+
+    monkeypatch.setattr(bus_monitor_mod, "fetch_live_snapshot", _live)
+    result = await bus_monitor_mod.get_bus_monitor().query()
+    assert result["next_minutes"] == 0
+    assert result["service_state"] == BusServiceState.ARRIVING.value
+    assert result["arrival_confirmed"] is False
+    assert "due now" in result["spoken"].lower()
+    assert "has arrived" not in result["spoken"]
+
+
+@pytest.mark.asyncio
+async def test_stale_query_is_unknown_not_fact(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stale Home Assistant data is unknown, not spoken as a live arrival."""
+
+    async def _stale() -> LiveBusSnapshot:
+        return _snapshot(12, stale=True)
+
+    monkeypatch.setattr(bus_monitor_mod, "fetch_live_snapshot", _stale)
+    result = await bus_monitor_mod.get_bus_monitor().query()
+    assert result["service_state"] == BusServiceState.UNKNOWN.value
+    assert result["arrival_confirmed"] is False
+    assert "minutes" not in result
+
+
+@pytest.mark.asyncio
+async def test_arrival_alert_only_when_confirmed() -> None:
+    """The arrived sentence is reserved for an explicit confirmation."""
+    assert format_arrival_alert(_arrival(0), confirmed=True) == "The 311 has arrived."
+    assert format_arrival_alert(_arrival(0), confirmed=False) == "The 311 is due now."

@@ -216,7 +216,7 @@ def run(
     go_to_sleep_requested = threading.Event()
 
     def go_to_sleep_and_stop_app() -> dict[str, Any]:
-        """Put Reachy to sleep, then stop the current app."""
+        """Put Reachy Mini to sleep, then stop the current app."""
         if not go_to_sleep_lock.acquire(blocking=False):
             return {"status": "already_requested"}
 

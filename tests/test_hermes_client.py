@@ -366,6 +366,52 @@ def test_is_trend_query_matches_reef_history_phrases() -> None:
     assert is_trend_query("what's the reef temperature") is False
     assert is_trend_query("What is the current pH?") is False
     assert is_trend_query("Give me a weather report") is False
+    assert is_trend_query("What's the latest Hermes report?") is True
+    assert is_trend_query("What's the latest report?") is True
+    assert is_trend_query("Give me the latest weather report") is False
+
+
+def test_reef_request_kind_separates_current_from_historical() -> None:
+    """Current/latest trend phrases must not be forced through reef_history."""
+    from reachy_mini_conversation_app.hermes_client import (
+        REQUEST_KIND_CURRENT,
+        REQUEST_KIND_HISTORY,
+        reef_request_kind,
+        current_reef_is_fresh,
+        is_current_reef_query,
+        reef_slopes_are_fresh,
+        is_historical_reef_query,
+    )
+
+    current_phrases = (
+        "Can you tell me where my reef tank is trending at?",
+        "what's my reef tank trending at?",
+        "What's the latest Hermes report?",
+        "Give me the latest reef trends.",
+        "What's happening with my reef?",
+        "how is my reef tank trending?",
+    )
+    for phrase in current_phrases:
+        assert is_historical_reef_query(phrase) is False, phrase
+        assert is_current_reef_query(phrase) is True, phrase
+        assert reef_request_kind(phrase) == REQUEST_KIND_CURRENT, phrase
+
+    historical_phrases = (
+        "How has my reef tank changed over the last 6 hours?",
+        "How much ATO have I been using?",
+        "Give me the parameter history",
+        "How has my reef tank been doing?",
+    )
+    for phrase in historical_phrases:
+        assert is_historical_reef_query(phrase) is True, phrase
+        assert reef_request_kind(phrase) == REQUEST_KIND_HISTORY, phrase
+
+    assert current_reef_is_fresh(12.0) is True
+    assert current_reef_is_fresh(93.0) is True
+    assert current_reef_is_fresh(1201.0) is False
+    assert current_reef_is_fresh(None) is False
+    assert reef_slopes_are_fresh(1200.0) is True
+    assert reef_slopes_are_fresh(1801.0) is False
 
 
 def test_chat_completions_url_normalizes_host_port() -> None:
@@ -430,7 +476,12 @@ async def test_send_to_hermes_posts_to_chat_completions_when_url_is_host_port(
 
 @pytest.mark.asyncio
 async def test_send_to_hermes_appends_trend_instruction(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Reef-trend questions ask Hermes for an answer, not process narration."""
+    """Current reef-trend questions use the live-cache voice prompt, not history mode."""
+    from reachy_mini_conversation_app.hermes_client import (
+        HERMES_REEF_CURRENT_INSTRUCTION,
+        HERMES_REEF_CURRENT_VOICE_SYSTEM_PROMPT,
+    )
+
     _configure_gateway(monkeypatch)
     posts: list[tuple[str, dict[str, str] | None, object | None]] = []
     monkeypatch.setattr(
@@ -450,10 +501,37 @@ async def test_send_to_hermes_appends_trend_instruction(monkeypatch: pytest.Monk
     user_message = messages[1]
     assert isinstance(system_message, dict)
     assert isinstance(user_message, dict)
-    assert system_message["content"] == HERMES_REEF_VOICE_SYSTEM_PROMPT
+    assert system_message["content"] == HERMES_REEF_CURRENT_VOICE_SYSTEM_PROMPT
     assert "how is my reef tank trending?" in str(user_message["content"])
+    assert HERMES_REEF_CURRENT_INSTRUCTION in str(user_message["content"])
+    assert HERMES_REEF_TREND_INSTRUCTION not in str(user_message["content"])
+    assert "Do not invent values" in HERMES_REEF_CURRENT_INSTRUCTION
+
+
+@pytest.mark.asyncio
+async def test_send_to_hermes_historical_uses_history_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Explicit historical reef questions keep the Reefy history instruction."""
+    _configure_gateway(monkeypatch)
+    posts: list[tuple[str, dict[str, str] | None, object | None]] = []
+    monkeypatch.setattr(
+        hermes_client.httpx,
+        "AsyncClient",
+        _fake_async_client(response=_json_response(200, _completion_payload("History: nitrate fell.")), posts=posts),
+    )
+
+    reply = await send_to_hermes("How has my reef tank changed over the last 6 hours?", "session-abc")
+
+    assert reply == "History: nitrate fell."
+    body = posts[0][2]
+    assert isinstance(body, dict)
+    messages = body["messages"]
+    assert isinstance(messages, list)
+    system_message = messages[0]
+    user_message = messages[1]
+    assert isinstance(system_message, dict)
+    assert isinstance(user_message, dict)
+    assert system_message["content"] == HERMES_REEF_VOICE_SYSTEM_PROMPT
     assert HERMES_REEF_TREND_INSTRUCTION in str(user_message["content"])
-    assert "Do not narrate files" in HERMES_REEF_TREND_INSTRUCTION
 
 
 def test_parse_reef_timestamp_accepts_z_suffix() -> None:

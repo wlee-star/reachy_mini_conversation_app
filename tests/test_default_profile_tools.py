@@ -20,6 +20,7 @@ def test_default_profile_keeps_local_reachy_tools_without_cloud_spaces() -> None
     assert "monitor_bus" in tools
     assert "apex" in tools
     assert "ask_hermes" in tools
+    assert "get_time" in tools
     assert not set(CLOUD_SPACE_TOOLS) & set(tools)
 
 
@@ -36,6 +37,15 @@ def test_default_profile_sends_tank_trends_to_ask_hermes() -> None:
     assert "handle that new request" in instructions.lower()
 
 
+def test_default_profile_identifies_wally_on_reachy_mini() -> None:
+    """The default personality is Wally running on Reachy Mini, not Reachy-as-assistant."""
+    instructions = read_packaged_default_profile().instructions
+    assert "You are Wally" in instructions
+    assert "Never identify yourself as Reachy" in instructions
+    assert "Reachy Mini is the robot" in instructions
+    assert "You are Reachy Mini:" not in instructions
+
+
 def test_default_profile_sends_live_tank_status_to_apex() -> None:
     """Current tank status must use the local Apex snapshot, not Hermes."""
     instructions = read_packaged_default_profile().instructions
@@ -43,6 +53,7 @@ def test_default_profile_sends_live_tank_status_to_apex() -> None:
     assert "use **apex** immediately" in instructions.lower()
     assert "call **home_assistant** or **monitor_bus** immediately" in instructions.lower()
     assert "call **monitor_bus** immediately" in instructions.lower()
+    assert "use **get_time** immediately" in instructions.lower()
     assert "button.screen_down" in instructions
     assert "do not call play_emotion for that success" in instructions.lower()
     assert "done, lamp three is on" in instructions.lower()

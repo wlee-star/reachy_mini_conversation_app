@@ -3,15 +3,13 @@ import logging
 from typing import Any
 from dataclasses import dataclass
 
+from reachy_mini_conversation_app.activation import strip_transcript_name_prefix
 from reachy_mini_conversation_app.tools.core_tools import Tool, ToolDependencies
 from reachy_mini_conversation_app.tools.reef_status import _load_reef_snapshot, snapshot_provenance
 
 
 logger = logging.getLogger(__name__)
 
-_WAKE_PREFIX = re.compile(
-    r"^(?:hey |ok |okay )?(?:reachy|erichi|richie|rishi|ricci|ritchie|i reach a|i reachy|reach it)\s+"
-)
 _POLITE_PREFIX = re.compile(r"^(?:please |can you |could you |would you |tell me )+")
 _TREND_RE = re.compile(
     r"\b(?:trend(?:ing|s)?|treading|thread(?:ing)?|history|historical|over time|"
@@ -22,6 +20,7 @@ _TREND_RE = re.compile(
 )
 _REPORT_RE = re.compile(r"\b(?:report|repot|repo|analys(?:e|is)|analyze|detailed)\b")
 _ASK_HERMES_RE = re.compile(r"\bask(?:ing)?\s+hermes\b")
+_HERMES_REPORT_RE = re.compile(r"\b(?:latest\s+hermes\s+report|hermes\s+report|latest\s+report)\b")
 _HERMES_SOURCE_QUESTION_RE = re.compile(
     r"\b(?:did|was|is) (?:that|this|it) (?:come from|from) hermes\b"
     r"|\bdid hermes (?:give you that|give that|send that|tell you that)\b"
@@ -82,7 +81,7 @@ def _filter_probes(probes: dict[str, Any], include: object) -> dict[str, Any]:
 def _normalize_reef_utterance(transcript: str) -> str:
     text = transcript.lower().strip().replace("'", "")
     text = re.sub(r"[.!?,;:]+", " ", text)
-    text = _WAKE_PREFIX.sub("", text)
+    text = strip_transcript_name_prefix(text)
     text = _POLITE_PREFIX.sub("", text)
     return re.sub(r"\s+", " ", text).strip()
 
@@ -112,6 +111,8 @@ def classify_reef_intent(transcript: str) -> ReefRoute | None:
     text = _normalize_reef_utterance(transcript)
     if not text:
         return None
+    if _HERMES_REPORT_RE.search(text):
+        return ReefRoute(intent="detailed_report", route="ask_hermes", explicit_hermes_request=True)
     explicit = bool(_ASK_HERMES_RE.search(text))
     metric = _reef_metric(text)
     has_reef = metric is not None

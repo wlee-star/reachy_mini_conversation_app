@@ -12,6 +12,7 @@ import reachy_mini_conversation_app.huggingface_realtime as hf_mod
 from reachy_mini_conversation_app import hermes_client
 from reachy_mini_conversation_app.config import config, get_default_voice
 from reachy_mini_conversation_app.streaming import AdditionalOutputs
+from reachy_mini_conversation_app.activation import ActivationSession
 from reachy_mini_conversation_app.tools.apex import classify_reef_intent
 from reachy_mini_conversation_app.hermes_client import HermesTimeoutError
 from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
@@ -532,6 +533,122 @@ async def test_start_fast_dance_emotion_plays_dance1_once(monkeypatch: Any, capl
 
 
 @pytest.mark.asyncio
+async def test_unactivated_transcript_does_not_start_fast_paths(monkeypatch: Any) -> None:
+    """Commands without Wally must not reach Home Assistant, reef, or dance fast paths."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    ha = MagicMock()
+    bus = MagicMock()
+    apex = MagicMock()
+    time_cmd = MagicMock()
+    dance = MagicMock()
+    monkeypatch.setattr(handler, "_start_fast_ha_command", ha)
+    monkeypatch.setattr(handler, "_start_fast_bus_command", bus)
+    monkeypatch.setattr(handler, "_start_fast_apex_command", apex)
+    monkeypatch.setattr(handler, "_start_fast_time_command", time_cmd)
+    monkeypatch.setattr(handler, "_start_fast_dance_emotion", dance)
+    monkeypatch.setattr(handler, "_reject_unactivated_speech", AsyncMock())
+
+    handler._handle_completed_user_transcript("Turn on lamp three.")
+    if handler._wake_reminder_task is not None:
+        await handler._wake_reminder_task
+
+    ha.assert_not_called()
+    bus.assert_not_called()
+    apex.assert_not_called()
+    time_cmd.assert_not_called()
+    dance.assert_not_called()
+    assert handler._user_turn_authorized is False
+
+
+@pytest.mark.asyncio
+async def test_wally_transcript_starts_fast_paths(monkeypatch: Any) -> None:
+    """A leading Wally authorizes deterministic routes for this turn."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    ha = MagicMock()
+    bus = MagicMock()
+    apex = MagicMock()
+    time_cmd = MagicMock()
+    dance = MagicMock()
+    monkeypatch.setattr(handler, "_start_fast_ha_command", ha)
+    monkeypatch.setattr(handler, "_start_fast_bus_command", bus)
+    monkeypatch.setattr(handler, "_start_fast_apex_command", apex)
+    monkeypatch.setattr(handler, "_start_fast_time_command", time_cmd)
+    monkeypatch.setattr(handler, "_start_fast_dance_emotion", dance)
+
+    handler._handle_completed_user_transcript("Wally, turn on lamp three.")
+
+    ha.assert_called_once()
+    bus.assert_called_once()
+    apex.assert_called_once()
+    time_cmd.assert_called_once()
+    dance.assert_called_once()
+    assert handler._user_turn_authorized is True
+    assert ha.call_args.args[0].lower() == "turn on lamp three."
+
+
+@pytest.mark.asyncio
+async def test_follow_up_transcript_stays_authorized_until_timeout(monkeypatch: Any) -> None:
+    """Follow-ups after Wally stay authorized until the session timeout."""
+    now = {"t": 0.0}
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._activation = ActivationSession(clock=lambda: now["t"])
+    ha = MagicMock()
+    bus = MagicMock()
+    apex = MagicMock()
+    time_cmd = MagicMock()
+    dance = MagicMock()
+    monkeypatch.setattr(handler, "_start_fast_ha_command", ha)
+    monkeypatch.setattr(handler, "_start_fast_bus_command", bus)
+    monkeypatch.setattr(handler, "_start_fast_apex_command", apex)
+    monkeypatch.setattr(handler, "_start_fast_time_command", time_cmd)
+    monkeypatch.setattr(handler, "_start_fast_dance_emotion", dance)
+    monkeypatch.setattr(handler, "_reject_unactivated_speech", AsyncMock())
+
+    handler._handle_completed_user_transcript("Wally, what's the reef temperature?")
+    handler._handle_completed_user_transcript("What is the salinity?")
+    assert apex.call_count == 2
+    assert handler._user_turn_authorized is True
+
+    now["t"] = 31.0
+    apex.reset_mock()
+    ha.reset_mock()
+    handler._handle_completed_user_transcript("What is the alkalinity?")
+    if handler._wake_reminder_task is not None:
+        await handler._wake_reminder_task
+    apex.assert_not_called()
+    ha.assert_not_called()
+    assert handler._user_turn_authorized is False
+
+
+@pytest.mark.asyncio
+async def test_unactivated_llm_tool_call_is_not_started(monkeypatch: Any) -> None:
+    """LLM tool calls must not execute when the user has not said Wally."""
+    monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
+    monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._user_turn_authorized = False
+    start_tool = AsyncMock()
+    monkeypatch.setattr(type(handler.tool_manager), "start_tool", start_tool)
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent(
+                "response.function_call_arguments.done",
+                name="home_assistant",
+                arguments='{"action": "turn_switch_on", "entity_id": "switch.lamp_3"}',
+                call_id="call_ha",
+            ),
+        ),
+    )
+
+    await handler._run_realtime_session()
+
+    start_tool.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_start_fast_dance_emotion_uses_dance3_when_energetic(monkeypatch: Any) -> None:
     """Energetic dance requests may queue official dance3."""
     play_calls: list[dict[str, Any]] = []
@@ -725,6 +842,31 @@ async def test_start_fast_bus_command_ignores_unrelated_speech(monkeypatch: Any)
 
 
 @pytest.mark.asyncio
+async def test_start_fast_time_command_uses_system_clock(monkeypatch: Any) -> None:
+    """A time question uses the deterministic clock, not the LLM."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    run = AsyncMock()
+    monkeypatch.setattr(handler, "_run_fast_time_command", run)
+
+    handler._start_fast_time_command("What time is it in Sydney?")
+    assert handler._fast_time_task is not None
+    await handler._fast_time_task
+    run.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_start_fast_time_command_ignores_bus_questions(monkeypatch: Any) -> None:
+    """A 311 time question must not be claimed by the clock fast path."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    run = AsyncMock()
+    monkeypatch.setattr(handler, "_run_fast_time_command", run)
+
+    handler._start_fast_time_command("what time is the 311")
+    assert handler._fast_time_task is None
+    run.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_start_fast_apex_command_queries_live_status(monkeypatch: Any) -> None:
     """A live reef request should call Apex immediately, without waiting for the LLM."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
@@ -798,7 +940,7 @@ async def test_start_fast_apex_command_routes_trends_to_hermes(monkeypatch: Any)
 
 @pytest.mark.asyncio
 async def test_hermes_reef_fast_path_speaks_live_report(monkeypatch: Any, caplog: pytest.LogCaptureFixture) -> None:
-    """Cache presence must not skip Hermes; the live report is spoken."""
+    """Cache presence must not skip Hermes; the current Hermes report is spoken."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler.connection = AsyncMock()
     handler._turn_generation = 1
@@ -807,6 +949,17 @@ async def test_hermes_reef_fast_path_speaks_live_report(monkeypatch: Any, caplog
     live_report = "Live Hermes Reef report: temp 24.1C, nitrate falling."
     send = AsyncMock(return_value=live_report)
     monkeypatch.setattr("reachy_mini_conversation_app.hermes_client.send_to_hermes", send)
+    monkeypatch.setattr(
+        "reachy_mini_conversation_app.hermes_client.load_reef_live_cache",
+        lambda path=None: {
+            "cached_at": "2026-09-04T00:00:00+00:00",
+            "data_timestamp": "2026-09-04T00:00:00+00:00",
+            "age_seconds": 12.0,
+            "probes": {"Tmp": {"value": 24.1, "status": "ok"}},
+            "ato": {},
+            "source": "reef_monitor",
+        },
+    )
     monkeypatch.setattr(
         "reachy_mini_conversation_app.hermes_client.load_latest_reef_thread",
         lambda path=None: {
@@ -839,12 +992,13 @@ async def test_hermes_reef_fast_path_speaks_live_report(monkeypatch: Any, caplog
     assert handler._last_reef_response_route == "ask_hermes"
     assert "[REEF_ROUTER] intent=trends" in caplog.text
     assert "[REEF_ROUTER] route=ask_hermes" in caplog.text
-    assert "[REEF_ROUTER] source=live" in caplog.text
-    assert "[REEF_ROUTER] source_type=live_trends" in caplog.text
+    assert "[REEF_ROUTER] source=hermes" in caplog.text
+    assert "[REEF_ROUTER] source_type=current_trends" in caplog.text
     assert "[REEF_ROUTER] cache_used=false" in caplog.text
     assert "[REEF_ROUTER] response_owner=ask_hermes" in caplog.text
     assert "[REEF_ROUTER] normal_llm_bypass=true" in caplog.text
     assert "[REEF_ROUTER] explicit_hermes_request=false" in caplog.text
+    assert "[REEF_ROUTER] fresh=true" in caplog.text
     assert "trend_keys=" in caplog.text
     assert "FS100" in caplog.text
     assert "LLSATO" in caplog.text
@@ -862,6 +1016,17 @@ async def test_explicit_hermes_report_calls_live_hermes(monkeypatch: Any, caplog
     live_report = "Live Hermes Reef Tank report: temp 24.1C."
     send = AsyncMock(return_value=live_report)
     monkeypatch.setattr("reachy_mini_conversation_app.hermes_client.send_to_hermes", send)
+    monkeypatch.setattr(
+        "reachy_mini_conversation_app.hermes_client.load_reef_live_cache",
+        lambda path=None: {
+            "cached_at": "2026-09-04T00:00:00+00:00",
+            "data_timestamp": "2026-09-04T00:00:00+00:00",
+            "age_seconds": 12.0,
+            "probes": {"Tmp": {"value": 24.1, "status": "ok"}},
+            "ato": {},
+            "source": "reef_monitor",
+        },
+    )
     monkeypatch.setattr(
         "reachy_mini_conversation_app.hermes_client.load_latest_reef_thread",
         lambda path=None: {"report": "Reef stable - temp 24.0C (-0.012/6h).", "source": "hermes", "trends": {}},
@@ -883,8 +1048,8 @@ async def test_explicit_hermes_report_calls_live_hermes(monkeypatch: Any, caplog
     assert "[REEF_ROUTER] intent=detailed_report" in caplog.text
     assert "[REEF_ROUTER] route=ask_hermes" in caplog.text
     assert "[REEF_ROUTER] explicit_hermes_request=true" in caplog.text
-    assert "[REEF_ROUTER] source=live" in caplog.text
-    assert "[REEF_ROUTER] source_type=live_report" in caplog.text
+    assert "[REEF_ROUTER] source=hermes" in caplog.text
+    assert "[REEF_ROUTER] source_type=current_report" in caplog.text
     assert "[REEF_ROUTER] cache_used=false" in caplog.text
     assert "skipping competing ask_hermes" not in caplog.text
 
@@ -900,7 +1065,7 @@ async def test_hermes_reef_fast_path_speaks_stale_cache_on_timeout(
     create = AsyncMock()
     monkeypatch.setattr(handler, "_safe_response_create", create)
 
-    async def _send(_text: str, _session_id: str, request_id: str | None = None) -> str:
+    async def _send(_text: str, _session_id: str, request_id: str | None = None, **_kwargs: object) -> str:
         raise HermesTimeoutError("timed out")
 
     monkeypatch.setattr("reachy_mini_conversation_app.hermes_client.send_to_hermes", _send)
@@ -1027,7 +1192,7 @@ async def test_late_live_hermes_result_is_not_spoken_after_cache_fallback(
     release = asyncio.Event()
     live_report = "LATE LIVE REPORT that must not be spoken"
 
-    async def _send(_text: str, _session_id: str, request_id: str | None = None) -> str:
+    async def _send(_text: str, _session_id: str, request_id: str | None = None, **_kwargs: object) -> str:
         async with hermes_client._HERMES_REQUEST_LOCK:
             started.set()
             await release.wait()
@@ -1066,7 +1231,7 @@ async def test_fast_path_skips_speech_when_turn_advances_during_hermes_wait(
     create = AsyncMock()
     monkeypatch.setattr(handler, "_safe_response_create", create)
 
-    async def _send(_text: str, _session_id: str, request_id: str | None = None) -> str:
+    async def _send(_text: str, _session_id: str, request_id: str | None = None, **_kwargs: object) -> str:
         handler._turn_generation = 2
         return "Live report after turn change"
 

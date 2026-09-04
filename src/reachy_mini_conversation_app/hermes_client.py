@@ -15,9 +15,18 @@ from reachy_mini_conversation_app.config import config
 
 
 logger = logging.getLogger(__name__)
-REEF_THREAD_PATH = os.path.expanduser("~/reef-monitor/reef_thread.jsonl")
+REEF_MONITOR_DIR = os.path.expanduser("~/reef-monitor")
+REEF_THREAD_PATH = os.path.join(REEF_MONITOR_DIR, "reef_thread.jsonl")
+REEF_CACHE_PATH = os.path.join(REEF_MONITOR_DIR, "reef_cache.json")
+# reef-monitor 1-minute cache cron; allow one missed tick of jitter.
+REEF_LIVE_CACHE_MAX_AGE_SECONDS = 120
+# reef-monitor history logger + thread updater cron (*/30).
+REEF_TREND_INTERVAL_SECONDS = 1800
 _CHAT_COMPLETIONS_SUFFIX = "/v1/chat/completions"
 HISTORY_UNAVAILABLE = "Historical reef data is currently unavailable."
+REQUEST_KIND_CURRENT = "reef_current"
+REQUEST_KIND_HISTORY = "reef_history"
+REQUEST_KIND_DELEGATED = "delegated"
 
 # Non-Reef delegated queries can take 45-90s; config.HERMES_REQUEST_TIMEOUT_SECONDS
 # caps them at 180s. Interactive Reef waits use config.HERMES_REEF_REQUEST_TIMEOUT_SECONDS (15s).
@@ -30,21 +39,36 @@ HERMES_CHAT_MODEL = "hermes-agent"
 HERMES_SESSION_HEADER = "X-Hermes-Session-Id"
 # Layered on Hermes's own system prompt so the agent skips essays and extra skills.
 HERMES_VOICE_SYSTEM_PROMPT = (
-    "You are answering a talking robot. Reply in 1-2 short spoken sentences. "
+    "You are answering Wally, a talking assistant on a Reachy Mini robot. "
+    "Reply in 1-2 short spoken sentences. "
     "Answer the user's question. Use advanced reasoning and external tools only when the request "
-    "cannot be handled by Reachy's local tools. "
+    "cannot be handled by Wally's local tools. "
     "Do not search the web, use the terminal, or narrate files, tools, agents, or your process."
 )
 HERMES_REEF_TREND_INSTRUCTION = (
-    "This is a reef trend/history request. Use the Reefy cache report included in this "
-    "message as the only data source. Speak the actual numbers, 6-hour slopes, and ATO "
+    "This is a historical reef request. Use the Reefy thread report included in this "
+    "message as the historical data source. Speak the actual numbers, 6-hour slopes, and ATO "
     "time-to-empty. Do not narrate files, tools, agents, or your process. Do not invent "
-    "historical values. Do not use live Apex readings. If no cache report is included, "
+    "historical values. If no historical report is included, "
     "say that historical reef data is currently unavailable."
 )
+HERMES_REEF_CURRENT_INSTRUCTION = (
+    "This is a current/latest reef request, not a historical one. "
+    "Use the current reef-monitor live cache in this message as the live probe source. "
+    "Use the latest 30-minute slope report only for 6-hour trends. "
+    "Do not use prior conversation context. Do not use an old reef_thread.jsonl report "
+    "as the only source. Do not invent values. Speak the current numbers and 6-hour slopes."
+)
 HERMES_REEF_VOICE_SYSTEM_PROMPT = (
-    "You are answering a talking robot. Reply in 1-2 short spoken sentences. "
+    "You are answering Wally, a talking assistant on a Reachy Mini robot. "
+    "Reply in 1-2 short spoken sentences. "
     "A Reefy historical cache report is included in the user message. Use those numbers. "
+    "Do not search the web. Do not invent values. Do not mention files, tools, or Apex."
+)
+HERMES_REEF_CURRENT_VOICE_SYSTEM_PROMPT = (
+    "You are answering Wally, a talking assistant on a Reachy Mini robot. "
+    "Reply in 1-2 short spoken sentences. "
+    "A current reef-monitor snapshot is included in the user message. Use those numbers. "
     "Do not search the web. Do not invent values. Do not mention files, tools, or Apex."
 )
 _TREND_MARKERS: tuple[str, ...] = (
@@ -65,6 +89,8 @@ _TREND_MARKERS: tuple[str, ...] = (
     "reef tank report",
     "reef report",
     "tank report",
+    "hermes report",
+    "latest hermes",
     "full reef",
     "time to empty",
     "time-to-empty",
@@ -74,7 +100,7 @@ _TREND_MARKERS: tuple[str, ...] = (
     "ato usage",
 )
 _REEF_CONTEXT_MARKERS: tuple[str, ...] = ("reef", "tank", "apex", "ato")
-_REEF_HISTORY_MARKERS: tuple[str, ...] = (
+_REEF_REPORT_MARKERS: tuple[str, ...] = (
     "report",
     "analyse",
     "analyze",
@@ -87,6 +113,24 @@ _REEF_HISTORY_MARKERS: tuple[str, ...] = (
     "been going",
     "changed",
     "changing",
+    "happening",
+)
+_HISTORICAL_REEF_MARKERS: tuple[str, ...] = (
+    "history",
+    "historical",
+    "over time",
+    "last 6",
+    "last six",
+    "last few hours",
+    "changed over",
+    "been using",
+    "ato history",
+    "parameter history",
+    "been doing",
+    "been going",
+    "how has",
+    "how have",
+    "what has changed",
 )
 _PROCESS_NARRATION_MARKERS: tuple[str, ...] = (
     "can't access the file",
@@ -218,6 +262,11 @@ def get_hermes_session_id() -> str:
     return _PROCESS_SESSION_ID
 
 
+def new_hermes_session_id() -> str:
+    """Return a one-off session id so a current reef request cannot reuse old context."""
+    return str(uuid.uuid4())
+
+
 def hermes_is_busy() -> bool:
     """Return whether a Hermes Gateway request is currently in flight."""
     return _HERMES_REQUEST_LOCK.locked()
@@ -238,20 +287,56 @@ def reset_hermes_circuit() -> None:
     _HERMES_CIRCUIT.reset()
 
 
-def hermes_request_timeout_s(*, history_request: bool) -> float:
+def hermes_request_timeout_s(*, history_request: bool = False, reef_request: bool | None = None) -> float:
     """Return the live-wait timeout for a Hermes call."""
-    if history_request:
+    if reef_request is None:
+        reef_request = history_request
+    if reef_request:
         return float(config.HERMES_REEF_REQUEST_TIMEOUT_SECONDS)
     return float(config.HERMES_REQUEST_TIMEOUT_SECONDS)
 
 
 def is_trend_query(text: str) -> bool:
-    """Return whether the utterance asks for historical trends rather than a live snapshot."""
+    """Return whether the utterance is a reef trend/report request for Hermes."""
     lowered = text.lower()
     if any(marker in lowered for marker in _TREND_MARKERS):
         return True
     reef_context = any(marker in lowered for marker in _REEF_CONTEXT_MARKERS)
-    return reef_context and any(marker in lowered for marker in _REEF_HISTORY_MARKERS)
+    if "latest report" in lowered and "weather" not in lowered:
+        return True
+    return reef_context and any(marker in lowered for marker in _REEF_REPORT_MARKERS)
+
+
+def is_historical_reef_query(text: str) -> bool:
+    """Return whether the utterance asks for historical reef data rather than current trends."""
+    if not is_trend_query(text):
+        return False
+    lowered = text.lower()
+    return any(marker in lowered for marker in _HISTORICAL_REEF_MARKERS)
+
+
+def is_current_reef_query(text: str) -> bool:
+    """Return whether the utterance asks for the current/latest reef trend or report."""
+    return is_trend_query(text) and not is_historical_reef_query(text)
+
+
+def reef_request_kind(text: str) -> str | None:
+    """Return reef_current, reef_history, or None for a non-reef utterance."""
+    if is_historical_reef_query(text):
+        return REQUEST_KIND_HISTORY
+    if is_trend_query(text):
+        return REQUEST_KIND_CURRENT
+    return None
+
+
+def current_reef_is_fresh(age_seconds: float | None) -> bool:
+    """Return whether a current-reef data timestamp is within the live-cache freshness window."""
+    return age_seconds is not None and age_seconds <= REEF_LIVE_CACHE_MAX_AGE_SECONDS
+
+
+def reef_slopes_are_fresh(age_seconds: float | None) -> bool:
+    """Return whether a reef_thread slope report is within the 30-minute trend cadence."""
+    return age_seconds is not None and age_seconds <= REEF_TREND_INTERVAL_SECONDS
 
 
 def is_process_narration(text: str) -> bool:
@@ -418,13 +503,54 @@ def reef_cache_status_for_age(age_seconds: float | None) -> str:
     return "stale"
 
 
+def load_reef_live_cache(path: str | None = None) -> dict[str, Any] | None:
+    """Return the current reef-monitor live cache, or None if it is missing."""
+    cache_path = path or REEF_CACHE_PATH
+    try:
+        with open(cache_path, encoding="utf-8") as handle:
+            raw: object = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("[HERMES] reef_cache unreadable path=%s error=%s", cache_path, exc)
+        return None
+    if not isinstance(raw, dict):
+        logger.warning("[HERMES] reef_cache invalid path=%s", cache_path)
+        return None
+    cached_at = raw.get("cached_at")
+    data_timestamp = cached_at if isinstance(cached_at, str) and cached_at.strip() else None
+    probes_raw = raw.get("probes")
+    ato_raw = raw.get("ato")
+    probes: dict[str, Any] = probes_raw if isinstance(probes_raw, dict) else {}
+    ato: dict[str, Any] = ato_raw if isinstance(ato_raw, dict) else {}
+    age_seconds = reef_cache_age_seconds(
+        generated_at=data_timestamp,
+        data_timestamp=data_timestamp,
+        path=cache_path,
+    )
+    snapshot: dict[str, Any] = {
+        "cached_at": data_timestamp,
+        "data_timestamp": data_timestamp,
+        "probes": {str(key): value for key, value in probes.items()},
+        "ato": {str(key): value for key, value in ato.items()},
+        "age_seconds": age_seconds,
+        "source": "reef_monitor",
+    }
+    logger.info(
+        "[HERMES] reef_cache loaded path=%s cached_at=%s age_seconds=%s probe_keys=%s",
+        cache_path,
+        data_timestamp,
+        age_seconds,
+        sorted(str(key) for key in probes),
+    )
+    return snapshot
+
+
 def reef_history_query(user_query: str, cache: dict[str, Any] | None) -> str:
-    """Build an unambiguous Hermes trend request, attaching the Reefy cache when present."""
-    parts = [f"Reef trend/history request: {user_query.strip()}", HERMES_REEF_TREND_INSTRUCTION]
+    """Build a historical Hermes request, attaching the Reefy thread when present."""
+    parts = [f"Reef historical request: {user_query.strip()}", HERMES_REEF_TREND_INSTRUCTION]
     if cache is None:
-        parts.append("Reefy cache is unavailable. Do not invent historical values.")
+        parts.append("Reefy historical report is unavailable. Do not invent historical values.")
         return "\n".join(parts)
-    parts.append("Use this Reefy cache report as the only data source. Do not invent values.")
+    parts.append("Use this Reefy thread report as the historical data source. Do not invent values.")
     parts.append(f"generated_at: {cache.get('generated_at')}")
     parts.append(f"data_timestamp: {cache.get('data_timestamp')}")
     parts.append(f"report: {cache.get('report')}")
@@ -433,6 +559,38 @@ def reef_history_query(user_query: str, cache: dict[str, Any] | None) -> str:
     trends = cache.get("trends")
     if isinstance(trends, dict) and trends:
         parts.append(f"trends: {json.dumps(trends)}")
+    return "\n".join(parts)
+
+
+def reef_current_query(
+    user_query: str,
+    live_cache: dict[str, Any] | None,
+    thread: dict[str, Any] | None,
+) -> str:
+    """Build a current Hermes request from the live cache plus latest 30-minute slopes."""
+    parts = [f"Reef current request: {user_query.strip()}", HERMES_REEF_CURRENT_INSTRUCTION]
+    if live_cache is None:
+        parts.append("Live reef-monitor cache is unavailable. Do not invent values.")
+    else:
+        parts.append("Current reef-monitor live cache:")
+        parts.append(f"cached_at: {live_cache.get('cached_at')}")
+        parts.append(f"data_timestamp: {live_cache.get('data_timestamp')}")
+        parts.append(f"age_seconds: {live_cache.get('age_seconds')}")
+        probes = live_cache.get("probes")
+        if isinstance(probes, dict) and probes:
+            parts.append(f"probes: {json.dumps(probes)}")
+        ato = live_cache.get("ato")
+        if isinstance(ato, dict) and ato:
+            parts.append(f"ato: {json.dumps(ato)}")
+    if thread is not None:
+        parts.append("Latest 30-minute slope report for 6-hour trends only. Not a substitute for live values.")
+        parts.append(f"slope_generated_at: {thread.get('generated_at')}")
+        parts.append(f"slope_data_timestamp: {thread.get('data_timestamp')}")
+        trends = thread.get("trends")
+        if isinstance(trends, dict) and trends:
+            parts.append(f"trends: {json.dumps(trends)}")
+        if thread.get("ato_hours_until_low") is not None:
+            parts.append(f"ato_hours_until_low: {thread['ato_hours_until_low']}")
     return "\n".join(parts)
 
 
@@ -476,21 +634,22 @@ def _reply_from_payload(payload: object) -> str:
     return reply.strip()
 
 
-def _log_hermes_timeout(request_id: str, *, elapsed: float, history_request: bool) -> None:
+def _log_hermes_timeout(request_id: str, *, elapsed: float, reef_request: bool) -> None:
     logger.warning(
-        "[HERMES] request timed out/failed request_id=%s elapsed=%.1fs history=%s failure_category=%s",
+        "[HERMES] request timed out/failed request_id=%s elapsed=%.1fs reef=%s failure_category=%s",
         request_id,
         elapsed,
-        history_request,
+        reef_request,
         HermesTimeoutError.category,
     )
-    if history_request:
+    if reef_request:
         logger.warning(
             "[HERMES] Reef request timed out request_id=%s elapsed=%.1fs failure_category=%s",
             request_id,
             elapsed,
             HermesTimeoutError.category,
         )
+        logger.warning("[HERMES] timeout after %.1f seconds", elapsed)
     logger.info("[HERMES] cancelling timed-out request request_id=%s", request_id)
 
 
@@ -504,7 +663,22 @@ def _should_retry_hermes(exc: BaseException, attempt: int) -> bool:
     return isinstance(exc, httpx.RequestError)
 
 
-async def send_to_hermes(text: str, session_id: str, request_id: str | None = None) -> str:
+def _resolve_request_kind(utterance: str, request_kind: str | None) -> str:
+    if request_kind in {REQUEST_KIND_CURRENT, REQUEST_KIND_HISTORY, REQUEST_KIND_DELEGATED}:
+        return request_kind
+    if utterance.startswith("Reef current request:"):
+        return REQUEST_KIND_CURRENT
+    if utterance.startswith("Reef historical request:") or utterance.startswith("Reef trend/history request:"):
+        return REQUEST_KIND_HISTORY
+    return reef_request_kind(utterance) or REQUEST_KIND_DELEGATED
+
+
+async def send_to_hermes(
+    text: str,
+    session_id: str,
+    request_id: str | None = None,
+    request_kind: str | None = None,
+) -> str:
     """POST a user message to Hermes /v1/chat/completions and return the assistant text."""
     global _HERMES_IN_FLIGHT_REQUEST_ID
     utterance = text.strip()
@@ -516,8 +690,10 @@ async def send_to_hermes(text: str, session_id: str, request_id: str | None = No
 
     gateway_url, api_key = _require_hermes_config()
     hermes_request_id = request_id or str(uuid.uuid4())
-    history_request = is_trend_query(utterance)
-    request_type = "reef_history" if history_request else "delegated"
+    resolved_kind = _resolve_request_kind(utterance, request_kind)
+    reef_request = resolved_kind in {REQUEST_KIND_CURRENT, REQUEST_KIND_HISTORY}
+    history_request = resolved_kind == REQUEST_KIND_HISTORY
+    request_type = resolved_kind
     if not _HERMES_CIRCUIT.allow_request():
         logger.warning(
             "[HERMES] circuit open request_id=%s request_type=%s failure_category=%s",
@@ -527,9 +703,16 @@ async def send_to_hermes(text: str, session_id: str, request_id: str | None = No
         )
         raise HermesCircuitOpenError("Hermes Gateway circuit is open.")
     user_content = utterance
-    if history_request and HERMES_REEF_TREND_INSTRUCTION not in utterance:
+    if resolved_kind == REQUEST_KIND_CURRENT and HERMES_REEF_CURRENT_INSTRUCTION not in utterance:
+        user_content = f"{utterance}\n\n{HERMES_REEF_CURRENT_INSTRUCTION}"
+    elif history_request and HERMES_REEF_TREND_INSTRUCTION not in utterance:
         user_content = f"{utterance}\n\n{HERMES_REEF_TREND_INSTRUCTION}"
-    system_prompt = HERMES_REEF_VOICE_SYSTEM_PROMPT if history_request else HERMES_VOICE_SYSTEM_PROMPT
+    if resolved_kind == REQUEST_KIND_CURRENT:
+        system_prompt = HERMES_REEF_CURRENT_VOICE_SYSTEM_PROMPT
+    elif history_request:
+        system_prompt = HERMES_REEF_VOICE_SYSTEM_PROMPT
+    else:
+        system_prompt = HERMES_VOICE_SYSTEM_PROMPT
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Accept": "application/json",
@@ -543,8 +726,14 @@ async def send_to_hermes(text: str, session_id: str, request_id: str | None = No
         ],
     }
 
-    timeout_s = hermes_request_timeout_s(history_request=history_request)
+    timeout_s = hermes_request_timeout_s(history_request=history_request, reef_request=reef_request)
     started = time.monotonic()
+    requested_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    logger.info("[HERMES] request started request_id=%s", hermes_request_id)
+    logger.info("[HERMES] request_type=%s request_id=%s", request_type, hermes_request_id)
+    logger.info("[HERMES] history=%s request_id=%s", str(history_request).lower(), hermes_request_id)
+    logger.info("[HERMES] gateway=%s request_id=%s", gateway_url, hermes_request_id)
+    logger.info("[HERMES] requested_at=%s request_id=%s", requested_at, hermes_request_id)
     logger.info(
         "[HERMES] request started request_id=%s request_type=%s url=%s history=%s query_chars=%s session=%s timeout=%.1f",
         hermes_request_id,
@@ -555,7 +744,7 @@ async def send_to_hermes(text: str, session_id: str, request_id: str | None = No
         session_id,
         timeout_s,
     )
-    if history_request:
+    if reef_request:
         logger.info("[HERMES] Reef request started request_id=%s timeout=%.1f", hermes_request_id, timeout_s)
     http_status: int | None = None
     payload: object | None = None
@@ -574,14 +763,14 @@ async def send_to_hermes(text: str, session_id: str, request_id: str | None = No
                             _log_hermes_timeout(
                                 hermes_request_id,
                                 elapsed=time.monotonic() - started,
-                                history_request=history_request,
+                                reef_request=reef_request,
                             )
                             raise
                         except httpx.TimeoutException:
                             _log_hermes_timeout(
                                 hermes_request_id,
                                 elapsed=time.monotonic() - started,
-                                history_request=history_request,
+                                reef_request=reef_request,
                             )
                             raise
                         except (httpx.HTTPStatusError, httpx.RequestError) as exc:
@@ -644,6 +833,7 @@ async def send_to_hermes(text: str, session_id: str, request_id: str | None = No
             http_status,
             exc,
         )
+        logger.warning("[HERMES] parse_error=%s", exc)
         raise HermesRequestError(
             "Hermes Gateway returned malformed JSON.",
             category="HERMES_INVALID_RESPONSE",
@@ -659,6 +849,7 @@ async def send_to_hermes(text: str, session_id: str, request_id: str | None = No
         raise
     _HERMES_CIRCUIT.record_success()
     logger.info("[HERMES] response received request_id=%s", hermes_request_id)
+    logger.info("[HERMES] http_status=%s request_id=%s", http_status, hermes_request_id)
     logger.info(
         "[HERMES] gateway reply request_id=%s request_type=%s http_status=%s chars=%s "
         "process_narration=%s elapsed=%.1fs prefix=%s",

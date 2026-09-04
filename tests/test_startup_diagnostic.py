@@ -9,6 +9,10 @@ import httpx
 import numpy as np
 import pytest
 
+from reachy_mini_conversation_app.local_time import (
+    get_startup_time_context,
+    reset_startup_time_context,
+)
 from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
 from reachy_mini_conversation_app.startup_diagnostic import (
     SYDNEY_TIMEZONE,
@@ -135,6 +139,7 @@ def _healthy_routes() -> dict[str, tuple[int, object | None]]:
 @pytest.fixture(autouse=True)
 def _isolate_boot(monkeypatch: pytest.MonkeyPatch) -> None:
     reset_boot_sequence_guard()
+    reset_startup_time_context()
     monkeypatch.setattr(
         "reachy_mini_conversation_app.startup_diagnostic.get_tool_specs",
         lambda: [{"name": "camera"}],
@@ -157,6 +162,7 @@ def _isolate_boot(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     yield
     reset_boot_sequence_guard()
+    reset_startup_time_context()
 
 
 @pytest.mark.parametrize(
@@ -190,6 +196,7 @@ def test_sydney_clock_names_walter_and_uses_zoneinfo() -> None:
     assert clock.greeting == "Good evening, Walter."
     instruction = build_greeting_instruction(clock)
     assert "Walter" in instruction
+    assert "I'm Wally." in instruction
     assert "Sunday, August 30th, 9:28 PM" in instruction
     assert "Sydney" in instruction
 
@@ -269,7 +276,14 @@ async def test_normal_startup_checks_simulator_and_ai_stack() -> None:
     assert by_name["speaker"].status is DiagnosticStatus.HEALTHY
     instruction = build_report_instruction(report)
     assert "All systems are green" in instruction
+    assert "Reachy Mini is online" in instruction
+    assert "I'm Wally." in build_greeting_instruction(report.clock)
     assert "Walter" in build_greeting_instruction(report.clock)
+    context = get_startup_time_context()
+    assert context is not None
+    assert context["timezone"] == SYDNEY_TIMEZONE
+    assert context["startup_local_datetime"]
+    assert context["startup_utc_offset"] in {"+10:00", "+11:00"}
 
 
 @pytest.mark.asyncio

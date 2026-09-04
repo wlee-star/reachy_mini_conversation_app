@@ -20,3 +20,12 @@ def test_resolve_app_timeout_minutes(monkeypatch, raw_value, expected) -> None:
     monkeypatch.setenv(config.APP_TIMEOUT_MINUTES_ENV, raw_value)
 
     assert config.resolve_app_timeout_minutes() == expected
+
+
+def test_assistant_and_robot_names_default_to_wally_and_reachy_mini() -> None:
+    """Assistant identity is Wally; the robot display name stays Reachy Mini."""
+    assert config.config.ASSISTANT_NAME == "Wally"
+    assert config.config.WAKE_NAME == "Wally"
+    assert config.config.ROBOT_NAME == "Reachy Mini"
+    assert config.config.ACTIVE_SESSION_TIMEOUT_SECONDS == 30
+    assert config.config.LOCAL_TIMEZONE == "Australia/Sydney"

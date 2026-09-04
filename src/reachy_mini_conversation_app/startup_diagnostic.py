@@ -4,7 +4,6 @@ import asyncio
 import logging
 from enum import Enum
 from datetime import datetime
-from zoneinfo import ZoneInfo
 from dataclasses import dataclass
 from urllib.parse import quote, urlsplit
 from collections.abc import Callable, Sequence, Awaitable
@@ -18,6 +17,12 @@ from reachy_mini_conversation_app.config import (
     get_hf_direct_ws_url,
     parse_hf_realtime_url,
 )
+from reachy_mini_conversation_app.local_time import (
+    SYDNEY_TIMEZONE,
+    format_time_12h,
+    read_local_moment,
+    establish_startup_time_context,
+)
 from reachy_mini_conversation_app.tools.core_tools import ToolDependencies, get_tool_specs
 from reachy_mini_conversation_app.tools.play_emotion import EMOTION_AVAILABLE
 
@@ -25,7 +30,6 @@ from reachy_mini_conversation_app.tools.play_emotion import EMOTION_AVAILABLE
 logger = logging.getLogger(__name__)
 
 USER_DISPLAY_NAME = "Walter"
-SYDNEY_TIMEZONE = "Australia/Sydney"
 _HTTP_TIMEOUT_S = 3.0
 _LLAMA_HOST = "127.0.0.1"
 _LLAMA_PORT = 8080
@@ -165,20 +169,14 @@ def classify_time_of_day(hour: int) -> TimeOfDay:
 
 def read_sydney_clock(at: datetime | None = None) -> SydneyClock:
     """Read the current civil time in Australia/Sydney, including DST."""
-    tz = ZoneInfo(SYDNEY_TIMEZONE)
-    if at is None:
-        moment = datetime.now(tz)
-    elif at.tzinfo is None:
-        moment = at.replace(tzinfo=tz)
-    else:
-        moment = at.astimezone(tz)
+    moment = read_local_moment(at, SYDNEY_TIMEZONE)
     return SydneyClock(
         moment=moment,
         weekday=moment.strftime("%A"),
         month=moment.strftime("%B"),
         day=moment.day,
         day_ordinal=_ordinal(moment.day),
-        time_12h=moment.strftime("%I:%M %p").lstrip("0"),
+        time_12h=format_time_12h(moment),
         period=classify_time_of_day(moment.hour),
     )
 
@@ -208,7 +206,7 @@ def build_greeting_instruction(clock: SydneyClock) -> str:
     return (
         "Speak this startup line now, in character, as 1-2 short sentences. "
         f"Address the user as {USER_DISPLAY_NAME}. Do not ask a question or add extra topics. "
-        f"{clock.greeting} It's {clock.spoken_datetime} here in Sydney. "
+        f"{clock.greeting} I'm Wally. It's {clock.spoken_datetime} here in Sydney. "
         "I'm running my startup diagnostics now."
     )
 
@@ -258,8 +256,14 @@ async def run_startup_diagnostic(
 ) -> StartupReport:
     """Run AI-stack and Reachy hardware checks without crashing the boot path."""
     clock = read_sydney_clock()
+    context = establish_startup_time_context(clock.moment)
     logger.info("startup diagnostic started")
     logger.info("Sydney date/time: %s (%s)", clock.spoken_datetime, clock.period.value)
+    logger.info(
+        "startup local time context timezone=%s utc_offset=%s",
+        context["timezone"],
+        context["startup_utc_offset"],
+    )
 
     own_client = http_client is None
     client = http_client or httpx.AsyncClient(timeout=_HTTP_TIMEOUT_S)
@@ -296,6 +300,7 @@ async def deliver_boot_sequence(
     _boot_sequence_delivered = True
 
     clock = read_sydney_clock()
+    establish_startup_time_context(clock.moment)
     greeting_sent = await _speak_quietly(speak, build_greeting_instruction(clock))
     try:
         report = await run_startup_diagnostic(deps, speech_session_open=True)

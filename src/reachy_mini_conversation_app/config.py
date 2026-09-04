@@ -3,6 +3,7 @@ import re
 import sys
 import logging
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from dataclasses import dataclass
 from urllib.parse import urlsplit, parse_qsl, urlunsplit
 from importlib.resources import files
@@ -155,6 +156,38 @@ def _env_positive_int(name: str, default: int) -> int:
 
 APP_TIMEOUT_MINUTES_ENV = "REACHY_MINI_APP_TIMEOUT_MINUTES"
 DEFAULT_APP_TIMEOUT_MINUTES = 1440.0
+ASSISTANT_NAME_ENV = "ASSISTANT_NAME"
+WAKE_NAME_ENV = "WAKE_NAME"
+ROBOT_NAME_ENV = "ROBOT_NAME"
+ACTIVE_SESSION_TIMEOUT_SECONDS_ENV = "ACTIVE_SESSION_TIMEOUT_SECONDS"
+DEFAULT_ASSISTANT_NAME = "Wally"
+DEFAULT_WAKE_NAME = "Wally"
+DEFAULT_ROBOT_NAME = "Reachy Mini"
+DEFAULT_ACTIVE_SESSION_TIMEOUT_SECONDS = 30
+LOCAL_TIMEZONE_ENV = "LOCAL_TIMEZONE"
+DEFAULT_LOCAL_TIMEZONE = "Australia/Sydney"
+
+
+def _env_timezone(name: str, default: str) -> str:
+    """Return a valid IANA timezone from the environment, else the default."""
+    raw = os.getenv(name)
+    candidate = str(raw).strip() if raw is not None else ""
+    if not candidate:
+        return default
+    try:
+        ZoneInfo(candidate)
+    except (ZoneInfoNotFoundError, KeyError, ValueError):
+        logger.warning("Ignoring invalid %s=%r; using default %s.", name, raw, default)
+        return default
+    return candidate
+
+
+def _env_display_name(name: str, default: str) -> str:
+    """Return a non-empty display name from the environment, else the default."""
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    return str(raw).strip()
 
 
 def resolve_app_timeout_minutes() -> float | None:
@@ -369,6 +402,13 @@ class Config:
     HA_BUS_ENTITY_ID = os.getenv(HA_BUS_ENTITY_ID_ENV)
     APEX_STATUS_URL = os.getenv(APEX_STATUS_URL_ENV)
     REEF_CACHE_MAX_AGE_SECONDS = _env_positive_int(REEF_CACHE_MAX_AGE_SECONDS_ENV, DEFAULT_REEF_CACHE_MAX_AGE_SECONDS)
+    ASSISTANT_NAME = _env_display_name(ASSISTANT_NAME_ENV, DEFAULT_ASSISTANT_NAME)
+    WAKE_NAME = _env_display_name(WAKE_NAME_ENV, DEFAULT_WAKE_NAME)
+    ROBOT_NAME = _env_display_name(ROBOT_NAME_ENV, DEFAULT_ROBOT_NAME)
+    ACTIVE_SESSION_TIMEOUT_SECONDS = _env_positive_int(
+        ACTIVE_SESSION_TIMEOUT_SECONDS_ENV, DEFAULT_ACTIVE_SESSION_TIMEOUT_SECONDS
+    )
+    LOCAL_TIMEZONE = _env_timezone(LOCAL_TIMEZONE_ENV, DEFAULT_LOCAL_TIMEZONE)
 
     logger.debug(
         "HF mode: %s, HF session URL set: %s, HF direct URL set: %s",
@@ -501,6 +541,12 @@ def refresh_runtime_config_from_env() -> None:
     config.APEX_STATUS_URL = os.getenv(APEX_STATUS_URL_ENV)
     config.REEF_CACHE_MAX_AGE_SECONDS = _env_positive_int(
         REEF_CACHE_MAX_AGE_SECONDS_ENV, DEFAULT_REEF_CACHE_MAX_AGE_SECONDS
+    )
+    config.ASSISTANT_NAME = _env_display_name(ASSISTANT_NAME_ENV, DEFAULT_ASSISTANT_NAME)
+    config.WAKE_NAME = _env_display_name(WAKE_NAME_ENV, DEFAULT_WAKE_NAME)
+    config.ROBOT_NAME = _env_display_name(ROBOT_NAME_ENV, DEFAULT_ROBOT_NAME)
+    config.ACTIVE_SESSION_TIMEOUT_SECONDS = _env_positive_int(
+        ACTIVE_SESSION_TIMEOUT_SECONDS_ENV, DEFAULT_ACTIVE_SESSION_TIMEOUT_SECONDS
     )
     config.REACHY_MINI_CUSTOM_PROFILE = LOCKED_PROFILE or os.getenv("REACHY_MINI_CUSTOM_PROFILE")
 

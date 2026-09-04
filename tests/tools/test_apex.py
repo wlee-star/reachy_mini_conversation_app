@@ -371,6 +371,7 @@ def test_match_apex_intent_leaves_trends_to_hermes() -> None:
         ("Can you ask Hermes how my pH is trending?", "trends", "ask_hermes", None),
         ("Ask Hermes about my reef tank.", "detailed_report", "ask_hermes", None),
         ("Reachy, ask Hermes what my Reef Tank report is.", "detailed_report", "ask_hermes", None),
+        ("Wally, ask Hermes what my Reef Tank report is.", "detailed_report", "ask_hermes", None),
     ],
 )
 def test_classify_reef_intent_routes_status_and_reports(
@@ -392,6 +393,15 @@ def test_classify_reef_intent_ignores_unrelated_speech() -> None:
     assert classify_reef_intent("what's the weather") is None
     assert classify_reef_intent("Give me a weather report") is None
     assert classify_reef_intent("Ask Hermes about the weather") is None
+
+
+def test_classify_reef_intent_routes_latest_hermes_report() -> None:
+    """A latest-Hermes-report request is a live Hermes fetch, not Apex."""
+    classified = classify_reef_intent("What's the latest Hermes report?")
+    assert classified is not None
+    assert classified.route == "ask_hermes"
+    assert classified.intent == "detailed_report"
+    assert classified.explicit_hermes_request is True
 
 
 def test_explicit_ask_hermes_overrides_current_stats() -> None:

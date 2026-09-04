@@ -12,7 +12,7 @@ class IdleDoNothing(Tool):
 
     name = "idle_do_nothing"
     description = (
-        "Use only in response to an idle time update when you intentionally want Reachy to stay still and silent "
+        "Use only in response to an idle time update when you intentionally want the Reachy Mini robot to stay still and silent "
         "instead of choosing another idle action."
     )
     parameters_schema = {

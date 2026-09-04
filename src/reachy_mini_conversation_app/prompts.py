@@ -5,6 +5,7 @@ from pathlib import Path
 
 from reachy_mini_conversation_app.config import config, get_default_voice
 from reachy_mini_conversation_app.memory import format_memory_for_prompt
+from reachy_mini_conversation_app.local_time import startup_time_instructions
 from reachy_mini_conversation_app.profile_store import (
     DEFAULT_PROFILE_NAME,
     ProfileDefinition,
@@ -26,8 +27,37 @@ def _active_profile() -> ProfileDefinition:
     return read_profile(config.REACHY_MINI_CUSTOM_PROFILE)
 
 
+def assistant_identity_instructions() -> str:
+    """Return the mandatory Wally-vs-Reachy Mini identity block for every backend."""
+    assistant = config.ASSISTANT_NAME
+    robot = config.ROBOT_NAME
+    wake = config.WAKE_NAME
+    return (
+        f"You are {assistant}, the conversational assistant.\n"
+        f"You run on a {robot} robot.\n"
+        f"{assistant} is the assistant's name. {robot} is the robot's name.\n"
+        "Never identify yourself as Reachy.\n"
+        f"When asked your name, say {assistant}.\n"
+        f"When asked who you are, say you are {assistant}, the user's assistant.\n"
+        f"When asked if you are Reachy, say you are {assistant} and that {robot} is the robot you run on.\n"
+        f"When referring to the physical robot or its SDK, use {robot} / Reachy terminology.\n"
+        f"{assistant} is the conversational identity. {robot} is the robot and development platform.\n"
+        f"The user's wake/activation name is {wake}."
+    )
+
+
+def with_assistant_identity(instructions: str, memory_prompt: str = "") -> str:
+    """Prepend Wally identity, then optional memory, then profile instructions."""
+    parts = [assistant_identity_instructions().strip(), startup_time_instructions()]
+    if memory_prompt.strip():
+        parts.append(memory_prompt.strip())
+    if instructions.strip():
+        parts.append(instructions.strip())
+    return "\n\n".join(parts)
+
+
 def get_session_instructions(instance_path: str | Path | None = None) -> str:
-    """Return instructions for the active profile with memory context."""
+    """Return instructions for the active profile with identity and memory context."""
     selected_profile = config.REACHY_MINI_CUSTOM_PROFILE
     profile_name = selected_profile or DEFAULT_PROFILE_NAME
     try:
@@ -46,10 +76,7 @@ def get_session_instructions(instance_path: str | Path | None = None) -> str:
     if not instructions:
         raise RuntimeError("Default profile has no usable instructions")
 
-    memory_prompt = format_memory_for_prompt(instance_path)
-    if memory_prompt:
-        return f"{memory_prompt}\n\n{instructions}"
-    return instructions
+    return with_assistant_identity(instructions, format_memory_for_prompt(instance_path))
 
 
 def get_session_voice(default: str | None = None) -> str:

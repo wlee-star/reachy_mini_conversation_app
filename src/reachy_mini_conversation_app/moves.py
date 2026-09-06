@@ -76,11 +76,11 @@ class BreathingMove(Move):  # type: ignore
         self.neutral_head_pose = create_head_pose(0, 0, 0, 0, 0, 0, degrees=True)
         self.neutral_antennas = np.array([-0.1745, 0.1745])  # ~10° offset to reduce shaking
 
-        # Breathing parameters
+        # Breathing parameters (gentle continuous sine; keep sway small to avoid stepped look)
         self.breathing_z_amplitude = 0.005  # 5mm gentle breathing
         self.breathing_frequency = 0.1  # Hz (6 breaths per minute)
-        self.antenna_sway_amplitude = np.deg2rad(15)  # 15 degrees
-        self.antenna_frequency = 0.5  # Hz (faster antenna sway)
+        self.antenna_sway_amplitude = np.deg2rad(8)  # soft antenna sway
+        self.antenna_frequency = 0.25  # Hz (slow sway, less mechanical)
 
     @property
     def duration(self) -> float:

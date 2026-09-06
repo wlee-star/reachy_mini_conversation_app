@@ -1,0 +1,185 @@
+{
+  "_rollback": "Delete this file and restart the control dashboard to restore Gemma 4 E4B from services.json. The Gemma GGUF in the Hugging Face cache is unused, not deleted.",
+  "services": [
+    {
+      "id": "llama",
+      "name": "llama.cpp",
+      "group": "ai",
+      "description": "Local LLM server used by speech-to-speech.",
+      "managed": true,
+      "required": true,
+      "auto_restart": true,
+      "host": "127.0.0.1",
+      "port": 8080,
+      "depends_on": [],
+      "health": "llama",
+      "process_match": "llama-server",
+      "ready_timeout_s": 180,
+      "start": {
+        "executable": "C:/Users/Walter Lee/Workspace/reachy-mini-local-ai/tools/llama-b10819/llama-server.exe",
+        "args": [
+          "-m", "models/Qwen3-8B-Q4_K_M.gguf",
+          "-a", "Qwen3-8B-Q4_K_M",
+          "-ngl", "99",
+          "-np", "2",
+          "-c", "65536",
+          "-fa", "on",
+          "--reasoning", "off",
+          "--host", "0.0.0.0",
+          "--port", "8080"
+        ],
+        "cwd": "{ai_stack_root}"
+      }
+    },
+    {
+      "id": "speech",
+      "name": "Speech-to-speech",
+      "group": "ai",
+      "description": "Hugging Face realtime voice server (Parakeet STT + Qwen TTS).",
+      "managed": true,
+      "required": true,
+      "auto_restart": true,
+      "host": "127.0.0.1",
+      "port": 8765,
+      "depends_on": ["llama"],
+      "health": "speech",
+      "process_match": "speech-to-speech|speech_to_speech",
+      "ready_timeout_s": 300,
+      "start": {
+        "executable": "C:/Users/Walter Lee/Workspace/reachy-mini-local-ai/tools/python312/python.exe",
+        "args": [
+          "-u",
+          "-m",
+          "speech_to_speech.s2s_pipeline",
+          "--mode", "realtime",
+          "--stt", "parakeet-tdt",
+          "--tts", "qwen3",
+          "--llm_backend", "responses-api",
+          "--model_name", "Qwen3-8B-Q4_K_M",
+          "--responses_api_base_url", "http://127.0.0.1:8080/v1",
+          "--responses_api_api_key", "",
+          "--ws_host", "0.0.0.0",
+          "--ws_port", "8765",
+          "--qwen3_tts_backend", "torch",
+          "--qwen3_tts_device", "cuda"
+        ],
+        "cwd": "{ai_stack_root}"
+      }
+    },
+    {
+      "id": "qwen_tts",
+      "name": "Qwen TTS",
+      "group": "ai",
+      "description": "Text-to-speech backend bundled inside speech-to-speech (--tts qwen3).",
+      "managed": false,
+      "required": true,
+      "auto_restart": false,
+      "depends_on": ["speech"],
+      "health": "qwen_tts",
+      "process_match": "speech-to-speech|speech_to_speech"
+    },
+    {
+      "id": "hermes",
+      "name": "Hermes",
+      "group": "tools",
+      "description": "Hermes Agent API for delegated live-data tasks.",
+      "managed": false,
+      "required": false,
+      "auto_restart": true,
+      "host": "127.0.0.1",
+      "port": 8642,
+      "depends_on": [],
+      "health": "hermes",
+      "process_match": "hermes_cli\\.main.*\\bgateway\\b|hermes(\\.exe)?[\\s\\\"].*\\bgateway\\b|hermes-gateway",
+      "ready_timeout_s": 45,
+      "needs": ["HERMES_GATEWAY_URL", "HERMES_API_KEY"],
+      "start": {
+        "executable": "{hermes_exe}",
+        "args": ["gateway", "start"],
+        "cwd": "{hermes_home}"
+      },
+      "stop_args": ["gateway", "stop"]
+    },
+    {
+      "id": "conversation",
+      "name": "Conversation app",
+      "group": "system",
+      "description": "Reachy Mini conversation application (console + optional web UI).",
+      "managed": true,
+      "required": true,
+      "auto_restart": true,
+      "host": "192.168.0.57",
+      "port": 7860,
+      "depends_on": ["llama", "speech", "reachy_daemon"],
+      "health": "conversation",
+      "process_match": "reachy-mini-conversation-app|reachy_mini_conversation_app",
+      "ready_timeout_s": 90,
+      "start": {
+        "executable": "{dashboard_python}",
+        "args": ["-m", "control_dashboard.start_physical_conversation", "--host", "192.168.0.57"],
+        "cwd": "{conversation_root}"
+      }
+    },
+    {
+      "id": "reachy_daemon",
+      "name": "Reachy Mini",
+      "group": "system",
+      "description": "Virtual Reachy Mini SDK daemon (MuJoCo sim) for local testing.",
+      "managed": true,
+      "required": true,
+      "auto_restart": true,
+      "host": "127.0.0.1",
+      "port": 8000,
+      "depends_on": [],
+      "health": "reachy_daemon",
+      "process_match": "reachy-mini-daemon.*--sim",
+      "ready_timeout_s": 90,
+      "start": {
+        "executable": "{daemon_exe}",
+        "args": [
+          "--sim",
+          "--fastapi-host", "127.0.0.1",
+          "--fastapi-port", "8000"
+        ],
+        "gui": true,
+        "cwd": "{conversation_root}"
+      }
+    },
+    {
+      "id": "home_assistant",
+      "name": "Home Assistant",
+      "group": "tools",
+      "description": "Local Home Assistant REST API used by the home_assistant tool.",
+      "managed": false,
+      "required": false,
+      "auto_restart": false,
+      "depends_on": [],
+      "health": "home_assistant",
+      "needs": ["HA_URL", "HA_TOKEN"]
+    },
+    {
+      "id": "apex",
+      "name": "Neptune Apex",
+      "group": "tools",
+      "description": "Neptune Apex Fusion /status JSON used by apex and reef_status.",
+      "managed": false,
+      "required": false,
+      "auto_restart": false,
+      "depends_on": [],
+      "health": "apex",
+      "needs": ["APEX_STATUS_URL"]
+    },
+    {
+      "id": "bus",
+      "name": "Bus API",
+      "group": "tools",
+      "description": "Bus arrivals via the configured Home Assistant bus sensor.",
+      "managed": false,
+      "required": false,
+      "auto_restart": false,
+      "depends_on": ["home_assistant"],
+      "health": "bus",
+      "needs": ["HA_URL", "HA_TOKEN"]
+    }
+  ]
+}

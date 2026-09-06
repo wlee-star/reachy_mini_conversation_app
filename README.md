@@ -16,7 +16,7 @@ tags:
 
 Conversational app for the Reachy Mini robot combining realtime voice, vision, personality-aware tools, and choreographed motion.
 
-The conversational assistant is **Wally**. **Reachy Mini** is the robot Wally runs on and controls. Spoken requests require the wake name `Wally` (or an active follow-up session) before tools or other side effects run. `Reachy` / `Reachy Mini` is not a wake name.
+The conversational robot is **Reachy Mini**. Spoken requests require the wake name `Reachy` (or an active follow-up session) before tools or other side effects run.
 
 ![Reachy Mini Dance](docs/assets/reachy_mini_dance.gif)
 
@@ -43,7 +43,7 @@ The conversational assistant is **Wally**. **Reachy Mini** is the robot Wally ru
 
 ## Architecture
 
-The app connects the user, AI services, and robot hardware. Wally is the assistant identity sitting above the realtime backend; Reachy Mini remains the robot and SDK.
+The app connects the user, AI services, and Reachy Mini robot hardware through the official SDK.
 
 <p align="center">
   <img src="docs/assets/conversation_app_arch.svg" alt="Architecture Diagram" width="600"/>
@@ -121,11 +121,11 @@ Copy `.env.example` to `.env`. The example file selects local mode and `ws://127
 | `HA_BUS_ENTITY_ID` | Optional Home Assistant entity for bus arrivals. Defaults to `sensor.route_311_at_rockwall_cres`. |
 | `APEX_STATUS_URL` | Optional Neptune Apex Fusion status URL, for example `http://192.168.0.143:8080/status`. Used by the local `apex` and `reef_status` tools. Live Apex data is `source=live` and `stale=false`. If unset or unreachable, they fall back to `~/reef-monitor/reef_cache.json` with `stale=true` and `source=cache`. |
 | `REEF_CACHE_MAX_AGE_SECONDS` | Optional age threshold for Reef/Hermes *fallback* cache classification. Defaults to `3600`. Fallback cache younger than this is `status=degraded`; older fallback cache is `status=stale`. Cached fallbacks are never returned as `status=success`. Current Hermes freshness uses the reef-monitor live-cache cadence (60 seconds), not this fallback threshold. |
-| `ASSISTANT_NAME` | Spoken identity of the conversational assistant. Defaults to `Wally`. |
-| `WAKE_NAME` | Wake/activation name required at the start of a user request. Defaults to `Wally`. `Reachy` and `Reachy Mini` are not wake names. |
+| `ASSISTANT_NAME` | Spoken identity of the conversational robot. Defaults to `Reachy Mini`. |
+| `WAKE_NAME` | Wake/activation name required at the start of a user request. Defaults to `Reachy`. |
 | `ROBOT_NAME` | Display name of the physical robot. Defaults to `Reachy Mini`. Does not rename SDK classes, packages, or hardware interfaces. |
-| `ACTIVE_SESSION_TIMEOUT_SECONDS` | Follow-up window after a valid Wally activation. Defaults to `30`. After timeout, the user must say Wally again before tools run. |
-| `LOCAL_TIMEZONE` | IANA timezone for Wally's local clock and startup time context. Defaults to `Australia/Sydney`. Current time always comes from the system clock in this zone, not the LLM. |
+| `ACTIVE_SESSION_TIMEOUT_SECONDS` | Follow-up window after a valid Reachy activation. Defaults to `30`. After timeout, the user must say Reachy again before tools run. |
+| `LOCAL_TIMEZONE` | IANA timezone for Reachy's local clock and startup time context. Defaults to `Australia/Sydney`. Current time always comes from the system clock in this zone, not the LLM. |
 | `REACHY_MINI_APP_TIMEOUT_MINUTES` | Minutes of inactivity before Reachy Mini goes to sleep and the app stops. Defaults to `1440` (one day); set to `0` to disable. |
 
 ### Hugging Face Connection Modes
@@ -201,7 +201,7 @@ reachy-mini-conversation-app
 
 The app runs in console mode. Add `--ui` to serve the web interface at http://127.0.0.1:7860/.
 
-On each application boot, Wally greets Walter using `Australia/Sydney` local time, announces startup diagnostics, checks the AI stack and the connected Reachy Mini daemon (simulator or physical robot), then speaks a short readiness report. The spoken sequence runs once per process and does not repeat on realtime reconnects. Optional integrations that are unset are reported as not configured, not as failures.
+On each application boot, Reachy greets Walter using `Australia/Sydney` local time, announces startup diagnostics, checks the AI stack and the connected Reachy Mini daemon (simulator or physical robot), then speaks a short readiness report. The spoken sequence runs once per process and does not repeat on realtime reconnects. Optional integrations that are unset are reported as not configured, not as failures.
 
 ### Local AI control dashboard
 
@@ -212,6 +212,14 @@ python -m control_dashboard
 ```
 
 Then open http://127.0.0.1:8788/. The dashboard is a separate orchestration layer. It does not rewrite this conversation app, move motors, or send device-control commands during health checks.
+
+The **Physical** tab (`#/physical`) is a physical Reachy Mini AI-stack view. It shows live status for Reachy, camera preview, microphone/speaker controls, Hermes, and Safe Stop. Physical motor/audio/camera commands are proxied through the conversation app’s existing media pipeline (`/api/dashboard/*` on port 7860) and are **blocked** when the resolved target is not a confidently identified physical robot (simulator or unknown). The Overview tab and simulator start/stop behaviour are unchanged.
+
+**Camera Preview On/Off** only starts or stops dashboard JPEG frame requests. It does not power down, release, or disable the physical Reachy camera used by the conversation app.
+
+**Safe Stop** runs `disable_wobbling` → stop moves → `disable_motors`. It does not call `goto_sleep`, does not terminate Reachy/Hermes/the dashboard, and does not re-enable motors afterward.
+
+**Volume** stays unavailable in this dashboard: the installed SDK exposes daemon `/volume` routes, but `ReachyMini` / `MediaManager` (the app's audio path) have no client volume API, so the UI does not fake a slider.
 
 | Service | Purpose | Startup | Port | Dependencies | Health check | Stop |
 |---------|---------|---------|------|--------------|--------------|------|
@@ -314,7 +322,7 @@ Built-in motion content is published as open Hugging Face datasets:
 - Emotions: [`pollen-robotics/reachy-mini-emotions-library`](https://huggingface.co/datasets/pollen-robotics/reachy-mini-emotions-library)
 - Dances: [`pollen-robotics/reachy-mini-dances-library`](https://huggingface.co/datasets/pollen-robotics/reachy-mini-dances-library)
 
-Spoken requests for Wally to dance queue the official Reachy Mini `dance1` emotion from the emotions library immediately; conversation continues as usual. The request must be activated with `Wally` unless a follow-up session is already open.
+Spoken requests for Reachy to dance queue the official Reachy Mini `dance1` emotion from the emotions library immediately; conversation continues as usual. The request must be activated with `Reachy` unless a follow-up session is already open.
 
 <details>
 <summary>Custom profiles</summary>

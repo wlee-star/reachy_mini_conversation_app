@@ -196,7 +196,7 @@ def test_sydney_clock_names_walter_and_uses_zoneinfo() -> None:
     assert clock.greeting == "Good evening, Walter."
     instruction = build_greeting_instruction(clock)
     assert "Walter" in instruction
-    assert "I'm Wally." in instruction
+    assert "I'm Reachy Mini." in instruction
     assert "Sunday, August 30th, 9:28 PM" in instruction
     assert "Sydney" in instruction
 
@@ -277,7 +277,7 @@ async def test_normal_startup_checks_simulator_and_ai_stack() -> None:
     instruction = build_report_instruction(report)
     assert "All systems are green" in instruction
     assert "Reachy Mini is online" in instruction
-    assert "I'm Wally." in build_greeting_instruction(report.clock)
+    assert "I'm Reachy Mini." in build_greeting_instruction(report.clock)
     assert "Walter" in build_greeting_instruction(report.clock)
     context = get_startup_time_context()
     assert context is not None
@@ -460,6 +460,24 @@ async def test_llm_unavailable_is_reported() -> None:
     assert by_name["local_llm"].status is DiagnosticStatus.UNAVAILABLE
     assert by_name["speech_to_speech"].status is DiagnosticStatus.HEALTHY
     assert report.overall is OverallStatus.MINOR_ISSUE
+
+
+@pytest.mark.asyncio
+async def test_llm_uses_speech_realtime_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """On wireless Reachy, llama.cpp lives on the AI PC host from HF_REALTIME_WS_URL."""
+    monkeypatch.setattr(
+        "reachy_mini_conversation_app.startup_diagnostic.get_hf_direct_ws_url",
+        lambda: "ws://192.168.0.196:8765/v1/realtime",
+    )
+    client = _FakeAsyncClient(_healthy_routes())
+    report = await run_startup_diagnostic(
+        _deps(),
+        http_client=client,
+        speech_session_open=True,
+    )
+    by_name = {result.name: result for result in report.results}
+    assert by_name["local_llm"].status is DiagnosticStatus.HEALTHY
+    assert any(url.startswith("http://192.168.0.196:8080/") for url in client.requests)
 
 
 @pytest.mark.asyncio

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import json
+import sys
 import shutil
 import logging
 from typing import Any
@@ -161,6 +162,7 @@ def load_config() -> DashboardConfig:
         "ai_stack_root": str(ai_stack_root),
         "conversation_root": str(conversation_root),
         "conversation_python": str(paths.venv_python(conversation_root)),
+        "dashboard_python": sys.executable,
         "speech_python": str(paths.venv_python(ai_stack_root)),
         "speech_exe": str(speech_exe),
         "daemon_exe": str(paths.venv_script(conversation_root, "reachy-mini-daemon")),

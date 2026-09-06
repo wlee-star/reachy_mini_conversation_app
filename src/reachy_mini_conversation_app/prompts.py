@@ -28,26 +28,23 @@ def _active_profile() -> ProfileDefinition:
 
 
 def assistant_identity_instructions() -> str:
-    """Return the mandatory Wally-vs-Reachy Mini identity block for every backend."""
+    """Return the mandatory Reachy Mini identity block for every backend."""
     assistant = config.ASSISTANT_NAME
     robot = config.ROBOT_NAME
     wake = config.WAKE_NAME
     return (
-        f"You are {assistant}, the conversational assistant.\n"
-        f"You run on a {robot} robot.\n"
-        f"{assistant} is the assistant's name. {robot} is the robot's name.\n"
-        "Never identify yourself as Reachy.\n"
+        f"You are {assistant}, a friendly conversational robot assistant.\n"
+        f"{robot} is the robot and SDK platform.\n"
+        f"{assistant} is your name.\n"
         f"When asked your name, say {assistant}.\n"
-        f"When asked who you are, say you are {assistant}, the user's assistant.\n"
-        f"When asked if you are Reachy, say you are {assistant} and that {robot} is the robot you run on.\n"
+        f"When asked who you are, say you are {assistant}.\n"
         f"When referring to the physical robot or its SDK, use {robot} / Reachy terminology.\n"
-        f"{assistant} is the conversational identity. {robot} is the robot and development platform.\n"
         f"The user's wake/activation name is {wake}."
     )
 
 
 def with_assistant_identity(instructions: str, memory_prompt: str = "") -> str:
-    """Prepend Wally identity, then optional memory, then profile instructions."""
+    """Prepend Reachy identity, then optional memory, then profile instructions."""
     parts = [assistant_identity_instructions().strip(), startup_time_instructions()]
     if memory_prompt.strip():
         parts.append(memory_prompt.strip())

@@ -1,8 +1,7 @@
-"""Application-level Wally wake/activation gate.
+"""Application-level Reachy wake/activation gate.
 
-Wally is the conversational assistant. Reachy Mini is the robot. This module
-authorizes user requests before tools or other side effects run. The LLM prompt
-is not the security boundary.
+This module authorizes user requests before tools or other side effects run.
+The LLM prompt is not the security boundary.
 """
 
 import re
@@ -20,15 +19,24 @@ from reachy_mini_conversation_app.config import (
 logger = logging.getLogger(__name__)
 
 _VOCATIVE = r"(?:hey |hi |hello |ok |okay |yo )?"
-_WALLY_STT_VARIANTS = ("wally", "wall-e", "walle", "wali", "wolly")
-# Legacy Reachy Mini STT mishears, stripped only so command matchers still parse.
-# They must never activate the assistant.
-_LEGACY_ROBOT_STT_ALT = r"reachy|erichi|richie|rishi|ricci|ritchie|i reach a|i reachy|reach it"
+_REACHY_STT_VARIANTS = (
+    "reachy mini",
+    "reachy",
+    "reachie",
+    "reach it",
+    "reaching",
+    "erichi",
+    "harichi",
+    "richie",
+    "rishi",
+    "ricci",
+    "ritchie",
+)
 
 
 @dataclass(frozen=True)
 class ActivationDecision:
-    """Result of checking one user utterance against Wally activation rules."""
+    """Result of checking one user utterance against Reachy activation rules."""
 
     authorized: bool
     wake_detected: bool
@@ -37,18 +45,18 @@ class ActivationDecision:
 
 
 def configured_wake_names() -> tuple[str, ...]:
-    """Return lowercase wake tokens, including Wally STT variants when applicable."""
+    """Return lowercase wake tokens, including Reachy STT variants when applicable."""
     wake = (config.WAKE_NAME or DEFAULT_WAKE_NAME).strip().lower()
     names = [wake] if wake else [DEFAULT_WAKE_NAME.lower()]
-    if names[0] == "wally":
-        names.extend(_WALLY_STT_VARIANTS)
+    if names[0] in {"reachy", "reachy mini"}:
+        names.extend(_REACHY_STT_VARIANTS)
     seen: set[str] = set()
     unique: list[str] = []
     for name in names:
         if name and name not in seen:
             seen.add(name)
             unique.append(name)
-    return tuple(unique)
+    return tuple(sorted(unique, key=len, reverse=True))
 
 
 def _wake_alt_pattern() -> str:
@@ -56,20 +64,20 @@ def _wake_alt_pattern() -> str:
 
 
 def assistant_wake_prefix_re() -> re.Pattern[str]:
-    """Match Wally (or the configured wake name) only at the start of an utterance."""
+    """Match Reachy (or the configured wake name) only at the start of an utterance."""
     return re.compile(rf"^{_VOCATIVE}(?:{_wake_alt_pattern()})\b[\s,.\-:]*", re.IGNORECASE)
 
 
 def transcript_name_prefix_re() -> re.Pattern[str]:
     """Strip an opening assistant or legacy robot STT name so command matchers can run."""
     return re.compile(
-        rf"^{_VOCATIVE}(?:{_wake_alt_pattern()}|{_LEGACY_ROBOT_STT_ALT})[\s,.\-:]+",
+        rf"^{_VOCATIVE}(?:{_wake_alt_pattern()})[\s,.\-:]+",
         re.IGNORECASE,
     )
 
 
 def split_wake_prefix(transcript: str) -> tuple[bool, str]:
-    """Return whether Wally starts the utterance, and the remainder after that prefix."""
+    """Return whether Reachy starts the utterance, and the remainder after that prefix."""
     text = transcript.strip()
     if not text:
         return False, ""
@@ -95,7 +103,7 @@ def wake_reminder_text() -> str:
 
 
 class ActivationSession:
-    """Authorize Wally at utterance start, then accept follow-ups until timeout."""
+    """Authorize Reachy at utterance start, then accept follow-ups until timeout."""
 
     def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
         """Start an inactive session using a monotonic clock."""
@@ -103,7 +111,7 @@ class ActivationSession:
         self._authorized_until = 0.0
 
     def is_active(self, now: float | None = None) -> bool:
-        """Return whether a Wally session is still open."""
+        """Return whether a Reachy session is still open."""
         moment = self._clock() if now is None else now
         return moment < self._authorized_until
 
@@ -116,7 +124,7 @@ class ActivationSession:
         if wake_detected:
             self._authorized_until = moment + timeout
             command_text = remainder
-            logger.info("Wally activated")
+            logger.info("Reachy activated")
             return ActivationDecision(
                 authorized=True,
                 wake_detected=True,
@@ -131,7 +139,7 @@ class ActivationSession:
                 command_text=transcript.strip(),
                 session_active=True,
             )
-        logger.info("Wally activation required; ignoring unactivated user request")
+        logger.info("Reachy activation required; ignoring unactivated user request")
         return ActivationDecision(
             authorized=False,
             wake_detected=False,

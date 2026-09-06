@@ -232,7 +232,7 @@ async def test_get_bus_arrival_parses_route_departure_attributes() -> None:
             [{"action": "turn_switch_on", "entity_id": "switch.lamp_3"}],
         ),
         (
-            "Wally, turn on lamp three.",
+            "Reachy, turn on lamp three.",
             [{"action": "turn_switch_on", "entity_id": "switch.lamp_3"}],
         ),
         (
@@ -402,6 +402,44 @@ def test_control_success_wants_spoken_followup() -> None:
             None,
         )
         is True
+    )
+
+
+def test_spoken_ha_control_result_bedroom_cases() -> None:
+    """Fast-path speech must report the real bedroom-light outcome."""
+    from reachy_mini_conversation_app.tools.home_assistant import spoken_ha_control_result
+
+    assert (
+        spoken_ha_control_result(
+            {
+                "status": "success",
+                "service": "light.turn_off",
+                "entity_id": "light.yeelink_sg_269831873_lamp4_s_2_light",
+            }
+        )
+        == "Done, the bedroom light is off."
+    )
+    assert (
+        spoken_ha_control_result(
+            {
+                "status": "success",
+                "service": "light.turn_on",
+                "entity_id": "light.yeelink_sg_269831873_lamp4_s_2_light",
+                "brightness_pct": 45,
+            }
+        )
+        == "Done, the bedroom light is on at 45 percent."
+    )
+    assert (
+        spoken_ha_control_result(
+            {
+                "status": "success",
+                "service": "light.turn_on",
+                "entity_id": "light.yeelink_sg_269831873_lamp4_s_2_light",
+                "color_temp_kelvin": 3200,
+            }
+        )
+        == "Done, the bedroom light is set to 3200 kelvin."
     )
 
 

@@ -23,6 +23,12 @@ def parse_args() -> tuple[argparse.Namespace, list]:  # type: ignore
         help="Do not launch the Reachy Mini MuJoCo simulator; connect to an existing daemon",
     )
     parser.add_argument(
+        "--no-motion",
+        default=False,
+        action="store_true",
+        help="Keep motors disabled and skip startup movement and wobbling",
+    )
+    parser.add_argument(
         "--robot-name",
         type=str,
         default=None,

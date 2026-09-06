@@ -97,3 +97,31 @@ def test_run_go_to_sleep_tool_uses_runtime_callback() -> None:
 
     assert result == expected
     go_to_sleep.assert_called_once_with()
+
+
+def test_acknowledge_dashboard_sleep_stop_writes_stopped_json(tmp_path, monkeypatch) -> None:
+    """Sleep must mark conversation stopped before the process exits."""
+    stopped_path = tmp_path / "stopped.json"
+    monkeypatch.setattr(app_lifecycle, "_DASHBOARD_STOPPED_PATH", stopped_path)
+
+    class FakeResponse:
+        def __enter__(self) -> "FakeResponse":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            pass
+
+        def read(self) -> bytes:
+            return b'{"ok":true}'
+
+    def fake_urlopen(request, timeout):
+        assert request.get_method() == "POST"
+        assert request.full_url.endswith("/api/services/conversation/ack_stop")
+        assert timeout == 2.0
+        return FakeResponse()
+
+    monkeypatch.setattr(app_lifecycle.urllib.request, "urlopen", fake_urlopen)
+    logger = MagicMock()
+    app_lifecycle.acknowledge_dashboard_sleep_stop(logger)
+    assert stopped_path.read_text(encoding="utf-8").strip() == '[\n  "conversation"\n]'
+    logger.info.assert_any_call("Marked Conversation App as intentionally stopped for sleep")

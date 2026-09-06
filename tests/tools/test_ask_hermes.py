@@ -871,7 +871,7 @@ async def test_ask_hermes_trending_does_not_use_history_flag(
     monkeypatch.setattr(hermes_client, "load_reef_live_cache", lambda path=None: _fresh_live_cache())
     monkeypatch.setattr(hermes_client, "send_to_hermes", _send)
 
-    result = await AskHermes()(_deps(), query="Wally, can you tell me where my reef tank is trending at?")
+    result = await AskHermes()(_deps(), query="Reachy, can you tell me where my reef tank is trending at?")
 
     assert kinds == ["reef_current"]
     assert result["request_kind"] == "reef_current"

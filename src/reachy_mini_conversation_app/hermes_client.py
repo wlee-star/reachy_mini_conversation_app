@@ -39,10 +39,10 @@ HERMES_CHAT_MODEL = "hermes-agent"
 HERMES_SESSION_HEADER = "X-Hermes-Session-Id"
 # Layered on Hermes's own system prompt so the agent skips essays and extra skills.
 HERMES_VOICE_SYSTEM_PROMPT = (
-    "You are answering Wally, a talking assistant on a Reachy Mini robot. "
+    "You are answering Reachy Mini, a talking robot assistant. "
     "Reply in 1-2 short spoken sentences. "
     "Answer the user's question. Use advanced reasoning and external tools only when the request "
-    "cannot be handled by Wally's local tools. "
+    "cannot be handled by Reachy Mini's local tools. "
     "Do not search the web, use the terminal, or narrate files, tools, agents, or your process."
 )
 HERMES_REEF_TREND_INSTRUCTION = (
@@ -60,13 +60,13 @@ HERMES_REEF_CURRENT_INSTRUCTION = (
     "as the only source. Do not invent values. Speak the current numbers and 6-hour slopes."
 )
 HERMES_REEF_VOICE_SYSTEM_PROMPT = (
-    "You are answering Wally, a talking assistant on a Reachy Mini robot. "
+    "You are answering Reachy Mini, a talking robot assistant. "
     "Reply in 1-2 short spoken sentences. "
     "A Reefy historical cache report is included in the user message. Use those numbers. "
     "Do not search the web. Do not invent values. Do not mention files, tools, or Apex."
 )
 HERMES_REEF_CURRENT_VOICE_SYSTEM_PROMPT = (
-    "You are answering Wally, a talking assistant on a Reachy Mini robot. "
+    "You are answering Reachy Mini, a talking robot assistant. "
     "Reply in 1-2 short spoken sentences. "
     "A current reef-monitor snapshot is included in the user message. Use those numbers. "
     "Do not search the web. Do not invent values. Do not mention files, tools, or Apex."

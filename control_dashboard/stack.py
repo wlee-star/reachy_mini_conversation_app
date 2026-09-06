@@ -98,6 +98,17 @@ class StackController:
         self._user_stopped.discard(spec.id)
         self._save_stopped()
 
+    def acknowledge_intentional_stop(self, spec: ServiceSpec, *, reason: str = "sleep") -> dict[str, Any]:
+        """Record an expected exit so auto-restart will not treat it as a crash."""
+        with self._lifecycle_lock:
+            self._mark_stop_intent(spec, reason)
+            self._mark_user_stopped(spec)
+            self._owned.pop(spec.id, None)
+            self._save_owned()
+            self._restarts[spec.id] = 0
+            self._note("info", spec.id, f"{spec.name} stopped intentionally ({reason})")
+            return {"ok": True, "user_stopped": True, "reason": reason}
+
     def _note(self, level: str, service: str, message: str, technical: str | None = None) -> None:
         events.emit(level, service, message, technical=redact_text(technical) if technical else None)
         self._op_log.append(
@@ -240,6 +251,8 @@ class StackController:
 
     def _service_start_env(self, spec: ServiceSpec) -> dict[str, str] | None:
         """Pin the conversation app to the local simulator unless a physical host is set."""
+        if spec.id == "speech":
+            return {"NLTK_DATA": str(self.config.ai_stack_root / "nltk_data")}
         if spec.id != "conversation":
             return None
         host = (self.config.env.get("REACHY_DAEMON_HOST") or self.config.env.get("REACHY_DAEMON_URL") or "").strip()
@@ -337,7 +350,12 @@ class StackController:
                             executable = str(spec.start.get("executable") or "")
                             args = [str(arg) for arg in spec.start.get("args") or []]
                             cwd = Path(str(spec.start.get("cwd") or paths.REPO_ROOT))
-                            if not executable or not Path(executable).exists() and shutil_which(executable) is None:
+                            try:
+                                executable_exists = bool(executable) and Path(executable).exists()
+                            except OSError as exc:
+                                logger.warning("Cannot access %s executable %s: %s", spec.id, executable, exc)
+                                executable_exists = False
+                            if not executable or not executable_exists and shutil_which(executable) is None:
                                 finished = {
                                     "ok": False,
                                     "error": f"Cannot find {spec.name} executable: {executable}",
@@ -805,6 +823,8 @@ class StackController:
             self._lifecycle_lock.release()
 
     def _recover_locked(self) -> None:
+        # Pick up intentional stops written by the Conversation App during go_to_sleep.
+        self._load_stopped()
         for spec in self.config.services:
             if not spec.managed or not spec.auto_restart:
                 continue

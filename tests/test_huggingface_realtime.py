@@ -534,18 +534,20 @@ async def test_start_fast_dance_emotion_plays_dance1_once(monkeypatch: Any, capl
 
 @pytest.mark.asyncio
 async def test_unactivated_transcript_does_not_start_fast_paths(monkeypatch: Any) -> None:
-    """Commands without Wally must not reach Home Assistant, reef, or dance fast paths."""
+    """Commands without Reachy must not reach Home Assistant, reef, or dance fast paths."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     ha = MagicMock()
     bus = MagicMock()
     apex = MagicMock()
     time_cmd = MagicMock()
     dance = MagicMock()
+    sleep = MagicMock()
     monkeypatch.setattr(handler, "_start_fast_ha_command", ha)
     monkeypatch.setattr(handler, "_start_fast_bus_command", bus)
     monkeypatch.setattr(handler, "_start_fast_apex_command", apex)
     monkeypatch.setattr(handler, "_start_fast_time_command", time_cmd)
     monkeypatch.setattr(handler, "_start_fast_dance_emotion", dance)
+    monkeypatch.setattr(handler, "_start_fast_sleep_command", sleep)
     monkeypatch.setattr(handler, "_reject_unactivated_speech", AsyncMock())
 
     handler._handle_completed_user_transcript("Turn on lamp three.")
@@ -557,38 +559,42 @@ async def test_unactivated_transcript_does_not_start_fast_paths(monkeypatch: Any
     apex.assert_not_called()
     time_cmd.assert_not_called()
     dance.assert_not_called()
+    sleep.assert_not_called()
     assert handler._user_turn_authorized is False
 
 
 @pytest.mark.asyncio
-async def test_wally_transcript_starts_fast_paths(monkeypatch: Any) -> None:
-    """A leading Wally authorizes deterministic routes for this turn."""
+async def test_reachy_transcript_starts_fast_paths(monkeypatch: Any) -> None:
+    """A leading Reachy authorizes deterministic routes for this turn."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     ha = MagicMock()
     bus = MagicMock()
     apex = MagicMock()
     time_cmd = MagicMock()
     dance = MagicMock()
+    sleep = MagicMock()
     monkeypatch.setattr(handler, "_start_fast_ha_command", ha)
     monkeypatch.setattr(handler, "_start_fast_bus_command", bus)
     monkeypatch.setattr(handler, "_start_fast_apex_command", apex)
     monkeypatch.setattr(handler, "_start_fast_time_command", time_cmd)
     monkeypatch.setattr(handler, "_start_fast_dance_emotion", dance)
+    monkeypatch.setattr(handler, "_start_fast_sleep_command", sleep)
 
-    handler._handle_completed_user_transcript("Wally, turn on lamp three.")
+    handler._handle_completed_user_transcript("Reachy, turn on lamp three.")
 
     ha.assert_called_once()
     bus.assert_called_once()
     apex.assert_called_once()
     time_cmd.assert_called_once()
     dance.assert_called_once()
+    sleep.assert_called_once()
     assert handler._user_turn_authorized is True
     assert ha.call_args.args[0].lower() == "turn on lamp three."
 
 
 @pytest.mark.asyncio
 async def test_follow_up_transcript_stays_authorized_until_timeout(monkeypatch: Any) -> None:
-    """Follow-ups after Wally stay authorized until the session timeout."""
+    """Follow-ups after Reachy stay authorized until the session timeout."""
     now = {"t": 0.0}
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler._activation = ActivationSession(clock=lambda: now["t"])
@@ -597,14 +603,16 @@ async def test_follow_up_transcript_stays_authorized_until_timeout(monkeypatch: 
     apex = MagicMock()
     time_cmd = MagicMock()
     dance = MagicMock()
+    sleep = MagicMock()
     monkeypatch.setattr(handler, "_start_fast_ha_command", ha)
     monkeypatch.setattr(handler, "_start_fast_bus_command", bus)
     monkeypatch.setattr(handler, "_start_fast_apex_command", apex)
     monkeypatch.setattr(handler, "_start_fast_time_command", time_cmd)
     monkeypatch.setattr(handler, "_start_fast_dance_emotion", dance)
+    monkeypatch.setattr(handler, "_start_fast_sleep_command", sleep)
     monkeypatch.setattr(handler, "_reject_unactivated_speech", AsyncMock())
 
-    handler._handle_completed_user_transcript("Wally, what's the reef temperature?")
+    handler._handle_completed_user_transcript("Reachy, what's the reef temperature?")
     handler._handle_completed_user_transcript("What is the salinity?")
     assert apex.call_count == 2
     assert handler._user_turn_authorized is True
@@ -612,17 +620,55 @@ async def test_follow_up_transcript_stays_authorized_until_timeout(monkeypatch: 
     now["t"] = 31.0
     apex.reset_mock()
     ha.reset_mock()
+    sleep.reset_mock()
     handler._handle_completed_user_transcript("What is the alkalinity?")
     if handler._wake_reminder_task is not None:
         await handler._wake_reminder_task
     apex.assert_not_called()
     ha.assert_not_called()
+    sleep.assert_not_called()
     assert handler._user_turn_authorized is False
 
 
 @pytest.mark.asyncio
+async def test_authorized_transcript_cancels_pending_wake_reminder(monkeypatch: Any) -> None:
+    """A successful Reachy wake must cancel an in-flight wake reminder."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def slow_reject(turn: int) -> None:
+        started.set()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    ha = MagicMock()
+    monkeypatch.setattr(handler, "_start_fast_ha_command", ha)
+    monkeypatch.setattr(handler, "_start_fast_bus_command", MagicMock())
+    monkeypatch.setattr(handler, "_start_fast_apex_command", MagicMock())
+    monkeypatch.setattr(handler, "_start_fast_time_command", MagicMock())
+    monkeypatch.setattr(handler, "_start_fast_dance_emotion", MagicMock())
+    monkeypatch.setattr(handler, "_start_fast_sleep_command", MagicMock())
+    monkeypatch.setattr(handler, "_reject_unactivated_speech", slow_reject)
+
+    handler._handle_completed_user_transcript("What time is it?")
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    reminder_task = handler._wake_reminder_task
+    assert reminder_task is not None
+
+    handler._handle_completed_user_transcript("Reachy, hello")
+    assert handler._user_turn_authorized is True
+    assert handler._wake_reminder_task is None
+    await asyncio.wait_for(cancelled.wait(), timeout=1.0)
+    assert reminder_task.cancelled() or reminder_task.done()
+
+
+@pytest.mark.asyncio
 async def test_unactivated_llm_tool_call_is_not_started(monkeypatch: Any) -> None:
-    """LLM tool calls must not execute when the user has not said Wally."""
+    """LLM tool calls must not execute when the user has not said Reachy."""
     monkeypatch.setattr(hf_mod, "get_session_instructions", lambda _instance_path=None: "test")
     monkeypatch.setattr(hf_mod, "get_session_voice", lambda default=HF_DEFAULT_VOICE: "Aiden")
     monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
@@ -864,6 +910,124 @@ async def test_start_fast_time_command_ignores_bus_questions(monkeypatch: Any) -
     handler._start_fast_time_command("what time is the 311")
     assert handler._fast_time_task is None
     run.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "transcript",
+    [
+        "go to sleep",
+        "time to sleep",
+        "go to bed",
+        "sleep now",
+    ],
+)
+async def test_start_fast_sleep_command_runs_for_direct_commands(monkeypatch: Any, transcript: str) -> None:
+    """Direct sleep commands must take the deterministic go_to_sleep route."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    run = AsyncMock()
+    monkeypatch.setattr(handler, "_run_fast_sleep_command", run)
+
+    handler._start_fast_sleep_command(transcript)
+    assert handler._fast_sleep_task is not None
+    await handler._fast_sleep_task
+    run.assert_awaited_once()
+    assert handler._suppress_unsolicited_response_turn == handler._turn_generation
+
+
+@pytest.mark.asyncio
+async def test_start_fast_sleep_command_ignores_non_commands(monkeypatch: Any) -> None:
+    """Informational sleep talk must not invoke go_to_sleep."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    run = AsyncMock()
+    monkeypatch.setattr(handler, "_run_fast_sleep_command", run)
+
+    handler._start_fast_sleep_command("Why do people go to sleep?")
+    assert handler._fast_sleep_task is None
+    run.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reachy_go_to_sleep_starts_sleep_fast_path(monkeypatch: Any) -> None:
+    """Wake-authorized sleep commands, including STT name variants, route to sleep."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    sleep = MagicMock()
+    monkeypatch.setattr(handler, "_start_fast_ha_command", MagicMock())
+    monkeypatch.setattr(handler, "_start_fast_bus_command", MagicMock())
+    monkeypatch.setattr(handler, "_start_fast_apex_command", MagicMock())
+    monkeypatch.setattr(handler, "_start_fast_time_command", MagicMock())
+    monkeypatch.setattr(handler, "_start_fast_dance_emotion", MagicMock())
+    monkeypatch.setattr(handler, "_start_fast_sleep_command", sleep)
+
+    handler._handle_completed_user_transcript("Reachy, go to sleep")
+    sleep.assert_called_once()
+    assert sleep.call_args.args[0].lower() == "go to sleep"
+
+    sleep.reset_mock()
+    handler._handle_completed_user_transcript("Rishi, go to sleep.")
+    sleep.assert_called_once()
+    assert "go to sleep" in sleep.call_args.args[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_run_fast_sleep_command_invokes_tool_before_speech(monkeypatch: Any) -> None:
+    """Goodnight speech must follow a successful go_to_sleep tool result."""
+    go_to_sleep = MagicMock(
+        return_value={
+            "status": "sleeping",
+            "stop_current_app_requested": True,
+            "local_stop_requested": True,
+        }
+    )
+    handler = HuggingFaceRealtimeHandler(
+        ToolDependencies(
+            reachy_mini=MagicMock(),
+            movement_manager=MagicMock(),
+            go_to_sleep=go_to_sleep,
+        )
+    )
+    spoken: list[str] = []
+
+    async def capture_say(text: str, **_kwargs: Any) -> None:
+        spoken.append(text)
+
+    monkeypatch.setattr(handler, "_suppress_unsolicited_realtime", AsyncMock())
+    monkeypatch.setattr(handler, "say", capture_say)
+    monkeypatch.setattr(handler.output_queue, "put", AsyncMock())
+
+    await handler._run_fast_sleep_command()
+
+    go_to_sleep.assert_called_once_with()
+    assert spoken
+    assert "Goodnight." in spoken[0]
+
+
+@pytest.mark.asyncio
+async def test_run_fast_sleep_command_does_not_claim_success_on_failure(monkeypatch: Any) -> None:
+    """A failed sleep tool must not produce a spoken goodnight."""
+    go_to_sleep = MagicMock(return_value={"error": "go_to_sleep failed: RuntimeError: boom"})
+    handler = HuggingFaceRealtimeHandler(
+        ToolDependencies(
+            reachy_mini=MagicMock(),
+            movement_manager=MagicMock(),
+            go_to_sleep=go_to_sleep,
+        )
+    )
+    spoken: list[str] = []
+
+    async def capture_say(text: str, **_kwargs: Any) -> None:
+        spoken.append(text)
+
+    monkeypatch.setattr(handler, "_suppress_unsolicited_realtime", AsyncMock())
+    monkeypatch.setattr(handler, "say", capture_say)
+    monkeypatch.setattr(handler.output_queue, "put", AsyncMock())
+
+    await handler._run_fast_sleep_command()
+
+    go_to_sleep.assert_called_once_with()
+    assert spoken
+    assert "couldn't go to sleep" in spoken[0].lower()
+    assert "Goodnight." not in spoken[0]
 
 
 @pytest.mark.asyncio
@@ -1647,12 +1811,17 @@ async def test_fast_ha_success_plays_emotion(monkeypatch: Any) -> None:
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler.output_queue = asyncio.Queue()
     play = AsyncMock()
+    speak = AsyncMock()
     monkeypatch.setattr(hf_mod, "HomeAssistant", FakeHomeAssistant)
     monkeypatch.setattr(handler, "_play_device_success_emotion", play)
+    monkeypatch.setattr(handler, "_speak_ha_update", speak)
+    monkeypatch.setattr(handler, "_suppress_unsolicited_realtime", AsyncMock())
 
     await handler._run_fast_ha_commands([{"action": "turn_switch_on", "entity_id": "switch.lamp_3"}])
 
     play.assert_awaited_once()
+    speak.assert_awaited_once()
+    assert "Done" in speak.await_args.args[0]
 
 
 @pytest.mark.asyncio
@@ -1666,12 +1835,17 @@ async def test_fast_ha_failure_does_not_play_emotion(monkeypatch: Any) -> None:
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler.output_queue = asyncio.Queue()
     play = AsyncMock()
+    speak = AsyncMock()
     monkeypatch.setattr(hf_mod, "HomeAssistant", FakeHomeAssistant)
     monkeypatch.setattr(handler, "_play_device_success_emotion", play)
+    monkeypatch.setattr(handler, "_speak_ha_update", speak)
+    monkeypatch.setattr(handler, "_suppress_unsolicited_realtime", AsyncMock())
 
     await handler._run_fast_ha_commands([{"action": "turn_switch_on", "entity_id": "switch.missing"}])
 
     play.assert_not_awaited()
+    speak.assert_awaited_once()
+    assert "couldn't" in speak.await_args.args[0].lower() or "could not" in speak.await_args.args[0].lower()
 
 
 @pytest.mark.asyncio
@@ -1697,6 +1871,8 @@ async def test_fast_screen_up_success_plays_success_emotion_once(
     handler.output_queue = asyncio.Queue()
     monkeypatch.setattr(hf_mod, "HomeAssistant", FakeHomeAssistant)
     monkeypatch.setattr(hf_mod, "PlayEmotion", FakePlayEmotion)
+    monkeypatch.setattr(handler, "_speak_ha_update", AsyncMock())
+    monkeypatch.setattr(handler, "_suppress_unsolicited_realtime", AsyncMock())
 
     with caplog.at_level("INFO"):
         await handler._run_fast_ha_commands([{"action": "press_button", "entity_id": "button.screen_up"}])
@@ -1728,6 +1904,8 @@ async def test_fast_screen_up_failure_does_not_play_success_emotion(
     play = AsyncMock()
     monkeypatch.setattr(hf_mod, "HomeAssistant", FakeHomeAssistant)
     monkeypatch.setattr(handler, "_play_device_success_emotion", play)
+    monkeypatch.setattr(handler, "_speak_ha_update", AsyncMock())
+    monkeypatch.setattr(handler, "_suppress_unsolicited_realtime", AsyncMock())
 
     with caplog.at_level("INFO"):
         await handler._run_fast_ha_commands([{"action": "press_button", "entity_id": "button.screen_up"}])
@@ -1819,6 +1997,8 @@ async def test_screen_up_emotion_failure_does_not_fail_home_assistant(
     handler.output_queue = asyncio.Queue()
     monkeypatch.setattr(hf_mod, "HomeAssistant", FakeHomeAssistant)
     monkeypatch.setattr(hf_mod, "PlayEmotion", FakePlayEmotion)
+    monkeypatch.setattr(handler, "_speak_ha_update", AsyncMock())
+    monkeypatch.setattr(handler, "_suppress_unsolicited_realtime", AsyncMock())
 
     with caplog.at_level("INFO"):
         await handler._run_fast_ha_commands([{"action": "press_button", "entity_id": "button.screen_up"}])

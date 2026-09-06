@@ -1,0 +1,119 @@
+{
+  "version": 1,
+  "servers": [
+    {
+      "alias": "time",
+      "url": "http://127.0.0.1:8760/mcp",
+      "source": "manual",
+      "bearer_token": null,
+      "timeout_s": 10,
+      "enabled_tools": ["get_time"],
+      "tools": [
+        {
+          "local_name": "time__get_time",
+          "client_tool_name": "time__get_time",
+          "remote_name": "get_time",
+          "description": "Get the current date and time for an IANA timezone.",
+          "parameters_schema": {
+            "type": "object",
+            "properties": {
+              "timezone": {
+                "type": "string",
+                "description": "IANA timezone like Europe/Paris. Empty uses the local zone."
+              }
+            },
+            "required": []
+          }
+        }
+      ]
+    },
+    {
+      "alias": "apex",
+      "url": "http://127.0.0.1:8751/mcp",
+      "source": "hermes",
+      "bearer_token": null,
+      "timeout_s": 15,
+      "enabled_tools": ["get_temperature", "get_ph", "get_salinity", "get_status"],
+      "tools": [
+        {
+          "local_name": "apex__get_temperature",
+          "client_tool_name": "apex__get_temperature",
+          "remote_name": "get_temperature",
+          "description": "Read reef temperature from Neptune Apex.",
+          "parameters_schema": {"type": "object", "properties": {}, "required": []}
+        },
+        {
+          "local_name": "apex__get_ph",
+          "client_tool_name": "apex__get_ph",
+          "remote_name": "get_ph",
+          "description": "Read reef pH from Neptune Apex.",
+          "parameters_schema": {"type": "object", "properties": {}, "required": []}
+        },
+        {
+          "local_name": "apex__get_salinity",
+          "client_tool_name": "apex__get_salinity",
+          "remote_name": "get_salinity",
+          "description": "Read reef salinity from Neptune Apex.",
+          "parameters_schema": {"type": "object", "properties": {}, "required": []}
+        },
+        {
+          "local_name": "apex__get_status",
+          "client_tool_name": "apex__get_status",
+          "remote_name": "get_status",
+          "description": "Read a short Neptune Apex status summary.",
+          "parameters_schema": {"type": "object", "properties": {}, "required": []}
+        }
+      ]
+    },
+    {
+      "alias": "home_assistant",
+      "url": "http://127.0.0.1:8752/mcp",
+      "source": "hermes",
+      "bearer_token": null,
+      "timeout_s": 15,
+      "enabled_tools": ["get_temperature", "turn_on", "turn_off", "get_status"],
+      "tools": [
+        {
+          "local_name": "home_assistant__get_temperature",
+          "client_tool_name": "home_assistant__get_temperature",
+          "remote_name": "get_temperature",
+          "description": "Read an allowlisted Home Assistant temperature sensor.",
+          "parameters_schema": {
+            "type": "object",
+            "properties": {"entity_id": {"type": "string"}},
+            "required": []
+          }
+        },
+        {
+          "local_name": "home_assistant__turn_on",
+          "client_tool_name": "home_assistant__turn_on",
+          "remote_name": "turn_on",
+          "description": "Turn on an allowlisted Home Assistant entity.",
+          "parameters_schema": {
+            "type": "object",
+            "properties": {"entity_id": {"type": "string"}},
+            "required": ["entity_id"]
+          }
+        },
+        {
+          "local_name": "home_assistant__turn_off",
+          "client_tool_name": "home_assistant__turn_off",
+          "remote_name": "turn_off",
+          "description": "Turn off an allowlisted Home Assistant entity.",
+          "parameters_schema": {
+            "type": "object",
+            "properties": {"entity_id": {"type": "string"}},
+            "required": ["entity_id"]
+          }
+        },
+        {
+          "local_name": "home_assistant__get_status",
+          "client_tool_name": "home_assistant__get_status",
+          "remote_name": "get_status",
+          "description": "Read a short allowlisted Home Assistant status summary.",
+          "parameters_schema": {"type": "object", "properties": {}, "required": []}
+        }
+      ]
+    }
+  ]
+}

@@ -371,7 +371,7 @@ def test_match_apex_intent_leaves_trends_to_hermes() -> None:
         ("Can you ask Hermes how my pH is trending?", "trends", "ask_hermes", None),
         ("Ask Hermes about my reef tank.", "detailed_report", "ask_hermes", None),
         ("Reachy, ask Hermes what my Reef Tank report is.", "detailed_report", "ask_hermes", None),
-        ("Wally, ask Hermes what my Reef Tank report is.", "detailed_report", "ask_hermes", None),
+        ("Reachy, ask Hermes what my Reef Tank report is.", "detailed_report", "ask_hermes", None),
     ],
 )
 def test_classify_reef_intent_routes_status_and_reports(

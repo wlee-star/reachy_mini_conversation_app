@@ -1,0 +1,5 @@
+﻿# Physical Reachy Mini deployment notes (NOT active for local simulator development)
+# Restored from .env during surgical recovery 2026-09-06-0917
+REACHY_DAEMON_HOST=192.168.0.57
+REACHY_DAEMON_PORT=8000
+# Conversation app was removed from physical Reachy; do not redeploy until simulator stack is proven.

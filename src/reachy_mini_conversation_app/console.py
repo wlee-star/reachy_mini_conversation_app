@@ -8,6 +8,7 @@ import os
 import time
 import asyncio
 import logging
+import threading
 from typing import Any, List, Optional
 from pathlib import Path
 from collections.abc import Callable
@@ -53,15 +54,17 @@ from reachy_mini_conversation_app.conversation_handler import ConversationHandle
 
 try:
     # FastAPI is provided by the Reachy Mini Apps runtime
-    from fastapi import FastAPI, Response
+    from fastapi import FastAPI, Request, Response
     from pydantic import BaseModel
-    from fastapi.responses import FileResponse
+    from fastapi.responses import FileResponse, JSONResponse
     from starlette.staticfiles import StaticFiles
 except Exception:  # pragma: no cover - only loaded when settings_app is used
     FastAPI = object  # type: ignore
     FileResponse = object  # type: ignore
+    JSONResponse = object  # type: ignore
     StaticFiles = object  # type: ignore
     BaseModel = object  # type: ignore
+    Request = object  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -111,12 +114,14 @@ class LocalStream:
         instance_path: Optional[str] = None,
         handler_factory: HandlerFactory | None = None,
         startup_voice: Optional[str] = None,
+        safe_stop: Callable[[], dict[str, Any]] | None = None,
     ):
         """Initialize the stream with a realtime handler and pipelines.
 
         - ``settings_app``: the Reachy Mini Apps FastAPI to attach settings endpoints.
         - ``instance_path``: directory where per-instance ``.env`` should be stored.
         - ``handler_factory``: builds a fresh handler for the currently selected backend.
+        - ``safe_stop``: optional motors-safe stop that does not shut down the app.
         """
         self._robot = robot
         self._stop_event = asyncio.Event()
@@ -129,6 +134,12 @@ class LocalStream:
         self._settings_initialized = False
         self._asyncio_loop = None
         self._mic_muted = False  # mic starts live; the UI toggles it via the settings API
+        self._speaker_muted = False
+        self._safe_stop = safe_stop
+        self._motors_disabled = False
+        self._last_user_level = 0.0
+        self._last_assistant_level = 0.0
+        self._speaker_test_lock = threading.Lock()
         self._backend_connection_state = "not_started"
         self._backend_error: str | None = None
         self._backend_retry_delay = BACKEND_RETRY_DELAY_SECONDS
@@ -183,6 +194,10 @@ class LocalStream:
         except Exception:
             return
         level = max(0.0, min(1.0, rms * self._LEVEL_GAIN))
+        if role == "user":
+            self._last_user_level = level
+        elif role == "assistant":
+            self._last_assistant_level = level
         self._rpc.broadcast_threadsafe("conversation.level", {"role": role, "rms": round(level, 3)})
 
     # Map backend activity reasons to the orb's turn states (mirrors the old
@@ -602,6 +617,8 @@ class LocalStream:
                 logger.info("Microphone %s via /rpc", "muted" if self._mic_muted else "unmuted")
             return {"muted": self._mic_muted}
 
+        self._mount_dashboard_routes(settings_app)
+
         @rpc.method("backend.config")  # type: ignore[untyped-decorator]
         def _rpc_backend_config(params: dict[str, object]) -> dict[str, object]:
             hf_selection = get_hf_connection_selection()
@@ -906,6 +923,134 @@ class LocalStream:
             except asyncio.QueueEmpty:
                 break
 
+    def _dashboard_status_payload(self) -> dict[str, Any]:
+        """Return live audio/camera/robot fields for the physical control dashboard."""
+        media = self._robot.media
+        input_rate: int | None = None
+        output_rate: int | None = None
+        try:
+            input_rate = int(media.get_input_audio_samplerate())
+        except Exception as exc:
+            logger.debug("Input sample rate unavailable: %s", exc)
+        try:
+            output_rate = int(media.get_output_audio_samplerate())
+        except Exception as exc:
+            logger.debug("Output sample rate unavailable: %s", exc)
+
+        mic_status = "muted" if self._mic_muted else ("listening" if self._last_user_level > 0.02 else "idle")
+        speaker_status = "muted" if self._speaker_muted else "ready"
+        camera_status = "ready"
+        camera_summary = "Camera is served through the Reachy Mini media manager (no second pipeline)."
+        if getattr(media, "get_frame_jpeg", None) is None:
+            camera_status = "offline"
+            camera_summary = "Camera API unavailable on this media backend."
+
+        return {
+            "microphone_status": mic_status,
+            "microphone_summary": f"Microphone is {mic_status}.",
+            "microphone_muted": self._mic_muted,
+            "microphone_level": round(self._last_user_level, 3),
+            "input_sample_rate": input_rate,
+            "speaker_status": speaker_status,
+            "speaker_summary": f"Speaker is {speaker_status}.",
+            "speaker_muted": self._speaker_muted,
+            "speaker_level": round(self._last_assistant_level, 3),
+            "output_sample_rate": output_rate,
+            "volume_control": False,
+            "volume_control_summary": (
+                "Volume control unavailable — ReachyMini/MediaManager has no client volume API "
+                "(daemon /volume exists but is not wired through Reachy's audio path)."
+            ),
+            "camera_status": camera_status,
+            "camera_summary": camera_summary,
+            "safe_stop_available": self._safe_stop is not None,
+            "safe_stop_summary": (
+                "SAFE STOP: disable_wobbling → stop moves → disable_motors. "
+                "Not goto_sleep. Does not stop Reachy, Hermes, or the dashboard. "
+                "Motors stay disabled until explicitly re-enabled elsewhere."
+                if self._safe_stop is not None
+                else "Safe stop unavailable"
+            ),
+            "motors_status": "DISABLED" if self._motors_disabled else "UNKNOWN",
+            "robot_state": self._last_turn_state or "IDLE",
+            "backend_connection": self._backend_connection_state,
+        }
+
+    def _mount_dashboard_routes(self, settings_app: FastAPI) -> None:
+        """HTTP control surface for the physical AI-stack dashboard (reuses this media pipeline)."""
+
+        @settings_app.get("/api/dashboard/status")
+        def _dashboard_status() -> dict[str, Any]:
+            return self._dashboard_status_payload()
+
+        @settings_app.post("/api/dashboard/mic")
+        async def _dashboard_mic(request: Request) -> dict[str, Any]:
+            payload = await request.json()
+            if isinstance(payload, dict) and "muted" in payload:
+                self._mic_muted = bool(payload["muted"])
+                logger.info("Microphone %s via dashboard API", "muted" if self._mic_muted else "unmuted")
+            return {"ok": True, "muted": self._mic_muted, **self._dashboard_status_payload()}
+
+        @settings_app.post("/api/dashboard/speaker")
+        async def _dashboard_speaker(request: Request) -> dict[str, Any]:
+            payload = await request.json()
+            if isinstance(payload, dict) and "muted" in payload:
+                self._speaker_muted = bool(payload["muted"])
+                logger.info("Speaker %s via dashboard API", "muted" if self._speaker_muted else "unmuted")
+            return {"ok": True, "muted": self._speaker_muted, **self._dashboard_status_payload()}
+
+        @settings_app.post("/api/dashboard/speaker/test")
+        def _dashboard_speaker_test() -> dict[str, Any]:
+            if not self._speaker_test_lock.acquire(blocking=False):
+                return {"ok": False, "error": "Speaker test already running."}
+            try:
+                if self._speaker_muted:
+                    return {"ok": False, "error": "Speaker is muted."}
+                try:
+                    import reachy_mini as reachy_mini_pkg
+
+                    sound = Path(reachy_mini_pkg.__file__).resolve().parent / "assets" / "count.wav"
+                except Exception as exc:
+                    logger.warning("Could not resolve speaker test asset: %s", exc)
+                    return {"ok": False, "error": "Speaker test sound unavailable."}
+                if not sound.is_file():
+                    return {"ok": False, "error": f"Speaker test sound missing: {sound.name}"}
+                try:
+                    self._robot.media.play_sound(str(sound))
+                except Exception as exc:
+                    logger.warning("Speaker test failed: %s", exc)
+                    return {"ok": False, "error": f"Speaker test failed: {type(exc).__name__}: {exc}"}
+                logger.info("Speaker test played %s", sound.name)
+                return {"ok": True, "sound": sound.name}
+            finally:
+                self._speaker_test_lock.release()
+
+        @settings_app.get("/api/dashboard/camera.jpg")
+        def _dashboard_camera() -> Response:
+            try:
+                jpeg = self._robot.media.get_frame_jpeg()
+            except Exception as exc:
+                logger.warning("Dashboard camera frame failed: %s", exc)
+                return JSONResponse({"error": f"camera unavailable: {type(exc).__name__}"}, status_code=503)
+            if not jpeg:
+                return JSONResponse({"error": "no frame"}, status_code=503)
+            return Response(content=jpeg, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+        @settings_app.post("/api/dashboard/safe-stop")
+        def _dashboard_safe_stop() -> dict[str, Any]:
+            if self._safe_stop is None:
+                return {"ok": False, "error": "Safe stop unavailable"}
+            logger.info("Safe stop requested via dashboard API")
+            try:
+                result = self._safe_stop()
+            except Exception as exc:
+                logger.error("Safe stop failed: %s", exc)
+                return {"ok": False, "error": f"Safe stop failed: {type(exc).__name__}: {exc}"}
+            payload = result if isinstance(result, dict) else {"status": "ok"}
+            if payload.get("status") == "motors_disabled":
+                self._motors_disabled = True
+            return {"ok": True, **payload, **self._dashboard_status_payload()}
+
     async def record_loop(self) -> None:
         """Read mic frames from the recorder and forward them to the handler."""
         input_sample_rate = self._robot.media.get_input_audio_samplerate()
@@ -958,8 +1103,9 @@ class LocalStream:
                 # Cast if needed
                 audio_frame = audio_to_float32(audio_data)
 
-                self._robot.media.push_audio_sample(audio_frame)
-                self._emit_level("assistant", audio_frame)
+                if not self._speaker_muted:
+                    self._robot.media.push_audio_sample(audio_frame)
+                    self._emit_level("assistant", audio_frame)
 
             else:
                 logger.debug("Ignoring output type=%s", type(handler_output).__name__)

@@ -16,6 +16,15 @@ def test_parse_args_accepts_no_sim(monkeypatch: pytest.MonkeyPatch) -> None:
     assert args.no_sim is True
 
 
+def test_parse_args_accepts_no_motion(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--no-motion allows media startup while motors remain disabled."""
+    monkeypatch.setattr("sys.argv", ["reachy-mini-conversation-app", "--no-motion"])
+
+    args, _unknown = parse_args()
+
+    assert args.no_motion is True
+
+
 @pytest.mark.parametrize(
     ("no_sim", "daemon_host", "expected"),
     [

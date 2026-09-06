@@ -155,7 +155,11 @@ def run(
             logger.error("Please check your configuration and try again.")
             sys.exit(1)
 
-    app_lifecycle.prepare_robot_for_conversation(robot, logger)
+    no_motion = bool(getattr(args, "no_motion", False))
+    if no_motion:
+        logger.info("No-motion mode: leaving motors disabled and skipping startup wake movement.")
+    else:
+        app_lifecycle.prepare_robot_for_conversation(robot, logger)
 
     movement_manager = MovementManager(current_robot=robot)
 
@@ -215,6 +219,33 @@ def run(
     go_to_sleep_lock = threading.Lock()
     go_to_sleep_requested = threading.Event()
 
+    def safe_stop_motors() -> dict[str, Any]:
+        """Stop moves and disable motors; does not goto_sleep or shut down the app."""
+        logger.info("Safe stop: disabling wobble, stopping moves, disabling motors.")
+        errors: list[str] = []
+        try:
+            robot.disable_wobbling()
+        except Exception as e:
+            logger.debug("Error disabling wobbling during safe stop: %s", e)
+            errors.append(f"disable_wobbling: {type(e).__name__}")
+        try:
+            movement_manager.stop(reset_to_neutral=False)
+        except Exception as e:
+            logger.error("Failed to stop moves during safe stop: %s", e)
+            errors.append(f"stop_moves: {type(e).__name__}")
+        try:
+            robot.disable_motors()
+        except Exception as e:
+            logger.error("Failed to disable motors during safe stop: %s", e)
+            errors.append(f"disable_motors: {type(e).__name__}")
+            return {"status": "error", "error": "; ".join(errors)}
+        result: dict[str, Any] = {"status": "motors_disabled"}
+        if errors:
+            result["warnings"] = errors
+        return result
+
+    stream_manager._safe_stop = safe_stop_motors
+
     def go_to_sleep_and_stop_app() -> dict[str, Any]:
         """Put Reachy Mini to sleep, then stop the current app."""
         if not go_to_sleep_lock.acquire(blocking=False):
@@ -226,6 +257,7 @@ def run(
             go_to_sleep_requested.set()
 
             logger.info("Going to sleep before stopping conversation app.")
+            app_lifecycle.acknowledge_dashboard_sleep_stop(logger)
             sleep_error: str | None = None
 
             try:
@@ -286,14 +318,16 @@ def run(
         sys.exit(1)
 
     # Each async service → its own thread/loop
-    movement_manager.start()
+    if not no_motion:
+        movement_manager.start()
     # Audio-reactive head motion is driven by the daemon's wobbler, which
     # taps the media pipeline at push_audio_sample. The console stream pushes
     # assistant audio through that pipeline directly.
-    try:
-        robot.enable_wobbling()
-    except Exception as e:
-        logger.warning("Could not enable wobbling at startup: %s", e)
+    if not no_motion:
+        try:
+            robot.enable_wobbling()
+        except Exception as e:
+            logger.warning("Could not enable wobbling at startup: %s", e)
 
     timeout_minutes = resolve_app_timeout_minutes()
     if timeout_minutes is not None:

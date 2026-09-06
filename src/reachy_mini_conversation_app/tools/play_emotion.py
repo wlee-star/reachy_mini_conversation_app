@@ -180,7 +180,7 @@ _DANCE_REQUEST_RE = re.compile(
     r"(?:"
     r"^(?:please )?danc(?:e|es|ing)?(?: for me)?(?: please)?$"
     r"|lets danc"
-    r"|(?:can|could|will|would) (?:you |reachy |wally )?(?:please )?danc"
+    r"|(?:can|could|will|would) (?:you |reachy )?(?:please )?danc"
     r"|(?:can|could|will|would) you (?:please )?(?:show me )?how (?:you |to )?danc"
     r"|do you (?:know how (?:to |you )?|wanna |want to )?danc"
     r"|(?:i )?(?:want to|wanna) (?:see |watch )?(?:you )?danc"

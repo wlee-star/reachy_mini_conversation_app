@@ -575,6 +575,41 @@ def is_device_control_success(result: dict[str, Any] | None, error: str | None) 
     return result.get("status") == "success" and bool(result.get("service"))
 
 
+def spoken_ha_control_result(result: dict[str, Any]) -> str:
+    """Return a short spoken confirmation for a Home Assistant control result."""
+    spoken = result.get("spoken")
+    if isinstance(spoken, str) and spoken.strip():
+        return spoken.strip()
+    if "error" in result:
+        error = result.get("error")
+        return str(error) if error else "I couldn't complete that Home Assistant action."
+    if result.get("status") == "uncertain":
+        return "I couldn't confirm that the device changed."
+    if result.get("status") != "success":
+        return "I couldn't complete that Home Assistant action."
+
+    entity_id = result.get("entity_id")
+    service = str(result.get("service") or "")
+    brightness = result.get("brightness_pct")
+    kelvin = result.get("color_temp_kelvin")
+    bedroom = entity_id == _BEDROOM_LAMP_ENTITY_ID
+    label = "the bedroom light" if bedroom else "that device"
+
+    if service.endswith("turn_off"):
+        return f"Done, {label} is off."
+    if isinstance(brightness, int) and isinstance(kelvin, int):
+        return f"Done, {label} is on at {brightness} percent and {kelvin} kelvin."
+    if isinstance(brightness, int):
+        return f"Done, {label} is on at {brightness} percent."
+    if isinstance(kelvin, int):
+        return f"Done, {label} is set to {kelvin} kelvin."
+    if service.endswith("press") or service == "button.press":
+        return f"Done, I pressed {label}."
+    if service.endswith("turn_on") or bedroom:
+        return f"Done, {label} is on."
+    return "Done."
+
+
 def is_screen_up_command(action: object, entity_id: object) -> bool:
     """Return whether this Home Assistant call is the Screen Up button press."""
     return action == "press_button" and entity_id == SCREEN_UP_ENTITY_ID

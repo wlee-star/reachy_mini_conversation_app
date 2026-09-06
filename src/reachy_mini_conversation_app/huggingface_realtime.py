@@ -60,6 +60,7 @@ from reachy_mini_conversation_app.tools.core_tools import (
     ToolDependencies,
     get_tool_specs,
 )
+from reachy_mini_conversation_app.tools.go_to_sleep import GoToSleep, match_sleep_intent
 from reachy_mini_conversation_app.startup_diagnostic import (
     deliver_boot_sequence,
     boot_sequence_already_delivered,
@@ -77,6 +78,7 @@ from reachy_mini_conversation_app.tools.home_assistant import (
     is_screen_up_command,
     is_screen_up_success,
     match_fast_ha_commands,
+    spoken_ha_control_result,
     is_device_control_success,
 )
 from reachy_mini_conversation_app.tools.tool_constants import ToolState
@@ -130,6 +132,11 @@ _APEX_ALERT_PROMPT: Final[str] = (
     "Use the probe names and numbers as written. Do not convert them, do not add a "
     "percentage, unit, or salinity claim, and do not mention tools or Apex: {text}"
 )
+_HA_ALERT_PROMPT: Final[str] = (
+    "Speak this exact Home Assistant result to the user now, in one short sentence. "
+    "Do not invent a different outcome, do not mention tools or Home Assistant, "
+    "and do not add extra explanation: {text}"
+)
 _HERMES_REEF_ALERT_PROMPT: Final[str] = (
     "Speak this exact reef report to the user now. Keep any 'not current' or 'cached' "
     "disclaimer verbatim. Do not invent, estimate, or update reef numbers. Do not call "
@@ -139,6 +146,9 @@ _REEF_SOURCE_ALERT_PROMPT: Final[str] = (
     "Speak this exact sentence to the user now. Do not call tools. Do not add extra explanation: {text}"
 )
 _WAKE_REMINDER_PROMPT: Final[str] = (
+    "Speak this exact sentence to the user now, then stop. Do not call tools. Do not add extra explanation: {text}"
+)
+_SLEEP_ALERT_PROMPT: Final[str] = (
     "Speak this exact sentence to the user now, then stop. Do not call tools. Do not add extra explanation: {text}"
 )
 _COMPETING_REEF_TOOLS: Final[frozenset[str]] = frozenset({"apex", "reef_status"})
@@ -387,12 +397,14 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._fast_apex_task: asyncio.Task[None] | None = None
         self._fast_time_task: asyncio.Task[None] | None = None
         self._fast_dance_task: asyncio.Task[None] | None = None
+        self._fast_sleep_task: asyncio.Task[None] | None = None
         self._fast_hermes_reef_task: asyncio.Task[None] | None = None
         self._bus_monitor_start_task: asyncio.Task[None] | None = None
         self._bus_spoke_turn: int | None = None
         self._apex_spoke_turn: int | None = None
         self._hermes_spoke_turn: int | None = None
         self._time_spoke_turn: int | None = None
+        self._ha_fast_path_owns_turn: int | None = None
         self._reef_router_owns_turn: int | None = None
         self._reef_router_route: ReefRoute | None = None
         self._last_reef_response_source: str | None = None
@@ -450,12 +462,22 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         commands = match_fast_ha_commands(transcript)
         if not commands:
             return
+        self._ha_fast_path_owns_turn = self._turn_generation
+        self._claim_deterministic_route()
         self._fast_ha_task = asyncio.create_task(
             self._run_fast_ha_commands(commands),
             name="ha-fast-path",
         )
 
+    async def _speak_ha_update(self, text: str) -> None:
+        """Speak a deterministic Home Assistant confirmation through the realtime session."""
+        try:
+            await self.say(_HA_ALERT_PROMPT.format(text=text), **_TOOL_FOLLOWUP_CREATE_KWARGS)
+        except Exception as exc:
+            logger.warning("[HA] fast-path speech failed: %s", exc)
+
     async def _run_fast_ha_commands(self, commands: list[dict[str, Any]]) -> None:
+        await self._suppress_unsolicited_realtime()
         for command in commands:
             screen_up = is_screen_up_command(command.get("action"), command.get("entity_id"))
             if screen_up:
@@ -469,6 +491,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 if screen_up:
                     logger.warning("[SCREEN UP] Home Assistant turn-on failed")
                     logger.info("[SCREEN UP] success emotion skipped")
+                await self._speak_ha_update("I couldn't complete that Home Assistant action.")
                 continue
             logger.info(
                 "[HA] fast-path finished in %.0f ms: %s",
@@ -481,6 +504,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 None,
                 screen_up=screen_up,
             )
+            if isinstance(result, dict):
+                spoken = spoken_ha_control_result(result)
+                logger.info("[HA] fast-path spoken=%s", spoken)
+                await self._speak_ha_update(spoken)
 
     def _start_fast_bus_command(self, transcript: str) -> None:
         manager = get_bus_monitor()
@@ -567,6 +594,46 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             await self._cancel_active_realtime_response()
         await self._speak_time_update(spoken)
         logger.info("[TIME] fast-path finished in %.0f ms", (time.perf_counter() - started) * 1000)
+
+    def _start_fast_sleep_command(self, transcript: str) -> None:
+        if not match_sleep_intent(transcript):
+            return
+        self._claim_deterministic_route()
+        self._fast_sleep_task = asyncio.create_task(self._run_fast_sleep_command(), name="sleep-fast-path")
+
+    async def _speak_sleep_update(self, text: str) -> None:
+        """Speak a short sleep confirmation or failure after the tool result is known."""
+        try:
+            await self.say(_SLEEP_ALERT_PROMPT.format(text=text), **_TOOL_FOLLOWUP_CREATE_KWARGS)
+        except Exception as exc:
+            logger.warning("[SLEEP] fast-path speech failed: %s", exc)
+
+    async def _run_fast_sleep_command(self) -> None:
+        """Run go_to_sleep before any spoken goodnight; never claim sleep on failure."""
+        await self._suppress_unsolicited_realtime()
+        started = time.perf_counter()
+        logger.info("[SLEEP] fast-path executing go_to_sleep")
+        try:
+            result = await GoToSleep()(self.deps)
+        except Exception as exc:
+            logger.warning("[SLEEP] fast-path failed: %s", exc)
+            await self._speak_sleep_update("I couldn't go to sleep.")
+            return
+        await self.output_queue.put(AdditionalOutputs({"role": "assistant", "content": json.dumps(result)}))
+        logger.info(
+            "[SLEEP] fast-path finished in %.0f ms: %s",
+            (time.perf_counter() - started) * 1000,
+            result,
+        )
+        if not isinstance(result, dict):
+            await self._speak_sleep_update("I couldn't go to sleep.")
+            return
+        if result.get("error") or result.get("status") != "sleeping":
+            if result.get("status") == "already_requested":
+                return
+            await self._speak_sleep_update("I couldn't go to sleep.")
+            return
+        await self._speak_sleep_update("Goodnight.")
 
     def _claim_deterministic_route(self) -> None:
         """Own this turn as soon as a deterministic reef/bus/HA route is known."""
@@ -780,7 +847,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._dance_emotion_played = False
 
     def _handle_completed_user_transcript(self, transcript: str) -> None:
-        """Apply Wally activation, then start deterministic routes only when authorized."""
+        """Apply Reachy activation, then start deterministic routes only when authorized."""
         self._user_speech_in_progress = False
         self._turn_user_done_at = time.perf_counter()
         self._turn_response_created_at = None
@@ -801,33 +868,70 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._drop_active_response_output = False
         self._reef_router_owns_turn = None
         self._reef_router_route = None
+        self._ha_fast_path_owns_turn = None
         decision = self._activation.evaluate(transcript)
         self._user_turn_authorized = decision.authorized
         if not decision.authorized:
             self._claim_deterministic_route()
-            if self._wake_reminder_task is not None and not self._wake_reminder_task.done():
-                self._wake_reminder_task.cancel()
-            self._wake_reminder_task = asyncio.create_task(
-                self._reject_unactivated_speech(),
-                name="wally-wake-reminder",
-            )
+            self._cancel_wake_reminder(start_new=True)
             return
-        logger.info("Wally processing request")
+        # A successful wake must kill any in-flight "Please say Reachy first" speech.
+        self._cancel_wake_reminder(start_new=False)
+        logger.info("Reachy processing request")
         command = decision.command_text or transcript
         self._start_fast_ha_command(command)
         self._start_fast_bus_command(command)
         self._start_fast_apex_command(command)
         self._start_fast_time_command(command)
         self._start_fast_dance_emotion(command)
+        self._start_fast_sleep_command(command)
 
-    async def _reject_unactivated_speech(self) -> None:
-        """Block model/tool side effects and remind the user to say Wally."""
+    def _cancel_wake_reminder(self, *, start_new: bool) -> None:
+        """Cancel a pending wake reminder; optionally start a fresh one for this turn."""
+        if self._wake_reminder_task is not None and not self._wake_reminder_task.done():
+            self._wake_reminder_task.cancel()
+        self._wake_reminder_task = None
+        self._drop_queued_responses(reason="wake_reminder")
+        if self._active_response_reason == "wake_reminder" and not self._response_done_event.is_set():
+            self._drop_active_response_output = True
+            asyncio.create_task(self._cancel_active_realtime_response(), name="cancel-wake-reminder")
+        if start_new:
+            turn = self._turn_generation
+            self._wake_reminder_task = asyncio.create_task(
+                self._reject_unactivated_speech(turn),
+                name="reachy-wake-reminder",
+            )
+
+    def _drop_queued_responses(self, *, reason: str) -> None:
+        """Remove queued response.create payloads matching ``reason`` without losing others."""
+        kept: list[tuple[str, dict[str, Any]]] = []
+        while True:
+            try:
+                item = self._pending_responses.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if item[0] == reason:
+                continue
+            kept.append(item)
+        for item in kept:
+            self._pending_responses.put_nowait(item)
+
+    async def _reject_unactivated_speech(self, turn: int) -> None:
+        """Block model/tool side effects and remind the user to say Reachy."""
         await self._suppress_unsolicited_realtime()
+        if turn != self._turn_generation or self._user_turn_authorized:
+            return
         reminder = wake_reminder_text()
         try:
-            await self.say(_WAKE_REMINDER_PROMPT.format(text=reminder), **_TOOL_FOLLOWUP_CREATE_KWARGS)
+            await self.say(
+                _WAKE_REMINDER_PROMPT.format(text=reminder),
+                reason="wake_reminder",
+                **_TOOL_FOLLOWUP_CREATE_KWARGS,
+            )
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
-            logger.warning("Wally wake reminder failed: %s", exc)
+            logger.warning("Reachy wake reminder failed: %s", exc)
 
     def _value_from_tool_args(self, args_json: str, key: str) -> object:
         try:
@@ -1417,6 +1521,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             raise ValueError("say: empty text")
         if not self.connection:
             raise RuntimeError("say: no active session")
+        reason_obj = create_kwargs.pop("reason", "say")
+        reason = reason_obj if isinstance(reason_obj, str) and reason_obj else "say"
         await self.connection.conversation.item.create(
             item={
                 "type": "message",
@@ -1425,7 +1531,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             },
         )
         self._mark_activity("say")
-        await self._safe_response_create(reason="say", **create_kwargs)
+        await self._safe_response_create(reason=reason, **create_kwargs)
 
     async def _cancel_active_realtime_response(self) -> None:
         """Cancel the in-flight realtime response, if the server accepts cancel."""
@@ -2046,6 +2152,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         call_id: str = str(getattr(event, "call_id", uuid.uuid4()))
 
                         skip_deterministic_tool = False
+                        if isinstance(tool_name, str) and self._ha_fast_path_owns_turn == self._turn_generation:
+                            if tool_name == "home_assistant":
+                                logger.info("[HA] skipping competing home_assistant; response_owner=deterministic")
+                                skip_deterministic_tool = True
                         if isinstance(tool_name, str) and self._reef_router_owns_turn == self._turn_generation:
                             if tool_name in _COMPETING_REEF_TOOLS:
                                 logger.info(
@@ -2078,7 +2188,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                         if not self._user_turn_authorized:
                             logger.info(
-                                "Wally activation required; skipping tool %s call_id=%s",
+                                "Reachy activation required; skipping tool %s call_id=%s",
                                 tool_name,
                                 call_id,
                             )
@@ -2087,7 +2197,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                     item={
                                         "type": "function_call_output",
                                         "call_id": call_id,
-                                        "output": json.dumps({"error": "Wally activation required"}),
+                                        "output": json.dumps({"error": "Reachy activation required"}),
                                     },
                                 )
                             continue
@@ -2344,6 +2454,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if self._fast_dance_task is not None:
             self._fast_dance_task.cancel()
             self._fast_dance_task = None
+        if self._fast_sleep_task is not None:
+            self._fast_sleep_task.cancel()
+            self._fast_sleep_task = None
         if self._bus_monitor_start_task is not None:
             self._bus_monitor_start_task.cancel()
             self._bus_monitor_start_task = None

@@ -37,13 +37,11 @@ def test_default_profile_sends_tank_trends_to_ask_hermes() -> None:
     assert "handle that new request" in instructions.lower()
 
 
-def test_default_profile_identifies_wally_on_reachy_mini() -> None:
-    """The default personality is Wally running on Reachy Mini, not Reachy-as-assistant."""
+def test_default_profile_identifies_reachy_mini() -> None:
+    """The default personality identifies itself as Reachy Mini."""
     instructions = read_packaged_default_profile().instructions
-    assert "You are Wally" in instructions
-    assert "Never identify yourself as Reachy" in instructions
-    assert "Reachy Mini is the robot" in instructions
-    assert "You are Reachy Mini:" not in instructions
+    assert "You are Reachy Mini:" in instructions
+    assert "When asked your name, say Reachy Mini." in instructions
 
 
 def test_default_profile_sends_live_tank_status_to_apex() -> None:

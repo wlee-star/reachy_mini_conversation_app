@@ -13,6 +13,7 @@ import numpy as np
 
 from reachy_mini import ReachyMini
 from reachy_mini_conversation_app.config import (
+    DEFAULT_ASSISTANT_NAME,
     config,
     get_hf_direct_ws_url,
     parse_hf_realtime_url,
@@ -206,7 +207,8 @@ def build_greeting_instruction(clock: SydneyClock) -> str:
     return (
         "Speak this startup line now, in character, as 1-2 short sentences. "
         f"Address the user as {USER_DISPLAY_NAME}. Do not ask a question or add extra topics. "
-        f"{clock.greeting} I'm Wally. It's {clock.spoken_datetime} here in Sydney. "
+        f"{clock.greeting} I'm {getattr(config, 'ASSISTANT_NAME', DEFAULT_ASSISTANT_NAME)}. "
+        f"It's {clock.spoken_datetime} here in Sydney. "
         "I'm running my startup diagnostics now."
     )
 
@@ -389,9 +391,24 @@ def _bundled_speech_component(name: str, speech: SubsystemResult, detail: str) -
     return _result(name, speech.status, speech.detail or detail)
 
 
+def _llama_base_url() -> str:
+    """Return llama.cpp base URL; use the speech realtime host when configured (LAN-safe)."""
+    host = _LLAMA_HOST
+    ws_url = get_hf_direct_ws_url()
+    if ws_url:
+        try:
+            parsed = parse_hf_realtime_url(ws_url)
+        except ValueError:
+            parsed = None
+        if parsed is not None and parsed.host:
+            host = parsed.host
+    return f"http://{host}:{_LLAMA_PORT}"
+
+
 async def _check_llama(client: httpx.AsyncClient) -> SubsystemResult:
-    health_url = f"http://{_LLAMA_HOST}:{_LLAMA_PORT}/health"
-    models_url = f"http://{_LLAMA_HOST}:{_LLAMA_PORT}/v1/models"
+    base = _llama_base_url()
+    health_url = f"{base}/health"
+    models_url = f"{base}/v1/models"
     health_code, _, health_error = await _http_get(client, health_url)
     models_code, models_payload, models_error = await _http_get(client, models_url)
     if health_code == 200 and models_code == 200:

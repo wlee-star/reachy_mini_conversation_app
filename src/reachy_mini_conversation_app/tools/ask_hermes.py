@@ -252,7 +252,7 @@ def _hermes_reef_result(
         age_seconds,
         elapsed,
     )
-    logger.info("[REEF] returning Hermes Reef report to Wally request_id=%s trend_keys=%s", request_id, trend_keys)
+    logger.info("[REEF] returning Hermes Reef report to Reachy request_id=%s trend_keys=%s", request_id, trend_keys)
     _log_hermes_result(
         request_id=request_id,
         status=status,
@@ -319,7 +319,7 @@ def _cached_history_result(
     logger.info("[REEF] cache present request_id=%s", request_id)
     logger.info("[REEF] using cached Hermes Reef report request_id=%s", request_id)
     logger.info("[REEF] cache age=%s request_id=%s", age_seconds, request_id)
-    logger.info("[REEF] returning cached report to Wally request_id=%s status=%s", request_id, status)
+    logger.info("[REEF] returning cached report to Reachy request_id=%s status=%s", request_id, status)
     logger.info("[REEF] stale=true source=cache cache_used=true request_id=%s trend_keys=%s", request_id, trend_keys)
     _log_hermes_result(
         request_id=request_id,

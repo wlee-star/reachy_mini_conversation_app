@@ -1,5 +1,7 @@
 """Helpers for app startup and shutdown lifecycle behavior."""
 
+import os
+import json
 import time
 import asyncio
 import logging
@@ -13,7 +15,7 @@ import numpy.typing as npt
 from reachy_mini import ReachyMini
 from reachy_mini.reachy_mini import SLEEP_HEAD_POSE
 from reachy_mini.utils.interpolation import distance_between_poses
-from reachy_mini_conversation_app.config import config, set_custom_profile
+from reachy_mini_conversation_app.config import PROJECT_ROOT, config, set_custom_profile
 from reachy_mini_conversation_app.profile_store import DEFAULT_PROFILE_NAME, migrate_legacy_profiles
 from reachy_mini_conversation_app.tools.core_tools import ToolDependencies, initialize_tools
 from reachy_mini_conversation_app.tools.go_to_sleep import GoToSleep
@@ -23,6 +25,51 @@ _STOP_CURRENT_APP_PATH = "/api/apps/stop-current-app"
 _STOP_CURRENT_APP_TIMEOUT_S = 2.0
 _SLEEP_HEAD_TRANSLATION_TOLERANCE_M = 0.05
 _SLEEP_HEAD_ROTATION_TOLERANCE_RAD = 0.35
+_DASHBOARD_STOPPED_PATH = PROJECT_ROOT / "control_dashboard" / "runtime" / "stopped.json"
+_CONVERSATION_SERVICE_ID = "conversation"
+_DASHBOARD_ACK_STOP_TIMEOUT_S = 2.0
+
+
+def acknowledge_dashboard_sleep_stop(logger: logging.Logger) -> None:
+    """Mark Conversation App as intentionally stopped before exiting for sleep.
+
+    Writes ``stopped.json`` so the dashboard recovery loop will not treat the
+    exit as a crash, and best-effort notifies the live dashboard process.
+    """
+    try:
+        _append_stopped_service(_CONVERSATION_SERVICE_ID)
+        logger.info("Marked Conversation App as intentionally stopped for sleep")
+    except OSError as exc:
+        logger.warning("Failed to write dashboard stopped state for sleep: %s", exc)
+
+    base = (os.environ.get("CONTROL_DASHBOARD_URL") or "http://127.0.0.1:8788").rstrip("/")
+    url = f"{base}/api/services/{_CONVERSATION_SERVICE_ID}/ack_stop"
+    request = urllib.request.Request(url, data=b"{}", method="POST")
+    request.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(request, timeout=_DASHBOARD_ACK_STOP_TIMEOUT_S) as response:
+            response.read()
+        logger.info("Dashboard acknowledged intentional sleep stop")
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        logger.warning("Dashboard ack_stop unavailable during sleep: %s", exc)
+
+
+def _append_stopped_service(service_id: str) -> None:
+    """Add ``service_id`` to the dashboard stopped-service file."""
+    _DASHBOARD_STOPPED_PATH.parent.mkdir(parents=True, exist_ok=True)
+    ids: list[str] = []
+    if _DASHBOARD_STOPPED_PATH.is_file():
+        try:
+            payload: object = json.loads(_DASHBOARD_STOPPED_PATH.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            payload = []
+        if isinstance(payload, list):
+            ids = [str(item) for item in payload]
+        elif isinstance(payload, dict) and isinstance(payload.get("ids"), list):
+            ids = [str(item) for item in payload["ids"]]
+    if service_id not in ids:
+        ids.append(service_id)
+    _DASHBOARD_STOPPED_PATH.write_text(json.dumps(sorted(ids), indent=2) + "\n", encoding="utf-8")
 
 
 def initialize_tools_with_default_fallback(

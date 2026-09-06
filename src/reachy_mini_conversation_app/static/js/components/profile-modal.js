@@ -140,7 +140,7 @@ function buildDialog({ isEdit, initial }) {
       h(
         "p",
         { class: "modal__subtitle" },
-        "Define how Wally should behave and greet people."
+        "Define how Reachy should behave and greet people."
       )
     ),
     h(

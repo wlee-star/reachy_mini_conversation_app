@@ -27,7 +27,7 @@ export async function mountHomeView({ outlet, signal, navigate }) {
       h(
         "p",
         { class: "view-subtitle" },
-        "Pick how Wally should think and talk. Tap a card to start a conversation."
+        "Pick how Reachy should think and talk. Tap a card to start a conversation."
       )
     ),
     h("div", { class: "personality-grid", role: "list" }, h("p", { class: "muted" }, "Loading…"))
@@ -42,7 +42,7 @@ export async function mountHomeView({ outlet, signal, navigate }) {
   try {
     personalities = await untilReady(listPersonalities, signal, () => {
       grid.replaceChildren();
-      grid.appendChild(h("p", { class: "muted" }, "Waiting for Wally to finish starting…"));
+      grid.appendChild(h("p", { class: "muted" }, "Waiting for Reachy to finish starting…"));
     });
   } catch (error) {
     if (signal.aborted) return;

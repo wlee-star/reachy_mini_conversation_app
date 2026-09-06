@@ -846,6 +846,72 @@ def test_user_stopped_survives_controller_reload(tmp_path, monkeypatch: pytest.M
     assert "conversation" in second._user_stopped
 
 
+def test_acknowledge_intentional_stop_prevents_auto_restart(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A sleep/ack_stop exit must not be restarted even while auto_restart stays enabled."""
+    from control_dashboard import paths as dashboard_paths
+    from control_dashboard.stack import StackController
+
+    monkeypatch.setattr(dashboard_paths, "STOPPED_PATH", tmp_path / "stopped.json")
+    monkeypatch.setattr(dashboard_paths, "OWNED_PATH", tmp_path / "owned.json")
+    config = load_config()
+    controller = StackController(config)
+    conversation = config.service("conversation")
+    assert conversation is not None
+    controller._owned = {
+        "conversation": {"pid": 1, "started_by_dashboard": True, "started_at": "2026-09-06T10:00:00+10:00"}
+    }
+    result = controller.acknowledge_intentional_stop(conversation, reason="sleep")
+    assert result["ok"] is True
+    assert "conversation" in controller._user_stopped
+    assert "conversation" not in controller._owned
+
+    monkeypatch.setattr("control_dashboard.stack.proc.pid_is_running", lambda _pid: False)
+    monkeypatch.setattr("control_dashboard.stack.proc.listening_pids", lambda _port: [])
+    monkeypatch.setattr("control_dashboard.stack.proc.pids_matching", lambda _pattern: [])
+    monkeypatch.setattr(
+        controller,
+        "health",
+        lambda spec, probe=False: HealthResult(STATUS_OFFLINE, "down"),
+    )
+    started = MagicMock(return_value={"ok": True, "status": STATUS_ONLINE})
+    monkeypatch.setattr(controller, "start", started)
+    # Simulate crash ownership without clearing the intentional stop flag.
+    controller._owned = {
+        "conversation": {"pid": 1, "started_by_dashboard": True, "started_at": "2026-09-06T10:00:00+10:00"}
+    }
+    controller.recover_once()
+    started.assert_not_called()
+
+
+def test_recover_reloads_stopped_json_written_by_sleep(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Recovery must honor stopped.json written by the Conversation App during sleep."""
+    from control_dashboard import paths as dashboard_paths
+    from control_dashboard.stack import StackController
+
+    stopped_path = tmp_path / "stopped.json"
+    monkeypatch.setattr(dashboard_paths, "STOPPED_PATH", stopped_path)
+    monkeypatch.setattr(dashboard_paths, "OWNED_PATH", tmp_path / "owned.json")
+    config = load_config()
+    controller = StackController(config)
+    controller._owned = {
+        "conversation": {"pid": 1, "started_by_dashboard": True, "started_at": "2026-09-06T10:00:00+10:00"}
+    }
+    stopped_path.write_text('["conversation"]\n', encoding="utf-8")
+    monkeypatch.setattr("control_dashboard.stack.proc.pid_is_running", lambda _pid: False)
+    monkeypatch.setattr("control_dashboard.stack.proc.listening_pids", lambda _port: [])
+    monkeypatch.setattr("control_dashboard.stack.proc.pids_matching", lambda _pattern: [])
+    monkeypatch.setattr(
+        controller,
+        "health",
+        lambda spec, probe=False: HealthResult(STATUS_OFFLINE, "down"),
+    )
+    started = MagicMock(return_value={"ok": True, "status": STATUS_ONLINE})
+    monkeypatch.setattr(controller, "start", started)
+    controller.recover_once()
+    started.assert_not_called()
+    assert "conversation" in controller._user_stopped
+
+
 def test_reachy_health_rejects_physical_daemon_on_localhost(monkeypatch: pytest.MonkeyPatch) -> None:
     """A wireless robot answering on 127.0.0.1:8000 is not the managed simulator."""
     config = load_config()

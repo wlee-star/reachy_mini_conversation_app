@@ -3,7 +3,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
-from reachy_mini_conversation_app.tools.go_to_sleep import GoToSleep
+from reachy_mini_conversation_app.tools.go_to_sleep import GoToSleep, match_sleep_intent
 
 
 def test_go_to_sleep_has_no_required_arguments() -> None:
@@ -44,3 +44,41 @@ async def test_go_to_sleep_calls_runtime_callback() -> None:
 
     assert result == expected
     go_to_sleep.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "transcript",
+    [
+        "go to sleep",
+        "Go to sleep.",
+        "please go to sleep",
+        "time to sleep",
+        "go to bed",
+        "sleep now",
+        "put yourself to sleep",
+    ],
+)
+def test_match_sleep_intent_accepts_direct_commands(transcript: str) -> None:
+    """Imperative robot sleep phrases must match after wake-word stripping."""
+    assert match_sleep_intent(transcript) is True
+
+
+@pytest.mark.parametrize(
+    "transcript",
+    [
+        "Why do people go to sleep?",
+        "What time should I go to sleep?",
+        "Tell me a story about going to sleep.",
+        "I couldn't go to sleep last night.",
+        "I can't go to sleep",
+        "Should I go to sleep?",
+        "How long do people go to sleep?",
+        "what's the weather",
+        "hello",
+        "I watched a sleep video",
+        "sleeping is important",
+    ],
+)
+def test_match_sleep_intent_rejects_non_commands(transcript: str) -> None:
+    """Conversational or informational sleep mentions must not trigger the tool."""
+    assert match_sleep_intent(transcript) is False

@@ -42,6 +42,286 @@ function statusClass(status) {
   return `dot dot--${status || "offline"}`;
 }
 
+let physicalCameraTimer = null;
+let physicalCameraBackoffMs = 1000;
+let physicalCameraOn = true;
+const physicalLevelHistory = { microphone: Array(32).fill(0), speaker: Array(32).fill(0) };
+
+function stopPhysicalCamera() {
+  if (physicalCameraTimer) {
+    clearTimeout(physicalCameraTimer);
+    physicalCameraTimer = null;
+  }
+}
+
+function levelWave(kind, value) {
+  const level = Math.max(0, Math.min(1, Number(value) || 0));
+  physicalLevelHistory[kind] = [...physicalLevelHistory[kind].slice(1), level];
+  const bars = physicalLevelHistory[kind]
+    .map((sample) => `<span style="height:${Math.max(8, Math.round(sample * 100))}%"></span>`)
+    .join("");
+  return `<div class="level-wave" id="${kind}-wave" role="meter" aria-label="${kind} level" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(level * 100)}">${bars}</div>`;
+}
+
+function updateLevelWave(kind, value) {
+  const level = Math.max(0, Math.min(1, Number(value) || 0));
+  physicalLevelHistory[kind] = [...physicalLevelHistory[kind].slice(1), level];
+  const wave = document.getElementById(`${kind}-wave`);
+  if (!wave) return;
+  wave.setAttribute("aria-valuenow", String(Math.round(level * 100)));
+  [...wave.children].forEach((bar, index) => {
+    bar.style.height = `${Math.max(8, Math.round(physicalLevelHistory[kind][index] * 100))}%`;
+  });
+}
+
+async function updatePhysicalTelemetry() {
+  if (route() !== "/physical" || !view.querySelector(".physical")) return;
+  const status = await api("/api/physical/status");
+  const media = status.media || {};
+  updateLevelWave("microphone", media.microphone_level);
+  updateLevelWave("speaker", media.speaker_level);
+  const micStatus = document.getElementById("microphone-status");
+  const speakerStatus = document.getElementById("speaker-status");
+  if (micStatus) micStatus.textContent = (media.microphone_status || "offline").toUpperCase();
+  if (speakerStatus) speakerStatus.textContent = (media.speaker_status || "offline").toUpperCase();
+}
+
+async function renderPhysical() {
+  stopPhysicalCamera();
+  const status = await api("/api/physical/status");
+  const target = status.target || {};
+  const banners = status.banners || {};
+  const media = status.media || {};
+  const robot = status.robot || {};
+  const safeStop = status.safe_stop || {};
+  physicalCameraOn = status.camera_preview_enabled !== false;
+  const isPhysical = target.kind === "physical";
+  const stack = (status.stack || [])
+    .map(
+      (row) =>
+        `<li><span class="name">${escapeHtml(row.name)}</span><span class="${statusClass(row.status)}">${escapeHtml(
+          row.label || row.status,
+        )}</span></li>`,
+    )
+    .join("");
+  view.innerHTML = `
+    <section class="physical">
+      <div class="physical__head">
+        <div>
+          <h2 class="physical__title">${escapeHtml(target.assistant_name || "Reachy Mini")} — Physical AI Stack</h2>
+          <p class="physical__target">TARGET · ${escapeHtml(target.label || "UNKNOWN")} · ${escapeHtml(
+            target.host || "—",
+          )}:${escapeHtml(String(target.port || ""))}</p>
+          <p class="physical__note">${escapeHtml(target.summary || "")}</p>
+        </div>
+        <div class="physical__badges">
+          <span class="badge ${banners.connected ? "is-on" : "is-off"}">${banners.connected ? "● Connected" : "● Offline"}</span>
+          <span class="badge ${banners.ai_online ? "is-on" : "is-off"}">${banners.ai_online ? "● AI Online" : "● AI Offline"}</span>
+          <span class="badge ${banners.audio_online ? "is-on" : "is-off"}">${banners.audio_online ? "● Audio Online" : "● Audio Offline"}</span>
+        </div>
+      </div>
+
+      ${
+        isPhysical
+          ? `<p class="physical__note">Controlling <strong>PHYSICAL REACHY MINI</strong> — not the simulator.</p>`
+          : `<p class="card__reason">Physical controls are locked while the target is ${escapeHtml(
+              target.label || target.kind || "unknown",
+            )}. Simulator overview remains on the main page.</p>`
+      }
+
+      <div class="physical__panels">
+        <article class="panel">
+          <h3>Camera Preview · LIVE PHYSICAL CAMERA</h3>
+          <div class="camera-frame" id="camera-frame">
+            <img id="camera-img" alt="Physical Reachy Mini camera preview" hidden />
+            <div class="camera-frame__msg" id="camera-msg">${
+              physicalCameraOn ? "Waiting for camera preview…" : "PREVIEW OFF — dashboard not requesting frames"
+            }</div>
+          </div>
+          <div class="actions" style="margin-top:12px">
+            <button type="button" class="btn" id="camera-toggle">${
+              physicalCameraOn ? "Preview Off" : "Preview On"
+            }</button>
+          </div>
+          <p class="card__meta" id="camera-meta">${escapeHtml(
+            (status.camera_preview && status.camera_preview.summary) ||
+              media.camera_summary ||
+              "Camera Preview On/Off only controls dashboard frame requests.",
+          )}</p>
+
+          <h3 style="margin-top:20px">Microphone Input</h3>
+          <p id="microphone-status" class="${statusClass(media.microphone_status === "error" ? "offline" : "online")}">${escapeHtml(
+            (media.microphone_status || "offline").toUpperCase(),
+          )}</p>
+          ${levelWave("microphone", media.microphone_level)}
+          <dl class="kv">
+            ${kv("Sample rate", media.input_sample_rate ? `${media.input_sample_rate} Hz` : "")}
+            ${kv("Muted", media.microphone_muted ? "yes" : "no")}
+          </dl>
+          <div class="actions">
+            <button type="button" class="btn" data-physical="mic" data-muted="${media.microphone_muted ? "0" : "1"}" ${
+              isPhysical ? "" : "disabled"
+            }>${media.microphone_muted ? "Unmute" : "Mute"}</button>
+            <button type="button" class="btn" data-physical="mic-test" ${isPhysical ? "" : "disabled"}>Watch Levels</button>
+          </div>
+          <p class="card__meta">Uses Reachy's existing mic pipeline — no second capture stream.</p>
+
+          <h3 style="margin-top:20px">Speaker Output</h3>
+          <p id="speaker-status" class="${statusClass(media.speaker_status === "error" ? "offline" : "online")}">${escapeHtml(
+            (media.speaker_status || "offline").toUpperCase(),
+          )}</p>
+          ${levelWave("speaker", media.speaker_level)}
+          <dl class="kv">
+            ${kv("Sample rate", media.output_sample_rate ? `${media.output_sample_rate} Hz` : "")}
+            ${kv("Volume control", "unavailable")}
+            ${kv("Muted", media.speaker_muted ? "yes" : "no")}
+          </dl>
+          <div class="actions">
+            <button type="button" class="btn" data-physical="speaker" data-muted="${media.speaker_muted ? "0" : "1"}" ${
+              isPhysical ? "" : "disabled"
+            }>${media.speaker_muted ? "Unmute" : "Mute"}</button>
+            <button type="button" class="btn" data-physical="speaker-test" ${isPhysical ? "" : "disabled"}>Test Speaker</button>
+          </div>
+          <p class="card__meta">${escapeHtml(
+            media.volume_control_summary || "Volume control unavailable — no Reachy client volume API.",
+          )}</p>
+        </article>
+
+        <article class="panel">
+          <h3>AI Stack</h3>
+          <ul class="stack-list">${stack}</ul>
+        </article>
+      </div>
+
+      <div class="physical__panels">
+        <article class="panel">
+          <h3>PHYSICAL REACHY MINI</h3>
+          <dl class="kv">
+            ${kv("Connection", robot.connection)}
+            ${kv("SDK", robot.sdk)}
+            ${kv("Motors", robot.motors)}
+            ${kv("Camera", robot.camera)}
+            ${kv("Microphone", robot.microphone)}
+            ${kv("Speaker", robot.speaker)}
+            ${kv("Robot state", robot.state)}
+            ${kv("Daemon host", robot.wlan_ip)}
+            ${kv("Daemon state", robot.daemon_state)}
+          </dl>
+          <div class="actions">
+            <button type="button" class="btn btn--danger" data-physical="safe-stop" ${
+              isPhysical && safeStop.available ? "" : "disabled"
+            }>SAFE STOP</button>
+          </div>
+          <p class="card__meta">${escapeHtml(
+            safeStop.summary ||
+              "Stops active motion and disables motors. Not goto_sleep. Does not stop Reachy/Hermes/dashboard.",
+          )}</p>
+        </article>
+        <article class="panel">
+          <h3>Hermes / Local AI</h3>
+          <dl class="kv">
+            ${kv("Hermes", status.hermes?.label)}
+            ${kv("Hermes detail", status.hermes?.summary)}
+            ${kv("Local AI", status.local_ai?.label)}
+            ${kv("Model", status.local_ai?.model)}
+            ${kv("GPU", status.local_ai?.gpu)}
+          </dl>
+        </article>
+      </div>
+    </section>`;
+
+  const cameraToggle = view.querySelector("#camera-toggle");
+  if (cameraToggle) {
+    cameraToggle.addEventListener("click", async () => {
+      const next = !physicalCameraOn;
+      await api("/api/physical/camera", { method: "POST", body: JSON.stringify({ enabled: next }) });
+      await renderPhysical();
+    });
+  }
+  view.querySelectorAll("[data-physical]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const action = button.getAttribute("data-physical");
+      try {
+        if (action === "mic") {
+          const muted = button.getAttribute("data-muted") === "1";
+          showProgress(muted ? "Muting microphone…" : "Unmuting microphone…");
+          await api("/api/physical/mic", { method: "POST", body: JSON.stringify({ muted }) });
+        } else if (action === "mic-test") {
+          showProgress("Unmute and speak — watching Reachy mic levels.");
+          await api("/api/physical/mic", { method: "POST", body: JSON.stringify({ muted: false }) });
+        } else if (action === "speaker") {
+          const muted = button.getAttribute("data-muted") === "1";
+          showProgress(muted ? "Muting speaker…" : "Unmuting speaker…");
+          await api("/api/physical/speaker", { method: "POST", body: JSON.stringify({ muted }) });
+        } else if (action === "speaker-test") {
+          showProgress("Playing short speaker test…");
+          const result = await api("/api/physical/speaker/test", { method: "POST", body: "{}" });
+          showProgress(result.result?.ok === false ? result.result.error : "Speaker test sent.");
+          return;
+        } else if (action === "safe-stop") {
+          if (
+            !window.confirm(
+              "SAFE STOP: stop moves and disable motors on the PHYSICAL robot?\n\nThis is not goto_sleep. Reachy, Hermes, and the dashboard stay running. Motors stay disabled until re-enabled elsewhere.",
+            )
+          )
+            return;
+          showProgress("Safe stop (motor / torque disable)…");
+          const result = await api("/api/physical/safe-stop", { method: "POST", body: "{}" });
+          showProgress(JSON.stringify(result.result || result));
+        }
+        await renderPhysical();
+      } catch (error) {
+        showProgress(String(error));
+      }
+    });
+  });
+
+  if (isPhysical && physicalCameraOn) {
+    schedulePhysicalCamera();
+  }
+}
+
+function schedulePhysicalCamera() {
+  stopPhysicalCamera();
+  const img = document.getElementById("camera-img");
+  const msg = document.getElementById("camera-msg");
+  const meta = document.getElementById("camera-meta");
+  if (!img || !msg) return;
+  const tick = async () => {
+    if (route() !== "/physical" || !physicalCameraOn) return;
+    try {
+      const response = await fetch(`/api/physical/camera.jpg?t=${Date.now()}`, { cache: "no-store" });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({}));
+        img.hidden = true;
+        msg.hidden = false;
+        msg.textContent = payload.error || "CAMERA OFFLINE";
+        if (meta) meta.textContent = payload.meta?.summary || payload.error || "";
+        physicalCameraBackoffMs = Math.min(8000, Math.max(1000, physicalCameraBackoffMs * 2));
+      } else {
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        const previous = img.src;
+        img.onload = () => {
+          if (previous && previous.startsWith("blob:")) URL.revokeObjectURL(previous);
+        };
+        img.src = url;
+        img.hidden = false;
+        msg.hidden = true;
+        if (meta) meta.textContent = "LIVE PHYSICAL CAMERA — dashboard preview";
+        physicalCameraBackoffMs = 1000;
+      }
+    } catch (error) {
+      img.hidden = true;
+      msg.hidden = false;
+      msg.textContent = "CAMERA PREVIEW OFFLINE";
+      physicalCameraBackoffMs = Math.min(8000, Math.max(1000, physicalCameraBackoffMs * 2));
+    }
+    physicalCameraTimer = setTimeout(tick, physicalCameraBackoffMs);
+  };
+  physicalCameraTimer = setTimeout(tick, 200);
+}
+
 async function api(path, options) {
   const response = await fetch(path, {
     headers: { "Content-Type": "application/json" },
@@ -265,8 +545,18 @@ async function refresh() {
   document.querySelectorAll(".nav a").forEach((link) => {
     link.classList.toggle("is-active", link.getAttribute("href") === `#${path}` || (path === "/" && link.getAttribute("href") === "#/"));
   });
+  if (path !== "/physical") {
+    stopPhysicalCamera();
+  }
   if (path.startsWith("/service/")) {
     await renderDetail(path.slice("/service/".length));
+  } else if (path === "/physical") {
+    // Keep the camera timer alive; only rebuild the page when navigating here.
+    if (!view.querySelector(".physical")) {
+      await renderPhysical();
+    } else {
+      await updatePhysicalTelemetry();
+    }
   } else if (path === "/config") {
     await renderConfig();
   } else if (path === "/tests") {

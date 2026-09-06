@@ -341,7 +341,7 @@ def test_match_dance_intent_uses_dance1_by_default() -> None:
     """A plain dance request should play dance1, not a random or energetic variant."""
     assert match_dance_intent("Can you dance?") == "dance1"
     assert match_dance_intent("Reachy, can you dance?") == "dance1"
-    assert match_dance_intent("Wally, can you dance?") == "dance1"
+    assert match_dance_intent("Reachy, can you dance?") == "dance1"
 
 
 def test_match_dance_intent_uses_dance3_when_energetic() -> None:

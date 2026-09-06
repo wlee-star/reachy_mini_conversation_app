@@ -1,0 +1,11 @@
+﻿POST-CRASH BACKUP 2026-09-04-2319
+commit: 45db5668cfed8ba7d07e16d3da26e34b833a1aff
+branch: main
+working_tree: dirty (uncommitted HA fast-path / llama host / tests)
+Wally conversation processes: NONE (PC and robot)
+Hermes gateway PID owning :8642: 32596
+Duplicate hermes gateway process (no listen): 38428
+llama.cpp: 192.168.0.143:8080 OK
+speech-to-speech :8765: DOWN
+robot: 192.168.0.57 daemon active, motor_control_mode=disabled (asleep), no conversation app
+robot profile_toolsets.json: MISSING

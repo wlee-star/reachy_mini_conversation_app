@@ -11,14 +11,15 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from control_dashboard import paths, stack, events
+from control_dashboard import paths, stack, events, physical
 from control_dashboard.redact import redact_text
+from control_dashboard.physical import CommandBlocked
 from control_dashboard.registry import DashboardConfig, load_config
 
 
 logger = logging.getLogger(__name__)
 
-ALLOWED_ACTIONS = frozenset({"start", "stop", "restart", "health", "test"})
+ALLOWED_ACTIONS = frozenset({"start", "stop", "restart", "health", "test", "ack_stop"})
 _controller: stack.StackController | None = None
 _config: DashboardConfig | None = None
 _settings: dict[str, Any] = {"development_mode": True, "auto_restart": True}
@@ -122,6 +123,8 @@ def _handle_action(service_id: str, action: str) -> tuple[int, dict[str, Any]]:
         return 200, controller.start(spec)
     if action == "stop":
         return 200, controller.stop(spec)
+    if action == "ack_stop":
+        return 200, controller.acknowledge_intentional_stop(spec, reason="sleep")
     return 200, controller.restart(spec)
 
 
@@ -188,6 +191,48 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return _json(
                 self, {"events": events.list_events(after_id=after, service=service, errors_only=errors_only)}
             )
+        if path == "/api/physical/status":
+            config, controller = _require()
+            return _json(self, physical.build_physical_status(config, controller.health))
+        if path == "/api/physical/target":
+            config, _controller = _require()
+            target = physical.resolve_target(config)
+            return _json(
+                self,
+                {
+                    "kind": target.kind,
+                    "label": {
+                        physical.TARGET_PHYSICAL: "PHYSICAL REACHY MINI",
+                        physical.TARGET_SIMULATOR: "VIRTUAL REACHY MINI",
+                        physical.TARGET_UNKNOWN: "UNKNOWN TARGET",
+                    }.get(target.kind, target.kind.upper()),
+                    "host": target.host,
+                    "port": target.port,
+                    "simulation_enabled": target.simulation_enabled,
+                    "summary": target.summary,
+                },
+            )
+        if path == "/api/physical/camera.jpg":
+            config, _controller = _require()
+            jpeg, meta = physical.fetch_camera_jpeg(config)
+            if jpeg is None:
+                status_code = 409 if meta.get("status") == "preview_off" else 503
+                return _json(
+                    self,
+                    {
+                        "error": meta.get("summary") or "CAMERA OFFLINE",
+                        "meta": meta,
+                    },
+                    status_code,
+                )
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Camera-Status", str(meta.get("status") or "live"))
+            self.send_header("Content-Length", str(len(jpeg)))
+            self.end_headers()
+            self.wfile.write(jpeg)
+            return None
         if path.startswith("/api/services/") and path.endswith("/logs"):
             service_id = path[len("/api/services/") : -len("/logs")].strip("/")
             return _json(self, {"lines": _tail_log(service_id)})
@@ -215,6 +260,31 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 _settings["auto_restart"] = bool(body["auto_restart"])
             _save_settings()
             return _json(self, dict(_settings))
+        if path == "/api/physical/camera":
+            enabled = bool(body.get("enabled")) if "enabled" in body else True
+            return _json(self, {"ok": True, "enabled": physical.set_camera_preview_enabled(enabled)})
+        if path in {
+            "/api/physical/mic",
+            "/api/physical/speaker",
+            "/api/physical/speaker/test",
+            "/api/physical/safe-stop",
+        }:
+            config, _controller = _require()
+            action = {
+                "/api/physical/mic": "mic",
+                "/api/physical/speaker": "speaker",
+                "/api/physical/speaker/test": "speaker_test",
+                "/api/physical/safe-stop": "safe_stop",
+            }[path]
+            try:
+                return _json(self, physical.run_physical_action(config, action, body))
+            except CommandBlocked as exc:
+                events.emit("error", "physical", exc.reason)
+                return _json(self, {"ok": False, "error": exc.reason, "blocked": True}, 409)
+            except Exception as exc:
+                logger.warning("Physical action %s failed: %s", action, exc)
+                events.emit("error", "physical", f"{action} failed: {exc}")
+                return _json(self, {"ok": False, "error": str(exc)}, 500)
         if path == "/api/stack/start":
             _, controller = _require()
             return _json(self, controller.start_all())

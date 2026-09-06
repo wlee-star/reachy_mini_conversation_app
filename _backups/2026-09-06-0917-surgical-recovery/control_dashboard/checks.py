@@ -114,16 +114,6 @@ def check_llama(spec: ServiceSpec, config: DashboardConfig, extra: dict[str, Any
             suggested_action="Start llama.cpp",
             technical="TCP connection refused",
         )
-    process = _process_snapshot(spec, include_command=True)
-    if process.get("match") is False:
-        occupant = process.get("command") or process.get("name") or f"pid {process.get('pids')}"
-        return HealthResult(
-            STATUS_DEGRADED,
-            f"Port {port} is open, but the listener is not llama-server.",
-            details={"port": port, "gpu": gpu_name(), "process": process, "occupant": occupant},
-            technical=str(occupant),
-            suggested_action="Stop the process occupying port 8080, then start llama.cpp",
-        )
     health = net.http_request(f"http://{host}:{port}/health", timeout_s=5.0)
     models = net.http_request(f"http://{host}:{port}/v1/models", timeout_s=5.0)
     model_id = None
@@ -132,6 +122,7 @@ def check_llama(spec: ServiceSpec, config: DashboardConfig, extra: dict[str, Any
         data = payload.get("data")
         if isinstance(data, list) and data and isinstance(data[0], dict):
             model_id = data[0].get("id")
+    process = _process_snapshot(spec)
     if extra.get("probe"):
         probe = net.http_request(
             f"http://{host}:{port}/v1/chat/completions",
@@ -144,7 +135,7 @@ def check_llama(spec: ServiceSpec, config: DashboardConfig, extra: dict[str, Any
             timeout_s=20.0,
         )
         extra["probe_result"] = {"ok": probe.ok, "latency_ms": round(probe.latency_ms, 1), "error": probe.error}
-    if health.ok and models.ok and model_id:
+    if health.ok and models.ok:
         return HealthResult(
             STATUS_ONLINE,
             "llama.cpp API is responding and a model is loaded.",
@@ -167,9 +158,9 @@ def check_llama(spec: ServiceSpec, config: DashboardConfig, extra: dict[str, Any
         )
     return HealthResult(
         STATUS_DEGRADED,
-        f"llama-server is listening on port {port}, but the API is not healthy.",
+        f"Something is listening on port {port}, but the llama.cpp API is not healthy.",
         details={"port": port, "model": model_id, "gpu": gpu_name(), "process": process},
-        technical=health.error or models.error or ("model list empty" if models.ok and not model_id else None),
+        technical=health.error or models.error,
         suggested_action="Restart llama.cpp",
         latency_ms=round(health.latency_ms, 1),
     )
@@ -193,8 +184,7 @@ def check_speech(spec: ServiceSpec, config: DashboardConfig, extra: dict[str, An
             technical="TCP connection refused",
         )
     process = _process_snapshot(spec, include_command=True)
-    # /v1/models is often unimplemented (HTTP 404); do not treat any HTTP response as healthy.
-    models = net.http_request(f"http://{host}:{port}/v1/models", timeout_s=3.0)
+    http = net.http_request(f"http://{host}:{port}/v1/models", timeout_s=3.0)
     tts = "qwen3" in (process.get("command") or "").lower()
     details = {
         "port": port,
@@ -202,8 +192,7 @@ def check_speech(spec: ServiceSpec, config: DashboardConfig, extra: dict[str, An
         "stt": "parakeet-tdt" if "parakeet" in (process.get("command") or "").lower() else None,
         "tts": "qwen3" if tts else None,
         "process": process,
-        "http_api": models.ok,
-        "models_status_code": models.status_code,
+        "http_api": http.ok,
     }
     if process.get("match") is False:
         return HealthResult(
@@ -225,19 +214,11 @@ def check_speech(spec: ServiceSpec, config: DashboardConfig, extra: dict[str, An
                 technical="GET /v1/pool state=stuck",
                 latency_ms=round(pool_result.latency_ms, 1),
             )
-        return HealthResult(
-            STATUS_ONLINE,
-            "Speech-to-speech realtime pool is healthy.",
-            details=details,
-            latency_ms=round(pool_result.latency_ms, 1),
-        )
     return HealthResult(
-        STATUS_DEGRADED,
-        f"Port {port} is open, but /v1/pool did not confirm a healthy speech-to-speech pipeline.",
+        STATUS_ONLINE,
+        "Speech-to-speech realtime port is accepting connections.",
         details=details,
-        suggested_action="Restart speech-to-speech",
-        technical=pool_result.error or f"HTTP {pool_result.status_code}",
-        latency_ms=round(pool_result.latency_ms, 1) if pool_result.status_code else None,
+        latency_ms=round(http.latency_ms, 1) if http.ok else None,
     )
 
 
@@ -332,9 +313,34 @@ def check_hermes(spec: ServiceSpec, config: DashboardConfig, extra: dict[str, An
 
 
 def check_conversation(spec: ServiceSpec, config: DashboardConfig, extra: dict[str, Any]) -> HealthResult:
-    """Check the LOCAL conversation app UI port and process (not physical daemon app state)."""
+    """Check the conversation app UI port and process."""
     host = spec.host or "127.0.0.1"
     port = spec.port or 7860
+    daemon_host = _configured_daemon_host(config)
+    if daemon_host and not _is_loopback_host(host) and host == daemon_host:
+        daemon_port = int(config.env.get("REACHY_DAEMON_PORT") or 8000)
+        current = net.http_request(
+            f"http://{daemon_host}:{daemon_port}/api/apps/current-app-status",
+            timeout_s=4.0,
+        )
+        payload = net.json_payload(current) or {}
+        info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
+        running = payload.get("state") == "running" and info.get("name") == "reachy_mini_conversation_app"
+        if running:
+            return HealthResult(
+                STATUS_ONLINE,
+                "Conversation app is running on the physical Reachy Mini.",
+                details={"host": host, "managed_by_daemon": True, "state": "running"},
+                latency_ms=round(current.latency_ms, 1),
+            )
+        if current.ok:
+            return HealthResult(
+                STATUS_STARTING if payload.get("state") == "starting" else STATUS_OFFLINE,
+                f"Conversation app on physical Reachy Mini is {payload.get('state') or 'stopped'}.",
+                details={"host": host, "managed_by_daemon": True, "state": payload.get("state")},
+                suggested_action="Start conversation app",
+                technical=str(payload.get("error") or "") or None,
+            )
     process = _process_snapshot(spec, include_command=True)
     ui_up = net.port_open(host, port)
     if ui_up:
@@ -348,25 +354,19 @@ def check_conversation(spec: ServiceSpec, config: DashboardConfig, extra: dict[s
                 suggested_action="Stop the process occupying port 7860, then start the conversation app",
             )
         page = net.http_request(f"http://{host}:{port}/", timeout_s=4.0)
-        if page.ok:
-            return HealthResult(
-                STATUS_ONLINE,
-                "Conversation app web UI is responding.",
-                details={"port": port, "ui": True, "process": process, "host": host},
-                latency_ms=round(page.latency_ms, 1),
-            )
         return HealthResult(
-            STATUS_DEGRADED,
-            "UI port is open but did not return a healthy HTTP response.",
-            details={"port": port, "ui": False, "process": process, "host": host},
+            STATUS_ONLINE if page.ok or page.status_code else STATUS_DEGRADED,
+            "Conversation app web UI is responding."
+            if page.ok or page.status_code
+            else "UI port is open but did not return HTTP.",
+            details={"port": port, "ui": True, "process": process},
             latency_ms=round(page.latency_ms, 1),
-            technical=page.error or f"HTTP {page.status_code}",
-            suggested_action="Restart conversation app",
+            technical=None if page.ok or page.status_code else page.error,
         )
     return HealthResult(
         STATUS_OFFLINE,
         f"Conversation app UI is not listening on {host}:{port}.",
-        details={"port": port, "ui": False, "process": process, "host": host},
+        details={"port": port, "ui": False, "process": process},
         suggested_action="Start conversation app",
         technical="TCP connection refused",
     )

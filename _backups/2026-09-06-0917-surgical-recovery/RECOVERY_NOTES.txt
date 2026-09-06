@@ -1,0 +1,14 @@
+Surgical recovery checkpoint — 2026-09-06
+
+Preserved before edits:
+- control_dashboard/services.local.json
+- .env
+- control_dashboard/checks.py
+- control_dashboard/runtime/{stopped,owned,settings}.json
+
+Physical host preserved in PHYSICAL_REACHY_HOST.txt (192.168.0.57).
+
+Intentional non-reverts:
+- Reachy identity (not Wally)
+- physical.py / start_physical_conversation.py kept but not default
+- tools/llama-b10819 and tools/python312 left on disk, unused

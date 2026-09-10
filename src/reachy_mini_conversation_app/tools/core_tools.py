@@ -20,6 +20,7 @@ from reachy_mini_conversation_app.tool_spaces import build_remote_client, read_i
 from reachy_mini_conversation_app.profile_store import DEFAULT_PROFILE_NAME
 from reachy_mini_conversation_app.profile_toolsets import read_profile_tool_names
 from reachy_mini_conversation_app.tools.tool_constants import SystemTool
+from reachy_mini_conversation_app.face_identity.service import FaceMemoryService
 
 
 if TYPE_CHECKING:
@@ -45,6 +46,7 @@ class ToolDependencies:
     camera_enabled: bool = False
     motion_duration_s: float = 1.0
     go_to_sleep: Callable[[], dict[str, Any]] | None = None
+    face_memory_service: FaceMemoryService | None = None
 
 
 class ToolSpec(TypedDict):

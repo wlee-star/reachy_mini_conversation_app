@@ -125,7 +125,7 @@
       "ready_timeout_s": 90,
       "start": {
         "executable": "{conversation_python}",
-        "args": ["-m", "reachy_mini_conversation_app.main", "--no-camera", "--no-sim", "--ui"],
+        "args": ["-m", "reachy_mini_conversation_app.main", "--no-sim", "--ui"],
         "cwd": "{conversation_root}"
       }
     },

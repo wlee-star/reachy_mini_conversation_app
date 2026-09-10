@@ -49,6 +49,29 @@ def test_should_launch_simulator(
     assert simulator.should_launch_simulator(no_sim) is expected
 
 
+@pytest.mark.parametrize(
+    ("daemon_host", "expected"),
+    [
+        (None, None),
+        ("", None),
+        ("localhost", None),
+        ("127.0.0.1", None),
+        ("192.168.0.50", "192.168.0.50"),
+        ("http://192.168.0.50:8000", "192.168.0.50"),
+    ],
+)
+def test_configured_remote_daemon_host(
+    monkeypatch: pytest.MonkeyPatch, daemon_host: str | None, expected: str | None
+) -> None:
+    """Only a non-local configured daemon is treated as a physical robot."""
+    if daemon_host is None:
+        monkeypatch.delenv("REACHY_DAEMON_HOST", raising=False)
+    else:
+        monkeypatch.setenv("REACHY_DAEMON_HOST", daemon_host)
+
+    assert simulator.configured_remote_daemon_host() == expected
+
+
 def test_ensure_simulator_running_reuses_existing_daemon(monkeypatch: pytest.MonkeyPatch) -> None:
     """An existing local daemon is reused instead of spawning a second simulator."""
     popen = MagicMock()

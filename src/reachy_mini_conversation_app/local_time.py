@@ -31,6 +31,11 @@ _TIME_QUERY_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+# Fast-path only answers the configured local clock; other places go to the LLM/tools.
+_NONLOCAL_TIME_PLACE_RE = re.compile(
+    r"\bin\s+(?!sydney\b|australia\b)[a-z][a-z .'-]{1,40}\b",
+    re.IGNORECASE,
+)
 
 
 def local_timezone_name() -> str:
@@ -147,13 +152,15 @@ def current_local_time(
 
 
 def match_time_intent(transcript: str) -> bool:
-    """Return whether the utterance is a current time or date question."""
+    """Return whether the utterance is a current local time or date question."""
     text = transcript.lower().strip().replace("'", "")
     text = re.sub(r"[.!?,;:]+", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     if not text:
         return False
-    return _TIME_QUERY_RE.search(text) is not None
+    if not _TIME_QUERY_RE.search(text):
+        return False
+    return _NONLOCAL_TIME_PLACE_RE.search(text) is None
 
 
 def startup_time_instructions() -> str:

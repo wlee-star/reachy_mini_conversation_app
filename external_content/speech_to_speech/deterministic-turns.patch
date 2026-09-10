@@ -1,0 +1,136 @@
+--- a/STT/transcription_notifier.py
++++ b/STT/transcription_notifier.py
+@@ -66,6 +66,8 @@
+             speech_stopped_at_s = None
+ 
+         transcript = str(text)
++        if transcript and self.runtime_config is not None:
++            self.runtime_config.chat.add_item(make_user_message(transcript))
+         # Always close the client-visible transcription item. Empty final STT
+         # results should not trigger the LLM, but clients may already have
+         # received partial deltas and still need a completed event.
+@@ -93,7 +95,12 @@
+             logger.info("Transcription completed: %s", transcript)
+ 
+         if self.runtime_config is not None:
+-            self.runtime_config.chat.add_item(make_user_message(transcript))
++            audio = self.runtime_config.session.audio
++            turn_detection = audio.input.turn_detection if audio and audio.input else None
++            if turn_detection is not None and turn_detection.create_response is False:
++                if self.should_listen is not None:
++                    self.should_listen.set()
++                return
+             yield GenerateResponseRequest(
+                 runtime_config=self.runtime_config,
+                 language_code=language_code,
+--- a/api/openai_realtime/handlers/session.py
++++ b/api/openai_realtime/handlers/session.py
+@@ -58,7 +58,7 @@
+         # The OpenAI GA protocol includes the session id in session.created.
+         # The SDK model has no `id` field but allows extras, and model_dump()
+         # carries them onto the wire.
+-        session = cfg.session.model_copy(update={"id": conn_id})
++        session = cfg.session.model_copy(update={"id": conn_id, "reachy_direct_speech": True})
+         return SessionCreatedEvent(
+             type="session.created",
+             event_id=self._next_event_id(),
+@@ -72,7 +72,7 @@
+         protocol: https://platform.openai.com/docs/api-reference/realtime-server-events/session/updated
+         """
+         cfg = self._state(conn_id).runtime_config
+-        session = cfg.session.model_copy(update={"id": conn_id})
++        session = cfg.session.model_copy(update={"id": conn_id, "reachy_direct_speech": True})
+         return SessionUpdatedEvent(
+             type="session.updated",
+             event_id=self._next_event_id(),
+--- a/LLM/language_model.py
++++ b/LLM/language_model.py
+@@ -511,6 +511,30 @@
+ 
+         runtime_config = request.runtime_config
+         response = request.response
++        metadata = response.metadata if response and response.metadata else {}
++        direct_text = metadata.get("reachy_direct_text")
++        if isinstance(direct_text, str) and direct_text.strip():
++            generation = self.cancel_scope.generation if self.cancel_scope else None
++            if self.cancel_scope and self.cancel_scope.discarding:
++                yield EndOfResponse(cancel_generation=generation)
++                return
++            logger.info("Direct speech bypasses LLM: %s", direct_text)
++            runtime_config.chat.add_item(make_assistant_message(direct_text))
++            yield LLMResponseChunk(
++                text=direct_text,
++                language_code=request.language_code,
++                runtime_config=runtime_config,
++                response=response,
++                turn_id=ctx.turn_id,
++                turn_revision=ctx.turn_revision,
++                cancel_generation=generation,
++            )
++            yield EndOfResponse(
++                turn_id=ctx.turn_id,
++                turn_revision=ctx.turn_revision,
++                cancel_generation=generation,
++            )
++            return
+         original_chat = runtime_config.chat
+         out_of_band = is_out_of_band(response)
+         if out_of_band:
+--- a/api/openai_realtime/service.py
++++ b/api/openai_realtime/service.py
+@@ -453,7 +453,12 @@
+             st.speculative_user_speech_stopped_at_s = event.speech_stopped_at_s
+ 
+         queue = self.text_prompt_queue
+-        if queue and transcript:
++        audio = cfg.session.audio
++        turn_detection = audio.input.turn_detection if audio and audio.input else None
++        manual_response = turn_detection is not None and turn_detection.create_response is False
++        if manual_response and self.should_listen is not None:
++            self.should_listen.set()
++        if queue and transcript and not manual_response:
+             st.response_pending = True
+             queue.put(
+                 GenerateResponseRequest(
+--- a/LLM/base_openai_compatible_language_model.py
++++ b/LLM/base_openai_compatible_language_model.py
+@@ -32,6 +32,7 @@
+     SupportedItem,
+     build_active_chat,
+     make_system_message,
++    make_assistant_message,
+     make_user_audio_message,
+     make_user_message,
+ )
+@@ -779,6 +780,30 @@
+             yield EndOfResponse(turn_id=turn_id, turn_revision=turn_revision)
+             return
+ 
++        metadata = response.metadata if response and response.metadata else {}
++        direct_text = metadata.get("reachy_direct_text")
++        if isinstance(direct_text, str) and direct_text.strip():
++            generation = self.cancel_scope.generation if self.cancel_scope else None
++            if self.cancel_scope and self.cancel_scope.discarding:
++                yield EndOfResponse(cancel_generation=generation)
++                return
++            logger.info("Direct speech bypasses LLM: %s", direct_text)
++            runtime_config.chat.add_item(make_assistant_message(direct_text))
++            yield LLMResponseChunk(
++                text=direct_text,
++                language_code=request.language_code,
++                runtime_config=runtime_config,
++                response=response,
++                turn_id=turn_id,
++                turn_revision=turn_revision,
++                cancel_generation=generation,
++            )
++            yield EndOfResponse(
++                turn_id=turn_id,
++                turn_revision=turn_revision,
++                cancel_generation=generation,
++            )
++            return
+         original_chat = runtime_config.chat
+         if is_out_of_band(response):
+             try:
+

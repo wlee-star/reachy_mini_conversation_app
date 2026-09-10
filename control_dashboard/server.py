@@ -12,6 +12,7 @@ from urllib.parse import parse_qs, urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from control_dashboard import paths, stack, events, physical
+from control_dashboard.people import MAX_BODY_BYTES, PeopleService
 from control_dashboard.redact import redact_text
 from control_dashboard.physical import CommandBlocked
 from control_dashboard.registry import DashboardConfig, load_config
@@ -23,6 +24,8 @@ ALLOWED_ACTIONS = frozenset({"start", "stop", "restart", "health", "test", "ack_
 _controller: stack.StackController | None = None
 _config: DashboardConfig | None = None
 _settings: dict[str, Any] = {"development_mode": True, "auto_restart": True}
+_people = PeopleService()
+_people_request_lock = threading.Lock()
 
 
 def _load_settings() -> None:
@@ -154,6 +157,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
+        if path == "/api/people":
+            if not self._people_same_origin():
+                return _json(self, {"error": "Use the local dashboard address."}, 403)
+            return _json(self, _people.execute("list", {}))
+        if path == "/api/physical/audio":
+            config, _controller = _require()
+            response = physical.net.http_request(
+                f"{physical.conversation_base_url(config)}/api/dashboard/status", timeout_s=1.0
+            )
+            payload = physical.net.json_payload(response) if response.ok else None
+            return _json(self, payload or {}, 200 if payload else 503)
         if path in {"/", "/index.html"}:
             return self._send_file(paths.STATIC_DIR / "index.html", "text/html; charset=utf-8")
         if path.startswith("/static/"):
@@ -249,6 +263,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         """Handle POST control routes."""
         parsed = urlparse(self.path)
         path = parsed.path
+        if path.startswith("/api/people/"):
+            return self._people_action(path.rsplit("/", 1)[-1])
         body = _read_json(self)
         if path == "/api/events/clear":
             events.clear_events()
@@ -296,6 +312,51 @@ class DashboardHandler(BaseHTTPRequestHandler):
             status, payload = _handle_action(service_id, action)
             return _json(self, payload, status)
         return _json(self, {"error": "Not found."}, 404)
+
+    def _people_same_origin(self) -> bool:
+        host = self.headers.get("Host", "")
+        parsed = urlparse("http://" + host)
+        return (
+            parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+            and self.client_address[0] in {"127.0.0.1", "::1"}
+            and self.headers.get("Origin", "http://" + host) == "http://" + host
+        )
+
+    def _people_action(self, action: str) -> None:
+        if not self._people_same_origin():
+            return _json(self, {"error": "Use the local dashboard address.", "persisted": False}, 403)
+        if not _people_request_lock.acquire(blocking=False):
+            self.close_connection = True
+            return _json(self, {"error": "Face memory is busy. Please try again.", "persisted": False}, 409)
+        try:
+            self.connection.settimeout(30)
+            length = int(self.headers.get("Content-Length", "0"))
+            if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
+                raise ValueError("JSON upload required")
+            if self.headers.get("Transfer-Encoding") or not 0 < length <= MAX_BODY_BYTES:
+                raise ValueError("Upload is empty or exceeds the size limit")
+            raw = self.rfile.read(length)
+            if len(raw) != length:
+                raise ValueError("Incomplete upload")
+            body = json.loads(raw)
+            if not isinstance(body, dict):
+                raise ValueError("Invalid upload")
+            result = _people.execute(action, body)
+            return _json(self, result, 400 if result.get("error") else 200)
+        except (ValueError, OSError, json.JSONDecodeError) as exc:
+            logger.warning("People upload rejected: %s", type(exc).__name__)
+            self.close_connection = True
+            return _json(self, {"error": "Invalid, oversized or incomplete upload.", "persisted": False}, 400)
+        except Exception:
+            logger.exception("People upload failed unexpectedly")
+            self.close_connection = True
+            return _json(
+                self,
+                {"error": "Face memory could not process this upload.", "persisted": False},
+                500,
+            )
+        finally:
+            _people_request_lock.release()
 
     def _send_static(self, relative: str) -> None:
         candidate = (paths.STATIC_DIR / relative).resolve()

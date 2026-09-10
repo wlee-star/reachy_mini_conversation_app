@@ -108,6 +108,7 @@ Copy `.env.example` to `.env`. The example file selects local mode and `ws://127
 | `REALTIME_TRANSCRIPTION_LANGUAGE` | Optional input transcription language for the realtime backend. Defaults to `en`; set to a backend-supported code such as `zh` for Chinese. |
 | `HF_REALTIME_CONNECTION_MODE` | `local` uses `HF_REALTIME_WS_URL` on your AI PC. `deployed` uses the built-in Hugging Face cloud server. Application default remains `deployed` if unset; this project's `.env.example` sets `local`. |
 | `HF_REALTIME_WS_URL` | Direct websocket endpoint for speech-to-speech. Accepts `ws://127.0.0.1:8765/v1` or `ws://127.0.0.1:8765/v1/realtime`. Used when `HF_REALTIME_CONNECTION_MODE=local`. |
+| `HF_VISION_ENABLED` | Whether the active realtime model accepts camera `input_image` payloads. Unset defaults to `false` for `local` mode and `true` for `deployed`. Set `true` only when the local model has working multimodal/mmproj support. |
 | `HF_TOKEN` | Optional token for Hugging Face Hub downloads and private Space tools. Local realtime endpoints receive only this explicitly configured token. Not used for cloud conversation when mode is `local`. |
 | `HERMES_CONFIG_PATH` | Optional path to a Hermes Agent `config.yaml` / `mcp_servers.yaml`. HTTP MCP servers listed there can be imported into `installed_local_mcp.json`. |
 | `HERMES_GATEWAY_URL` | Optional Hermes Agent API base for advanced delegated tasks. For a local Hermes gateway this is `http://127.0.0.1:8642/v1/chat/completions`. A host:port value such as `http://127.0.0.1:8642` is normalized to that chat-completions path. When set with `HERMES_API_KEY`, the `ask_hermes` tool POSTs OpenAI chat-completions (`{"model","messages"}`) and reads `choices[0].message.content`. Current reef trend/latest-report queries call Hermes with the 1-minute `~/reef-monitor/reef_cache.json` snapshot and do not treat `reef_thread.jsonl` as the only source. Historical reef questions still attach the latest `~/reef-monitor/reef_thread.jsonl` report. Freshness is computed from the actual data timestamp against the reef-monitor 60-second live-cache cadence; HTTP 200 is not treated as fresh. If Hermes is unavailable or exceeds `HERMES_REEF_REQUEST_TIMEOUT_SECONDS`, the thread report is still returned with `stale=true` and `source=cache`. Session continuity uses header `X-Hermes-Session-Id`; current reef requests use a fresh session. A second `ask_hermes` while one is in flight returns the cache immediately (or a controlled error if no cache), instead of queueing behind the in-flight request. |
@@ -127,6 +128,13 @@ Copy `.env.example` to `.env`. The example file selects local mode and `ws://127
 | `ACTIVE_SESSION_TIMEOUT_SECONDS` | Follow-up window after a valid Reachy activation. Defaults to `30`. After timeout, the user must say Reachy again before tools run. |
 | `LOCAL_TIMEZONE` | IANA timezone for Reachy's local clock and startup time context. Defaults to `Australia/Sydney`. Current time always comes from the system clock in this zone, not the LLM. |
 | `REACHY_MINI_APP_TIMEOUT_MINUTES` | Minutes of inactivity before Reachy Mini goes to sleep and the app stops. Defaults to `1440` (one day); set to `0` to disable. |
+| `FACE_MEMORY_ENABLED` | Enable conversational PC-side face-memory tools (YuNet + SFace). Defaults to `false`. Dashboard People enrolment works independently with this flag off. Does not enable automatic live greeting. |
+| `FACE_MEMORY_PHOTO_ENROLMENT_ENABLED` | Conversational held-up-photo enrolment via camera. Defaults to `false` (paused). Only effective when `FACE_MEMORY_ENABLED=true`. |
+| `FACE_MEMORY_LIVE_RECOGNITION_ENABLED` | Continuous live recognition (default `false`; leave off for this phase). Only effective when `FACE_MEMORY_ENABLED=true`. |
+| `FACE_MEMORY_ON_DEMAND_RECOGNITION_ENABLED` | Explicit user-triggered “who is this?” recognition. Defaults to `true` when face memory is enabled. Does not enable continuous scanning or greetings. |
+| `FACE_MEMORY_MODELS_DIR` | Optional cache directory for YuNet/SFace ONNX models. Defaults to `%LOCALAPPDATA%/reachy_mini_conversation_app/face_models` on Windows. |
+| `FACE_MEMORY_MATCH_THRESHOLD` | Minimum cosine similarity to accept a known identity. Defaults to `0.40`. |
+| `FACE_MEMORY_MATCH_MARGIN` | Minimum gap between best and second-best identity scores. Defaults to `0.05`. |
 
 ### Hugging Face Connection Modes
 
@@ -173,6 +181,10 @@ HF_REALTIME_WS_URL=ws://<your-laptop-lan-ip>:8765/v1/realtime
 
 For that LAN setup, make sure the backend listens on an address reachable from the robot, not only on `127.0.0.1`.
 
+The app requests realtime responses only after activation and deterministic routing. Requests carry a unique ownership token; audio, transcripts, and tool events must belong to the accepted response ID. A new turn invalidates queued requests and old callbacks. Missing response acknowledgements are cancelled without replaying the request.
+
+FACE-ID and wake reminders send their authoritative text directly through the existing speech server's Qwen TTS pipeline, without an LLM repeat prompt. The local speech server requires the companion [protocol patch](external_content/speech_to_speech/deterministic-turns.patch): it honors `create_response=False`, publishes the transcript after updating history, advertises direct-speech support, and sends the known sentence to the existing TTS pipeline. Apply it from the installed `speech_to_speech` package directory with `git apply --check --ignore-space-change <absolute-path-to-patch>`, then `git apply --ignore-space-change <absolute-path-to-patch>`, and restart the existing speech service. Keep a backup before applying it; a speech-server reinstall may require reapplying the patch. No model, llama.cpp setting, Reachy SDK, or daemon change is required. An unsupported direct-speech server produces a logged error rather than an LLM paraphrase.
+
 If the backend stays bound to loopback on your laptop, you can forward it into the robot over SSH instead:
 
 ```bash
@@ -212,6 +224,28 @@ python -m control_dashboard
 ```
 
 Then open http://127.0.0.1:8788/. The dashboard is a separate orchestration layer. It does not rewrite this conversation app, move motors, or send device-control commands during health checks.
+
+#### People / Face Memory
+
+Open **People** to remember someone using uploaded photos, without starting the conversation app or camera (`--no-camera` is supported). Enter a name, optionally relationship/context, hobbies, interests and notes, then select or drop 1–10 JPG/PNG photos. Several different photos (ideally 3–10) improve coverage. Use one clearly visible face per photo; avoid blur and severe cropping. Each file is limited to 8 MiB, the batch to 32 MiB, and each decoded image to 16 megapixels / 8192 pixels per side. WEBP is not accepted.
+
+The PC dashboard reuses YuNet, the existing quality gates and SFace; rejected images never create stored samples. Existing verified ONNX models must already be in the model cache. Missing models produce a failure, never a success message or an automatic download. Identity embeddings and readable profiles remain in their existing separate `face_memory/face_identities.v1.json` and `face_memory/person_profiles.v1.json` files, linked by a stable `person_id`. The standard PC launch uses `%LOCALAPPDATA%/reachy_mini_conversation_app` on Windows and the existing XDG application data path on other platforms. Dashboard administration currently targets that default PC instance.
+
+**Edit details** updates the profile without generating or changing embeddings. **Add photos** appends accepted compatible SFace samples. **Forget** asks for confirmation and removes the identity and profile. Success requires rereading and verifying the saved records or deletion. Caught write/verification failures restore the prior store bytes; this is application-level rollback, not a crash-safe database transaction. Do not run external gallery-writing scripts concurrently with dashboard administration. A rollback failure is logged, surfaced to the user, and blocks subsequent mutations until recovery and a dashboard restart.
+
+Uploaded image bytes are processed in memory, never written as source photos or logged as embeddings. There are no temporary upload files to clean after rejection or errors. Browser selections/previews clear after success, Clear/Cancel, or navigation; after a rejection they remain locally available for correction until cleared. Once submission starts, let it finish; closing the browser does not undo an already saved operation. Refresh the people list after a lost connection before retrying. Existing source photographs outside the stores are not managed or deleted by the dashboard.
+
+People APIs accept only local-loopback, same-origin requests. The JSON upload body has a 45 MiB ceiling, image contents and dimensions are validated server-side, and only one upload operation runs at a time. Filenames are labels only and never become filesystem paths. Photo processing runs on the dashboard HTTP worker, separate from STT/TTS, with no permanent recognition worker.
+
+Keep `FACE_MEMORY_PHOTO_ENROLMENT_ENABLED=false` and `FACE_MEMORY_LIVE_RECOGNITION_ENABLED=false`. Set `FACE_MEMORY_ENABLED=true` (and leave `FACE_MEMORY_ON_DEMAND_RECOGNITION_ENABLED=true`) to allow explicit “who is this?” recognition. Dashboard enrolment does not enable continuous scanning, greetings, conversation profile injection or held-photo tools. SFace matching defaults remain `0.40` with margin `0.05`; speech-authority and robot-name safeguards remain in place.
+
+#### Preview and audio meters
+
+The dark dashboard retains the existing service and physical controls. Its microphone and speaker waveforms are driven by existing scaled RMS telemetry, not FFT data; when telemetry is disconnected they fall back to a clearly labelled, gentle UI-only idle motion. A lightweight audio route polls at most once per 150 ms, with one request in flight. Animation uses time-based attack/release smoothing; stale telemetry decays to zero and disconnects are labelled. The speaker meter describes TTS output samples rather than a measurement at the physical loudspeaker.
+
+Camera preview continues through the conversation app's supported `media.get_frame_jpeg()` API. The browser requests at a target five frames per second with one request and decode in flight, skips obsolete responses, disables HTTP caching, releases blob URLs, and cancels on navigation or hiding the page. Failures back off; the conversation endpoint rejects overlapping camera calls rather than queuing them. The remote SDK already drops old video frames. No SDK/daemon code or camera ownership changes are required.
+
+The preview caption reports request-plus-decode time and JPEG size; the conversation endpoint also exposes `Server-Timing: camera` for acquisition plus SDK JPEG encoding. These are proxies, not camera-to-screen latency. Compare actual motion on the physical camera after restarting the PC dashboard and conversation app to load these local changes. No maximum-FPS or physical latency claim is implied.
 
 The **Physical** tab (`#/physical`) is a physical Reachy Mini AI-stack view. It shows live status for Reachy, camera preview, microphone/speaker controls, Hermes, and Safe Stop. Physical motor/audio/camera commands are proxied through the conversation app’s existing media pipeline (`/api/dashboard/*` on port 7860) and are **blocked** when the resolved target is not a confidently identified physical robot (simulator or unknown). The Overview tab and simulator start/stop behaviour are unchanged.
 
@@ -277,7 +311,7 @@ Every bundled profile enables `head_tracking` by default; users can still disabl
 | `stop_dance` | Clear queued dances. | Core install only. |
 | `play_emotion` | Play a recorded emotion clip via Hugging Face datasets. | Core install only. Uses the default open emotions dataset: [`pollen-robotics/reachy-mini-emotions-library`](https://huggingface.co/datasets/pollen-robotics/reachy-mini-emotions-library). |
 | `stop_emotion` | Clear queued emotions. | Core install only. |
-| `camera` | Capture the latest camera frame and analyze it with the selected realtime backend. | Core install only. Requires the camera (disable with `--no-camera`). |
+| `camera` | Capture the latest camera frame and analyze it when the active realtime model supports image input (`HF_VISION_ENABLED`). On text-only local models it returns a structured `vision_unavailable` result and speaks an honest fallback instead of attaching a JPEG. | Core install only. Requires the camera (disable with `--no-camera`). |
 | `idle_do_nothing` | Explicitly remain idle during an idle turn. Not intended for normal conversation turns. | Core install only. |
 | `move_head` | Queue a head pose change (left/right/up/down/front). | Core install only. |
 | `head_tracking` | Follow the user's face with the head, or stop following. | Core install only. Requires a daemon with the `vision` extra and a camera. |
@@ -291,11 +325,14 @@ Every bundled profile enables `head_tracking` by default; users can still disabl
 | `apex` | Read current Neptune Apex / reef status from `APEX_STATUS_URL` (`/status` JSON) for water parameters, equipment, alarms, and alerts. Current reef stats, status, readings, pH, temperature, and ATO questions call this tool immediately and speak the raw probe values. Report, trend, and analysis questions do not use this path. Live reads are `source=live`; cache fallback is `stale=true`. | Set `APEX_STATUS_URL`. Falls back to `~/reef-monitor/reef_cache.json`. |
 | `reef_status` | Legacy fast-path reef status reader; same live `/status` URL or cache as `apex`. | Set `APEX_STATUS_URL`, or keep the reef cache producer. |
 | `ask_hermes` | Forward advanced delegated tasks to the Hermes Gateway, such as other buses/trains (not live Route 311), research, multi-step household tasks, or reef report/trend/analysis. Current reef results are `source=hermes` and `fresh=true` only when the underlying reef-monitor data timestamp is within 60 seconds. HTTP 200 with old data is `status=stale`. If Hermes is unavailable or exceeds the Reef live-wait timeout, the Reefy `reef_thread.jsonl` cache is returned with `stale=true` and `source=cache`. Direct `apex__*` / `home_assistant__*` MCP tools are not registered while this tool is on. | Set `HERMES_GATEWAY_URL` and `HERMES_API_KEY`. Optional `HERMES_REEF_REQUEST_TIMEOUT_SECONDS` (default 15). |
+| `photo_enrol_face` | Explicit photo enrolment from a held-up picture (implementation retained). **Paused** by default: not in the default profile; requires `FACE_MEMORY_ENABLED=true` and `FACE_MEMORY_PHOTO_ENROLMENT_ENABLED=true`. | Camera photo enrolment is disabled until dashboard enrolment replaces it. |
+| `who_is_in_frame` | Explicit on-demand identification of who is in the current camera frame (YuNet + SFace + remembered identities). Used for “who is this?” questions; never for automatic greetings. | Requires `FACE_MEMORY_ENABLED=true` and `FACE_MEMORY_ON_DEMAND_RECOGNITION_ENABLED=true` (default on when face memory is on). Read-only; does not modify stores. |
+| `face_memory_admin` | List remembered people, forget someone (identity + profile), or append profile details. | Requires `FACE_MEMORY_ENABLED=true`. Success speech only after verified tool results (`persisted=true`). |
 
 Weather and web search are no longer enabled on the default profile. Local time uses the built-in `get_time` tool and the system clock, not the hosted Hugging Face time Space. The bundled Hugging Face Tool Spaces remain installable from Tools if you accept cloud MCP calls. For other local HTTP MCP servers (weather), register them in `external_content/installed_local_mcp.json` and enable the `{alias}__{tool}` IDs per personality. Simple Apex and Home Assistant operations use local Python tools; Hermes remains available through `ask_hermes` for advanced delegation.
 
 > [!NOTE]
-> `remember`/`forget` facts are stored in `memory.v1.json` inside the app's instance data directory (`~/.local/share/reachy_mini_conversation_app/` by default, or the instance path used by the desktop launcher). `forget` only removes facts matched by query. To reset all remembered facts, delete this file. Active Route 311 watches persist in `bus_monitors.v1.json` in the same directory.
+> `remember`/`forget` facts are stored in `memory.v1.json` inside the app's instance data directory (`~/.local/share/reachy_mini_conversation_app/` by default, or the instance path used by the desktop launcher). `forget` only removes facts matched by query. To reset all remembered facts, delete this file. Active Route 311 watches persist in `bus_monitors.v1.json` in the same directory. Face-identity embeddings and person profiles (when face memory is enabled) live under `face_memory/` in that same data root and are separate from conversational `remember` facts.
 
 ## Creating and adding tools
 

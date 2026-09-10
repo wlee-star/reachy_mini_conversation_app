@@ -14,6 +14,7 @@ from reachy_mini_conversation_app.config import config, get_default_voice
 from reachy_mini_conversation_app.streaming import AdditionalOutputs
 from reachy_mini_conversation_app.activation import ActivationSession
 from reachy_mini_conversation_app.tools.apex import classify_reef_intent
+from reachy_mini_conversation_app.tools.camera import VISION_UNAVAILABLE_SPOKEN
 from reachy_mini_conversation_app.hermes_client import HermesTimeoutError
 from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
 from reachy_mini_conversation_app.huggingface_realtime import (
@@ -27,6 +28,85 @@ from reachy_mini_conversation_app.tools.background_tool_manager import ToolState
 
 
 HF_DEFAULT_VOICE = get_default_voice()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interruption", ["response.done", "input_audio_buffer.speech_started"])
+async def test_late_audio_cannot_reenter_after_response_is_invalidated(
+    monkeypatch: pytest.MonkeyPatch, interruption: str
+) -> None:
+    """Completion and barge-in permanently revoke an old response's output."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._response_requests["owned"] = (0, "startup_greeting")
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent("response.created", response={"id": "old", "metadata": {"reachy_request_id": "owned"}}),
+            _FakeEvent(interruption, response_id="old"),
+            _FakeEvent("response.output_audio.delta", response_id="old", delta=_silent_pcm_delta()),
+            _FakeEvent("response.output_audio_transcript.done", response_id="old", transcript="Stale answer."),
+        ),
+    )
+    await handler._run_realtime_session()
+    outputs = _drain_handler_outputs(handler)
+    assert _assistant_transcripts(outputs) == []
+    assert _audio_frame_count(outputs) == 0
+
+
+@pytest.mark.asyncio
+async def test_wake_rejection_revokes_named_startup_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A startup reason cannot exempt stale audio from activation enforcement."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._response_requests["startup"] = (0, "startup_greeting")
+    monkeypatch.setattr(handler, "_reject_unactivated_speech", AsyncMock())
+    monkeypatch.setattr(hf_mod, "get_tool_specs", lambda: [])
+    monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
+    monkeypatch.setattr(type(handler.tool_manager), "shutdown", AsyncMock())
+    handler.client = _make_fake_realtime_client(
+        events=(
+            _FakeEvent("response.created", response={"id": "old", "metadata": {"reachy_request_id": "startup"}}),
+            _FakeEvent("conversation.item.input_audio_transcription.completed", transcript="Yeah."),
+            _FakeEvent("response.output_audio.delta", response_id="old", delta=_silent_pcm_delta()),
+            _FakeEvent("response.done", response_id="old"),
+            _FakeEvent("response.output_audio_transcript.done", response_id="old", transcript="Glad to hear it!"),
+        ),
+    )
+    await handler._run_realtime_session()
+    outputs = _drain_handler_outputs(handler)
+    assert _assistant_transcripts(outputs) == []
+    assert _audio_frame_count(outputs) == 0
+    assert handler._user_turn_authorized is False
+
+
+@pytest.mark.asyncio
+async def test_deterministic_claim_invalidates_a_sender_already_waiting() -> None:
+    """Dequeuing a request before routing must not let it escape cancellation."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler._response_done_event.clear()
+    await handler._safe_response_create(reason="startup_greeting")
+    sender = asyncio.create_task(handler._response_sender_loop())
+    await asyncio.sleep(0)
+    assert handler._pending_responses.empty()
+    handler._claim_deterministic_route()
+    handler._response_done_event.set()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    sender.cancel()
+    await sender
+    handler.connection.response.create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_late_route_callback_cannot_enqueue_for_the_next_turn() -> None:
+    """An async route retains the turn that launched it across awaits."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._turn_generation = 2
+    handler._response_turn.set(1)
+    await handler._safe_response_create(reason="face_identity")
+    assert handler._pending_responses.empty()
 
 
 def test_hermes_result_text_prefers_report_over_errors() -> None:
@@ -305,8 +385,9 @@ async def test_tool_choice_is_restored_after_spoken_followup(monkeypatch: Any) -
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler._tool_followup_tools_disabled = True
     handler._active_response_reason = "tool_result:apex"
+    handler._active_response_id = "resp-apex"
     handler.client = _make_fake_realtime_client(
-        events=(_FakeEvent("response.done"),),
+        events=(_FakeEvent("response.done", response_id="resp-apex"),),
         captured_update=captured_update,
     )
     monkeypatch.setattr(type(handler.tool_manager), "start_up", MagicMock())
@@ -1479,7 +1560,7 @@ async def test_reef_router_does_not_skip_ask_hermes_as_competing(
     start_tool.assert_not_awaited()
     assert handler._reef_router_owns_turn == 1
     assert "skipping competing ask_hermes" not in caplog.text
-    assert "ask_hermes already dispatched by deterministic route" in caplog.text
+    assert "source=hermes" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -1657,9 +1738,13 @@ async def test_duplicate_transcript_event_is_delivered_once(monkeypatch: Any) ->
 
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler._active_response_reason = "say"
+    handler._response_requests["request-say"] = (0, "say")
     handler.client = _make_fake_realtime_client(
         events=(
-            _FakeEvent("response.created", response_id="resp-say"),
+            _FakeEvent(
+                "response.created",
+                response={"id": "resp-say", "metadata": {"reachy_request_id": "request-say"}},
+            ),
             _FakeEvent(
                 "response.output_audio_transcript.done",
                 transcript=spoken,
@@ -1742,9 +1827,13 @@ async def test_distinct_response_ids_are_not_suppressed_by_identical_text(monkey
     spoken = "Your next 311 bus is arriving in 7 minutes at Macleay St."
 
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._response_requests = {"request-one": (0, "say"), "request-two": (0, "say")}
     handler.client = _make_fake_realtime_client(
         events=(
-            _FakeEvent("response.created", response_id="resp-one"),
+            _FakeEvent(
+                "response.created",
+                response={"id": "resp-one", "metadata": {"reachy_request_id": "request-one"}},
+            ),
             _FakeEvent(
                 "response.output_audio_transcript.done",
                 transcript=spoken,
@@ -1754,7 +1843,10 @@ async def test_distinct_response_ids_are_not_suppressed_by_identical_text(monkey
                 event_id="evt-one",
             ),
             _FakeEvent("response.done"),
-            _FakeEvent("response.created", response_id="resp-two"),
+            _FakeEvent(
+                "response.created",
+                response={"id": "resp-two", "metadata": {"reachy_request_id": "request-two"}},
+            ),
             _FakeEvent(
                 "response.output_audio_transcript.done",
                 transcript=spoken,
@@ -2294,7 +2386,10 @@ async def test_local_response_create_uses_session_tools_only(monkeypatch: Any) -
     sender_task.cancel()
     await sender_task
 
-    handler.connection.response.create.assert_awaited_once_with()
+    handler.connection.response.create.assert_awaited_once()
+    response = handler.connection.response.create.await_args.kwargs["response"]
+    assert "tools" not in response
+    assert response["metadata"]["reachy_request_id"]
 
 
 @pytest.mark.asyncio
@@ -2318,28 +2413,22 @@ async def test_tool_followup_passes_tool_choice_on_response_create(monkeypatch: 
     sender_task.cancel()
     await sender_task
 
-    handler.connection.response.create.assert_awaited_once_with(response={"tool_choice": "none"})
+    handler.connection.response.create.assert_awaited_once()
+    response = handler.connection.response.create.await_args.kwargs["response"]
+    assert response["tool_choice"] == "none"
+    assert response["metadata"]["reachy_request_id"]
     handler.connection.session.update.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_response_create_retries_when_server_does_not_acknowledge(monkeypatch: Any) -> None:
-    """A dropped response.create acknowledgement should not stall the conversation."""
+async def test_response_create_does_not_replay_when_acknowledgement_is_missing(monkeypatch: Any) -> None:
+    """An uncertain send must be cancelled rather than spoken twice."""
     monkeypatch.setattr(hf_mod, "_RESPONSE_STARTED_TIMEOUT", 0.01)
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler.connection = MagicMock()
     response_sent = asyncio.Event()
-    send_count = 0
-
-    async def acknowledge_retry(**_kwargs: Any) -> None:
-        nonlocal send_count
-        send_count += 1
-        if send_count == 2:
-            handler._response_started_or_rejected_event.set()
-            handler._response_done_event.set()
-            response_sent.set()
-
-    handler.connection.response.create = AsyncMock(side_effect=acknowledge_retry)
+    handler.connection.response.create = AsyncMock()
+    handler.connection.response.cancel = AsyncMock(side_effect=response_sent.set)
     await handler._safe_response_create(reason="tool_result:reef_status")
     sender_task = asyncio.create_task(handler._response_sender_loop())
 
@@ -2347,7 +2436,8 @@ async def test_response_create_retries_when_server_does_not_acknowledge(monkeypa
     sender_task.cancel()
     await sender_task
 
-    assert handler.connection.response.create.await_count == 2
+    assert handler.connection.response.create.await_count == 1
+    assert handler._response_requests == {}
 
 
 @pytest.mark.asyncio
@@ -2659,3 +2749,261 @@ async def test_start_up_waits_when_session_slots_are_full(monkeypatch: Any, capl
 
     assert update_errors == []
     assert "no free session slot" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_camera_vision_unavailable_does_not_attach_image(monkeypatch: Any) -> None:
+    """Text-only models get a structured vision fallback without poisoning history."""
+    monkeypatch.setattr(hf_mod, "hf_vision_input_enabled", lambda: False)
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler.output_queue = asyncio.Queue()
+    monkeypatch.setattr(handler, "_wait_for_response_done_before_tool_result", AsyncMock(return_value=True))
+    say = AsyncMock()
+    create = AsyncMock()
+    monkeypatch.setattr(handler, "say", say)
+    monkeypatch.setattr(handler, "_safe_response_create", create)
+
+    await handler._handle_tool_result(
+        ToolNotification(
+            id="call_cam",
+            tool_name="camera",
+            is_idle_tool_call=False,
+            status=ToolState.COMPLETED,
+            result={
+                "status": "vision_unavailable",
+                "reason": "active_model_does_not_support_images",
+                "spoken": "I can capture the camera image, but my current local model can't interpret images.",
+            },
+        )
+    )
+
+    item_create = handler.connection.conversation.item.create
+    for call in item_create.await_args_list:
+        item = call.kwargs.get("item") or {}
+        content = item.get("content") or []
+        assert all(part.get("type") != "input_image" for part in content if isinstance(part, dict))
+    say.assert_awaited_once()
+    assert "can't interpret images" in say.await_args.args[0]
+    create.assert_not_awaited()
+    assert handler._pending_camera_image_item_ids == []
+
+
+@pytest.mark.asyncio
+async def test_camera_image_attach_skipped_when_vision_disabled(monkeypatch: Any) -> None:
+    """Even a legacy b64 payload must not be attached when vision is disabled."""
+    monkeypatch.setattr(hf_mod, "hf_vision_input_enabled", lambda: False)
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler.output_queue = asyncio.Queue()
+    monkeypatch.setattr(handler, "_wait_for_response_done_before_tool_result", AsyncMock(return_value=True))
+    monkeypatch.setattr(handler, "say", AsyncMock())
+    monkeypatch.setattr(handler, "_safe_response_create", AsyncMock())
+
+    await handler._handle_tool_result(
+        ToolNotification(
+            id="call_cam",
+            tool_name="camera",
+            is_idle_tool_call=False,
+            status=ToolState.COMPLETED,
+            result={"b64_im": base64.b64encode(b"\xff\xd8\xff\xd9").decode("ascii")},
+        )
+    )
+
+    for call in handler.connection.conversation.item.create.await_args_list:
+        item = call.kwargs.get("item") or {}
+        content = item.get("content") or []
+        assert all(part.get("type") != "input_image" for part in content if isinstance(part, dict))
+    assert handler._pending_camera_image_item_ids == []
+
+
+@pytest.mark.asyncio
+async def test_failed_camera_image_is_removed_from_history(monkeypatch: Any) -> None:
+    """Unsupported-image errors delete the pending camera item so the next turn can succeed."""
+    monkeypatch.setattr(hf_mod, "hf_vision_input_enabled", lambda: True)
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler.output_queue = asyncio.Queue()
+    monkeypatch.setattr(handler, "_wait_for_response_done_before_tool_result", AsyncMock(return_value=True))
+    monkeypatch.setattr(handler, "_safe_response_create", AsyncMock())
+
+    await handler._handle_tool_result(
+        ToolNotification(
+            id="call_cam",
+            tool_name="camera",
+            is_idle_tool_call=False,
+            status=ToolState.COMPLETED,
+            result={"b64_im": base64.b64encode(b"\xff\xd8\xff\xd9").decode("ascii")},
+        )
+    )
+    assert len(handler._pending_camera_image_item_ids) == 1
+    poisoned_id = handler._pending_camera_image_item_ids[0]
+
+    await handler._clear_poisoned_camera_images()
+
+    handler.connection.conversation.item.delete.assert_awaited_once_with(item_id=poisoned_id)
+    assert handler._pending_camera_image_item_ids == []
+
+
+def test_unsupported_image_input_error_detection() -> None:
+    """Match the live llama.cpp / speech-to-speech rejection text."""
+    assert hf_mod._is_unsupported_image_input_error(
+        "Language model generation failed: image input is not supported - hint: if this is unexpected, you may need to provide the mmproj"
+    )
+    assert not hf_mod._is_unsupported_image_input_error("conversation_already_has_active_response")
+
+
+def test_hf_vision_defaults_off_for_local_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Local mode refuses vision unless HF_VISION_ENABLED is explicitly true."""
+    from reachy_mini_conversation_app.config import hf_vision_input_enabled
+
+    monkeypatch.setattr(config, "HF_REALTIME_CONNECTION_MODE", "local")
+    monkeypatch.delenv("HF_VISION_ENABLED", raising=False)
+    assert hf_vision_input_enabled() is False
+    monkeypatch.setenv("HF_VISION_ENABLED", "true")
+    assert hf_vision_input_enabled() is True
+    monkeypatch.setenv("HF_VISION_ENABLED", "false")
+    monkeypatch.setattr(config, "HF_REALTIME_CONNECTION_MODE", "deployed")
+    assert hf_vision_input_enabled() is False
+
+
+@pytest.mark.asyncio
+async def test_face_id_disabled_speaks_exact_without_camera(monkeypatch: Any) -> None:
+    """Disabled on-demand FACE-ID speaks the authoritative line and never calls camera."""
+    from reachy_mini_conversation_app.face_identity.speech_authority import ON_DEMAND_DISABLED_SPOKEN
+
+    monkeypatch.setattr(hf_mod, "face_memory_on_demand_recognition_enabled", lambda: False)
+    monkeypatch.setattr(hf_mod, "hf_vision_input_enabled", lambda: False)
+    who_is = AsyncMock()
+    who_is_cls = MagicMock(return_value=who_is)
+    monkeypatch.setattr(hf_mod, "WhoIsInFrame", who_is_cls)
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._turn_generation = 7
+    handler._face_id_owns_turn = 7
+    handler._direct_speech_supported = True
+    create = AsyncMock()
+
+    monkeypatch.setattr(handler, "_suppress_unsolicited_realtime", AsyncMock())
+    monkeypatch.setattr(handler, "_safe_response_create", create)
+
+    await handler._run_fast_face_identity()
+
+    who_is_cls.assert_not_called()
+    who_is.assert_not_awaited()
+    assert handler._face_id_spoke_turn == 7
+    create.assert_awaited_once_with(
+        reason="face_identity",
+        response={"tool_choice": "none", "metadata": {"reachy_direct_text": ON_DEMAND_DISABLED_SPOKEN}},
+    )
+
+
+@pytest.mark.asyncio
+async def test_wake_reminder_skips_chat_history(monkeypatch: Any) -> None:
+    """Wake reminders must not be written into LLM chat history."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._turn_generation = 4
+    handler._direct_speech_supported = True
+    handler._user_turn_authorized = False
+    create = AsyncMock()
+    monkeypatch.setattr(handler, "_suppress_unsolicited_realtime", AsyncMock())
+    monkeypatch.setattr(handler, "_safe_response_create", create)
+
+    await handler._reject_unactivated_speech(4)
+
+    create.assert_awaited_once()
+    kwargs = create.await_args.kwargs
+    assert kwargs["reason"] == "wake_reminder"
+    metadata = kwargs["response"]["metadata"]
+    assert metadata["reachy_direct_text"] == "Please say Reachy first."
+    assert metadata["reachy_direct_skip_history"] == "true"
+
+
+@pytest.mark.asyncio
+async def test_look_request_speaks_vision_unavailable_without_llm(monkeypatch: Any) -> None:
+    """Text-only look/camera asks speak the guard line and skip general chat."""
+    monkeypatch.setattr(hf_mod, "hf_vision_input_enabled", lambda: False)
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._turn_generation = 9
+    handler._direct_speech_supported = True
+    create = AsyncMock()
+    monkeypatch.setattr(handler, "_suppress_unsolicited_realtime", AsyncMock())
+    monkeypatch.setattr(handler, "_safe_response_create", create)
+
+    handler._start_fast_vision_unavailable("Reachy, look at what's in front of you.")
+    assert handler._suppress_unsolicited_response_turn == 9
+    await handler._run_fast_vision_unavailable()
+
+    create.assert_awaited_once_with(
+        reason="vision_unavailable",
+        response={"tool_choice": "none", "metadata": {"reachy_direct_text": VISION_UNAVAILABLE_SPOKEN}},
+    )
+
+
+def test_start_fast_vision_unavailable_skips_when_vision_enabled(monkeypatch: Any) -> None:
+    """Vision-capable models keep look/camera routing with the normal tool path."""
+    monkeypatch.setattr(hf_mod, "hf_vision_input_enabled", lambda: True)
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._turn_generation = 2
+    monkeypatch.setattr(hf_mod.asyncio, "create_task", MagicMock())
+    handler._start_fast_vision_unavailable("Reachy, look at what's in front of you.")
+    assert handler._suppress_unsolicited_response_turn is None
+
+
+def test_start_fast_face_identity_claims_turn(monkeypatch: Any) -> None:
+    """Person-identity questions claim the turn before the realtime model can answer."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._turn_generation = 3
+    created: list[Any] = []
+
+    def capture_task(coro: Any, *, name: str | None = None) -> MagicMock:
+        created.append((coro, name))
+        coro.close()
+        return MagicMock()
+
+    monkeypatch.setattr(hf_mod.asyncio, "create_task", capture_task)
+    handler._start_fast_face_identity("Reachy, who's this?")
+
+    assert handler._face_id_owns_turn == 3
+    assert handler._suppress_unsolicited_response_turn == 3
+    assert created and created[0][1] == "face-identity-fast-path"
+
+
+def test_start_fast_face_identity_ignores_self_identity(monkeypatch: Any) -> None:
+    """Self-identity questions must not claim the FACE-ID turn."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._turn_generation = 4
+    monkeypatch.setattr(hf_mod.asyncio, "create_task", MagicMock())
+    handler._start_fast_face_identity("Reachy, who are you?")
+    assert handler._face_id_owns_turn is None
+
+
+@pytest.mark.asyncio
+async def test_face_id_tool_result_speech_uses_authoritative_prompt(monkeypatch: Any) -> None:
+    """LLM who_is_in_frame results still speak via the FACE-ID constrained prompt."""
+    from reachy_mini_conversation_app.face_identity.speech_authority import ON_DEMAND_DISABLED_SPOKEN
+
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler.connection = AsyncMock()
+    handler.output_queue = asyncio.Queue()
+    handler._turn_generation = 2
+    monkeypatch.setattr(handler, "_wait_for_response_done_before_tool_result", AsyncMock(return_value=True))
+    speak = AsyncMock()
+    monkeypatch.setattr(handler, "_speak_deterministic", speak)
+    monkeypatch.setattr(handler, "_safe_response_create", AsyncMock())
+
+    await handler._handle_tool_result(
+        ToolNotification(
+            id="call_face",
+            tool_name="who_is_in_frame",
+            is_idle_tool_call=False,
+            status=ToolState.COMPLETED,
+            result={"status": "disabled", "spoken": ON_DEMAND_DISABLED_SPOKEN},
+        )
+    )
+
+    speak.assert_awaited_once()
+    assert speak.await_args.args[0] == ON_DEMAND_DISABLED_SPOKEN
+    assert speak.await_args.kwargs.get("reason") == "tool_result:who_is_in_frame"
+    assert handler._face_id_spoke_turn == 2
+    assert handler._pending_camera_image_item_ids == []

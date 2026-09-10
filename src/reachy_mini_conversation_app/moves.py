@@ -221,6 +221,8 @@ class MovementManager:
         self._antenna_blend_duration = 0.4  # seconds to blend back after listening
         self._last_listening_blend_time = self._now()
         self._breathing_active = False  # true when breathing move is running or queued
+        self._photo_stillness = False  # suppress breathing/wobble during photo capture
+        self._photo_wobble_disabled = False
         self._listening_debounce_s = 0.15
         self._last_listening_toggle_time = self._now()
         self._last_set_target_err = 0.0
@@ -289,6 +291,26 @@ class MovementManager:
     def set_head_tracking(self, enabled: bool) -> None:
         """Start or stop following the user's face; thread-safe via the command queue."""
         self._command_queue.put(("set_head_tracking", enabled))
+
+    def get_head_tracking_enabled(self) -> bool:
+        """Return whether head tracking is currently enabled."""
+        return self._head_tracking
+
+    def freeze_head_tracking(self) -> None:
+        """Hold the head still by setting tracking weight to 0 while leaving tracking enabled."""
+        self._command_queue.put(("freeze_head_tracking", None))
+
+    def restore_head_tracking(self, was_enabled: bool) -> None:
+        """Restore the exact prior tracking enabled/disabled state after a temporary freeze."""
+        self._command_queue.put(("restore_head_tracking", bool(was_enabled)))
+
+    def hold_still_for_capture(self) -> None:
+        """Stop breathing/moves and pause daemon wobble for a short photo capture."""
+        self._command_queue.put(("hold_still_for_capture", None))
+
+    def release_capture_stillness(self) -> None:
+        """Allow breathing again and re-enable daemon wobble after photo capture."""
+        self._command_queue.put(("release_capture_stillness", None))
 
     def set_speaking(self, speaking: bool) -> None:
         """Pause head tracking while the assistant speaks, resume it afterwards.
@@ -382,6 +404,54 @@ class MovementManager:
                     self.current_robot.stop_head_tracking()
             except Exception as e:
                 logger.warning("Head-tracking toggle failed: %s", e)
+        elif command == "freeze_head_tracking":
+            if not self._head_tracking:
+                return
+            try:
+                self.current_robot.start_head_tracking(weight=0.0)
+            except Exception as e:
+                logger.warning("Head-tracking freeze failed: %s", e)
+        elif command == "restore_head_tracking":
+            was_enabled = bool(payload)
+            self._track_anchor = None
+            self._is_speaking = False
+            try:
+                if was_enabled:
+                    self._head_tracking = True
+                    self.current_robot.start_head_tracking(weight=1.0)
+                else:
+                    self._head_tracking = False
+                    self.current_robot.stop_head_tracking()
+            except Exception as e:
+                logger.warning("Head-tracking restore failed: %s", e)
+        elif command == "hold_still_for_capture":
+            self.move_queue.clear()
+            self.state.current_move = None
+            self.state.move_start_time = None
+            self._breathing_active = False
+            self._photo_stillness = True
+            self._photo_wobble_disabled = False
+            self.state.update_activity()
+            disable_wobble = getattr(self.current_robot, "disable_wobbling", None)
+            if disable_wobble is not None:
+                try:
+                    disable_wobble()
+                    self._photo_wobble_disabled = True
+                except Exception as e:
+                    logger.warning("Failed to disable wobbling for photo capture: %s", e)
+            logger.info("Photo capture stillness enabled")
+        elif command == "release_capture_stillness":
+            self._photo_stillness = False
+            self.state.update_activity()
+            if self._photo_wobble_disabled:
+                enable_wobble = getattr(self.current_robot, "enable_wobbling", None)
+                if enable_wobble is not None:
+                    try:
+                        enable_wobble()
+                    except Exception as e:
+                        logger.warning("Failed to re-enable wobbling after photo capture: %s", e)
+                self._photo_wobble_disabled = False
+            logger.info("Photo capture stillness released")
         elif command == "set_speaking":
             if not self._head_tracking:
                 return
@@ -430,6 +500,7 @@ class MovementManager:
             self.state.current_move is None
             and not self.move_queue
             and not self._is_listening
+            and not self._photo_stillness
             and not self._breathing_active
         ):
             idle_for = current_time - self.state.last_activity_time

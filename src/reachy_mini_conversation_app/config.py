@@ -84,6 +84,7 @@ DEFAULT_REEF_CACHE_MAX_AGE_SECONDS = 3600
 HF_LOCAL_CONNECTION_MODE = "local"
 HF_DEPLOYED_CONNECTION_MODE = "deployed"
 HF_REALTIME_SESSION_PROXY_URL = "https://pollen-robotics-reachy-mini-realtime-url.hf.space/session"
+HF_VISION_ENABLED_ENV = "HF_VISION_ENABLED"
 
 
 @dataclass(frozen=True)
@@ -594,6 +595,16 @@ def get_hf_connection_selection() -> HFConnectionSelection:
 def has_hf_realtime_target() -> bool:
     """Return whether Hugging Face has a target for the selected mode."""
     return get_hf_connection_selection().has_target
+
+
+def hf_vision_input_enabled() -> bool:
+    """Return whether the active realtime model is known to accept image input."""
+    raw = os.getenv(HF_VISION_ENABLED_ENV)
+    if raw is not None and str(raw).strip() != "":
+        return _env_flag(HF_VISION_ENABLED_ENV, False)
+    # Local llama.cpp stacks reject images without mmproj; do not attach by default.
+    mode = _normalize_hf_connection_mode(getattr(config, "HF_REALTIME_CONNECTION_MODE", None))
+    return mode != HF_LOCAL_CONNECTION_MODE
 
 
 def set_instance_path(instance_path: str | Path | None) -> None:

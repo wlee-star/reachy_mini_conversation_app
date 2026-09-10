@@ -4,70 +4,75 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="dark" />
-    <title>Reachy Mini AI Control</title>
+    <meta name="theme-color" content="#07090f" />
+    <title>Reachy Mini Control</title>
     <link rel="stylesheet" href="/static/style.css" />
+    <link rel="stylesheet" href="/static/dashboard.css" />
   </head>
   <body>
-    <div class="shell">
-      <header class="top">
-        <div class="brand">
-          <span class="brand__mark" aria-hidden="true"></span>
-          <div>
-            <h1>Reachy Mini AI Control</h1>
-            <p class="brand__sub">Local stack monitor · does not move the robot</p>
-          </div>
-        </div>
-        <div class="top__actions">
-          <label class="toggle">
-            <input id="dev-mode" type="checkbox" />
-            Dev mode
-          </label>
-          <label class="toggle">
-            <input id="auto-restart" type="checkbox" />
-            Auto-recover
-          </label>
-          <nav class="nav">
-            <a href="#/">Overview</a>
-            <a href="#/physical">Physical</a>
-            <a href="#/config">Config</a>
-            <a href="#/tests">Tests</a>
-          </nav>
-        </div>
-      </header>
-
-      <section class="ready" id="ready-banner">
-        <div>
-          <p class="ready__label" id="ready-label">Checking stack…</p>
-          <p class="ready__reason" id="ready-reason"></p>
-        </div>
-        <div class="ready__buttons">
-          <button type="button" class="btn btn--primary" id="start-all">Start all</button>
-          <button type="button" class="btn btn--danger" id="stop-all">Stop all</button>
-        </div>
-      </section>
-
-      <p class="progress" id="progress" hidden></p>
-
-      <main id="view"></main>
-
-      <aside class="events">
-        <div class="events__head">
-          <h2>Live events</h2>
-          <div class="events__tools">
-            <select id="event-filter" aria-label="Filter events">
-              <option value="">All services</option>
-            </select>
-            <label class="toggle toggle--small">
-              <input id="errors-only" type="checkbox" />
-              Errors
-            </label>
-            <button type="button" class="btn btn--ghost" id="pause-events">Pause</button>
-            <button type="button" class="btn btn--ghost" id="clear-events">Clear</button>
-          </div>
-        </div>
-        <ol id="event-list" class="event-list"></ol>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Primary navigation">
+        <a class="logo" href="#/" aria-label="Reachy Mini overview">
+          <span class="logo__orb" aria-hidden="true">R</span>
+          <span class="logo__text">Reachy<span>Mini</span></span>
+        </a>
+        <nav class="nav" id="primary-nav">
+          <a href="#/" data-label="Overview"><span class="nav__icon" aria-hidden="true">⌂</span><span>Overview</span></a>
+          <a href="#/physical" data-label="Physical"><span class="nav__icon" aria-hidden="true">◉</span><span>Physical</span></a>
+          <a href="#/simulator" data-label="Simulator"><span class="nav__icon" aria-hidden="true">◇</span><span>Simulator</span></a>
+          <a href="#/vision" data-label="Vision"><span class="nav__icon" aria-hidden="true">◎</span><span>Vision</span></a>
+          <a href="#/people" data-label="People"><span class="nav__icon" aria-hidden="true">♙</span><span>People</span></a>
+          <a href="#/ai-stack" data-label="AI Stack"><span class="nav__icon" aria-hidden="true">⌘</span><span>AI Stack</span></a>
+          <a href="#/tools" data-label="Tools"><span class="nav__icon" aria-hidden="true">✦</span><span>Tools</span></a>
+          <a href="#/logs" data-label="Logs"><span class="nav__icon" aria-hidden="true">≡</span><span>Logs</span></a>
+          <a href="#/settings" data-label="Settings"><span class="nav__icon" aria-hidden="true">⚙</span><span>Settings</span></a>
+        </nav>
+        <div class="sidebar__foot"><span class="sidebar__pulse" aria-hidden="true"></span><span>Local control</span></div>
       </aside>
+
+      <div class="workspace">
+        <header class="command-bar">
+          <div class="command-bar__title">
+            <p class="eyebrow">REACHY MINI CONTROL</p>
+            <p id="current-section">Overview</p>
+          </div>
+          <div class="health-strip" id="health-strip" aria-label="System health">
+            <span class="health-strip__loading">Reading system health…</span>
+          </div>
+          <div class="command-bar__clock" aria-label="Local time">
+            <span id="local-time">--:--</span><small id="local-date">Local</small>
+          </div>
+        </header>
+
+        <section class="ready" id="ready-banner" aria-live="polite">
+          <div class="ready__state">
+            <span class="ready__indicator" aria-hidden="true"></span>
+            <div><p class="ready__label" id="ready-label">Checking system…</p><p class="ready__reason" id="ready-reason"></p></div>
+          </div>
+          <div class="ready__buttons">
+            <button type="button" class="btn btn--primary" id="start-all">Start stack</button>
+            <button type="button" class="btn btn--danger" id="stop-all">Stop managed</button>
+          </div>
+        </section>
+
+        <p class="progress" id="progress" role="status" hidden></p>
+        <main id="view" tabindex="-1"></main>
+
+        <aside class="events" id="events-panel" hidden>
+          <div class="events__head">
+            <div><p class="eyebrow">LOCAL EVENT STREAM</p><h2>System events</h2></div>
+            <div class="events__tools">
+              <select id="event-filter" aria-label="Filter events"><option value="">All services</option></select>
+              <label class="toggle toggle--small"><input id="errors-only" type="checkbox" />Errors only</label>
+              <button type="button" class="btn btn--ghost" id="pause-events">Pause</button>
+              <button type="button" class="btn btn--ghost" id="clear-events">Clear view</button>
+            </div>
+          </div>
+          <ol id="event-list" class="event-list"></ol>
+        </aside>
+      </div>
     </div>
+    <script src="/static/people.js"></script>
     <script src="/static/app.js"></script>
   </body>
 </html>

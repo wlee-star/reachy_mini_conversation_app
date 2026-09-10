@@ -70,6 +70,11 @@ class GoToSleep(Tool):
             return {"error": "go_to_sleep is unavailable in this runtime"}
 
         logger.info("Tool call: go_to_sleep")
+        if deps.face_memory_service is not None:
+            try:
+                deps.face_memory_service.abort_photo_enrolment(deps.movement_manager)
+            except Exception as abort_error:
+                logger.warning("Failed to abort photo enrolment before sleep: %s", abort_error)
         try:
             return await asyncio.to_thread(deps.go_to_sleep)
         except Exception as e:

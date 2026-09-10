@@ -393,7 +393,9 @@ def build_physical_status(config: DashboardConfig, health_fn: Any) -> dict[str, 
             "port": target.port,
             "simulation_enabled": target.simulation_enabled,
             "summary": target.summary,
-            "assistant_name": (config.env.get("ASSISTANT_NAME") or config.env.get("WAKE_NAME") or "Reachy Mini").strip()
+            "assistant_name": (
+                config.env.get("ASSISTANT_NAME") or config.env.get("WAKE_NAME") or "Reachy Mini"
+            ).strip()
             or "Reachy Mini",
         },
         "banners": {

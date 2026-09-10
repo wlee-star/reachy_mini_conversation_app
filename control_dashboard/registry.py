@@ -1,8 +1,8 @@
 """Load the service registry from JSON and the conversation app .env."""
 
 from __future__ import annotations
-import json
 import sys
+import json
 import shutil
 import logging
 from typing import Any

@@ -140,6 +140,7 @@ class LocalStream:
         self._last_user_level = 0.0
         self._last_assistant_level = 0.0
         self._speaker_test_lock = threading.Lock()
+        self._dashboard_camera_lock = threading.Lock()
         self._backend_connection_state = "not_started"
         self._backend_error: str | None = None
         self._backend_retry_delay = BACKEND_RETRY_DELAY_SECONDS
@@ -181,9 +182,7 @@ class LocalStream:
     _LEVEL_GAIN = 6.0
 
     def _emit_level(self, role: str, frame: Any) -> None:
-        """Emit a throttled conversation.level (RMS) for ``role`` (user/assistant)."""
-        if self._rpc is None:
-            return
+        """Update dashboard RMS levels; optionally broadcast to the Gradio RPC UI."""
         now = time.monotonic()
         if now - self._last_level_emit.get(role, 0.0) < self._LEVEL_INTERVAL_S:
             return
@@ -198,7 +197,9 @@ class LocalStream:
             self._last_user_level = level
         elif role == "assistant":
             self._last_assistant_level = level
-        self._rpc.broadcast_threadsafe("conversation.level", {"role": role, "rms": round(level, 3)})
+        # Dashboard /api/dashboard/status reads these fields even when no Gradio client is connected.
+        if self._rpc is not None:
+            self._rpc.broadcast_threadsafe("conversation.level", {"role": role, "rms": round(level, 3)})
 
     # Map backend activity reasons to the orb's turn states (mirrors the old
     # browser orb's mapActivityToState so the orb reliably reaches listening/
@@ -937,8 +938,15 @@ class LocalStream:
         except Exception as exc:
             logger.debug("Output sample rate unavailable: %s", exc)
 
-        mic_status = "muted" if self._mic_muted else ("listening" if self._last_user_level > 0.02 else "idle")
-        speaker_status = "muted" if self._speaker_muted else "ready"
+        now = time.monotonic()
+        microphone_level = self._last_user_level if now - self._last_level_emit.get("user", 0.0) < 0.4 else 0.0
+        speaker_level = self._last_assistant_level if now - self._last_level_emit.get("assistant", 0.0) < 0.4 else 0.0
+        if self._mic_muted:
+            microphone_level = 0.0
+        if self._speaker_muted:
+            speaker_level = 0.0
+        mic_status = "muted" if self._mic_muted else ("listening" if microphone_level > 0.02 else "idle")
+        speaker_status = "muted" if self._speaker_muted else ("playing" if speaker_level > 0.02 else "ready")
         camera_status = "ready"
         camera_summary = "Camera is served through the Reachy Mini media manager (no second pipeline)."
         if getattr(media, "get_frame_jpeg", None) is None:
@@ -949,12 +957,12 @@ class LocalStream:
             "microphone_status": mic_status,
             "microphone_summary": f"Microphone is {mic_status}.",
             "microphone_muted": self._mic_muted,
-            "microphone_level": round(self._last_user_level, 3),
+            "microphone_level": round(microphone_level, 3),
             "input_sample_rate": input_rate,
             "speaker_status": speaker_status,
             "speaker_summary": f"Speaker is {speaker_status}.",
             "speaker_muted": self._speaker_muted,
-            "speaker_level": round(self._last_assistant_level, 3),
+            "speaker_level": round(speaker_level, 3),
             "output_sample_rate": output_rate,
             "volume_control": False,
             "volume_control_summary": (
@@ -1027,14 +1035,27 @@ class LocalStream:
 
         @settings_app.get("/api/dashboard/camera.jpg")
         def _dashboard_camera() -> Response:
+            if not self._dashboard_camera_lock.acquire(blocking=False):
+                return JSONResponse({"error": "preview busy; request the latest frame again"}, status_code=503)
+            started = time.perf_counter()
             try:
                 jpeg = self._robot.media.get_frame_jpeg()
             except Exception as exc:
                 logger.warning("Dashboard camera frame failed: %s", exc)
                 return JSONResponse({"error": f"camera unavailable: {type(exc).__name__}"}, status_code=503)
+            finally:
+                self._dashboard_camera_lock.release()
             if not jpeg:
                 return JSONResponse({"error": "no frame"}, status_code=503)
-            return Response(content=jpeg, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            return Response(
+                content=jpeg,
+                media_type="image/jpeg",
+                headers={
+                    "Cache-Control": "no-store",
+                    "Server-Timing": f"camera;dur={elapsed_ms:.1f}",
+                },
+            )
 
         @settings_app.post("/api/dashboard/safe-stop")
         def _dashboard_safe_stop() -> dict[str, Any]:

@@ -20,7 +20,7 @@ from reachy_mini_conversation_app.utils import (
     setup_logger,
     log_connection_troubleshooting,
 )
-from reachy_mini_conversation_app.simulator import ensure_simulator_running
+from reachy_mini_conversation_app.simulator import ensure_simulator_running, configured_remote_daemon_host
 
 
 if TYPE_CHECKING:
@@ -138,7 +138,11 @@ def run(
                 robot_kwargs["robot_name"] = args.robot_name
 
             logger.info("Initializing ReachyMini (SDK will auto-detect appropriate backend)")
-            robot = ReachyMini(**robot_kwargs)
+            remote_daemon_host = configured_remote_daemon_host()
+            if remote_daemon_host is None:
+                robot = ReachyMini(**robot_kwargs)
+            else:
+                robot = ReachyMini(host=remote_daemon_host, connection_mode="network", **robot_kwargs)
 
         except TimeoutError as e:
             logger.error(f"Connection timeout: Failed to connect to Reachy Mini daemon. Details: {e}")
@@ -163,11 +167,29 @@ def run(
 
     movement_manager = MovementManager(current_robot=robot)
 
+    from reachy_mini_conversation_app.face_identity.service import FaceMemoryService
+    from reachy_mini_conversation_app.face_identity.settings import (
+        face_memory_enabled,
+        face_memory_photo_enrolment_enabled,
+        face_memory_live_recognition_enabled,
+        face_memory_on_demand_recognition_enabled,
+    )
+
+    face_memory_service = FaceMemoryService(instance_path=instance_path) if face_memory_enabled() else None
+    logger.info(
+        "Face memory enabled=%s photo_enrolment=%s live_recognition=%s on_demand=%s",
+        face_memory_service is not None,
+        face_memory_photo_enrolment_enabled(),
+        face_memory_live_recognition_enabled(),
+        face_memory_on_demand_recognition_enabled(),
+    )
+
     deps = ToolDependencies(
         reachy_mini=robot,
         movement_manager=movement_manager,
         instance_path=instance_path,
         camera_enabled=not args.no_camera,
+        face_memory_service=face_memory_service,
     )
 
     def build_handler(startup_voice: Optional[str] = None) -> ConversationHandler:

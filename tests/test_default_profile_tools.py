@@ -44,6 +44,13 @@ def test_default_profile_identifies_reachy_mini() -> None:
     assert "When asked your name, say Reachy Mini." in instructions
 
 
+def test_default_profile_keeps_photo_enrol_face_paused() -> None:
+    """Held-up photo enrolment stays out of the default tool list while paused."""
+    profile = read_packaged_default_profile()
+    assert "photo_enrol_face" not in profile.default_tools
+    assert "never claim that a person was enrolled" in profile.instructions.lower()
+
+
 def test_default_profile_sends_live_tank_status_to_apex() -> None:
     """Current tank status must use the local Apex snapshot, not Hermes."""
     instructions = read_packaged_default_profile().instructions

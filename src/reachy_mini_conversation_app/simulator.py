@@ -37,8 +37,15 @@ def should_launch_simulator(no_sim: bool) -> bool:
 
 
 def _remote_physical_host() -> bool:
+    return configured_remote_daemon_host() is not None
+
+
+def configured_remote_daemon_host() -> str | None:
+    """Return the configured physical daemon host, excluding local addresses."""
     host = _configured_daemon_host()
-    return host is not None and not _is_loopback_host(host)
+    if host is None or _is_loopback_host(host):
+        return None
+    return host
 
 
 def ensure_simulator_running(app_logger: logging.Logger, *, no_sim: bool) -> None:

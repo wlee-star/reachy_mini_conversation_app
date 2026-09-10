@@ -81,6 +81,9 @@ def test_time_intent_matches_common_questions() -> None:
     assert match_time_intent("What time is it now?")
     assert match_time_intent("when is the 311") is False
     assert match_time_intent("what time is the 311") is False
+    assert match_time_intent("What time is it in London?") is False
+    assert match_time_intent("what time is it in Japan") is False
+    assert match_time_intent("what time is it in LA") is False
 
 
 def test_current_time_is_logged(caplog: pytest.LogCaptureFixture) -> None:

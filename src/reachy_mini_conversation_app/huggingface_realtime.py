@@ -6,6 +6,7 @@ import random
 import asyncio
 import logging
 from typing import TYPE_CHECKING, Any, Final, Tuple, Optional
+from contextvars import ContextVar
 
 import httpx
 import numpy as np
@@ -35,6 +36,7 @@ from reachy_mini_conversation_app.config import (
     get_available_voices,
     get_hf_direct_ws_url,
     parse_hf_realtime_url,
+    hf_vision_input_enabled,
     get_hf_connection_selection,
 )
 from reachy_mini_conversation_app.prompts import (
@@ -54,6 +56,10 @@ from reachy_mini_conversation_app.tools.apex import (
     match_reef_source_question,
 )
 from reachy_mini_conversation_app.bus_monitor import get_bus_monitor, match_bus_intent
+from reachy_mini_conversation_app.tools.camera import (
+    VISION_UNAVAILABLE_SPOKEN,
+    match_camera_look_request,
+)
 from reachy_mini_conversation_app.tools.ask_hermes import AskHermes
 from reachy_mini_conversation_app.tools.core_tools import (
     ToolSpec,
@@ -82,10 +88,24 @@ from reachy_mini_conversation_app.tools.home_assistant import (
     is_device_control_success,
 )
 from reachy_mini_conversation_app.tools.tool_constants import ToolState
+from reachy_mini_conversation_app.tools.who_is_in_frame import WhoIsInFrame
+from reachy_mini_conversation_app.face_identity.settings import (
+    face_memory_photo_enrolment_enabled,
+    face_memory_on_demand_recognition_enabled,
+)
 from reachy_mini_conversation_app.tools.background_tool_manager import (
     ToolCallRoutine,
     ToolNotification,
     BackgroundToolManager,
+)
+from reachy_mini_conversation_app.face_identity.speech_authority import (
+    PHOTO_ENROLMENT_DISABLED_SPOKEN,
+    match_photo_enrolment_request,
+    spoken_for_recognition_result,
+    match_person_identity_question,
+    match_enrolment_status_question,
+    match_face_memory_success_narration,
+    honest_reply_for_unverified_enrolment,
 )
 
 
@@ -145,12 +165,13 @@ _HERMES_REEF_ALERT_PROMPT: Final[str] = (
 _REEF_SOURCE_ALERT_PROMPT: Final[str] = (
     "Speak this exact sentence to the user now. Do not call tools. Do not add extra explanation: {text}"
 )
-_WAKE_REMINDER_PROMPT: Final[str] = (
-    "Speak this exact sentence to the user now, then stop. Do not call tools. Do not add extra explanation: {text}"
-)
 _SLEEP_ALERT_PROMPT: Final[str] = (
     "Speak this exact sentence to the user now, then stop. Do not call tools. Do not add extra explanation: {text}"
 )
+_CAMERA_VISION_ALERT_PROMPT: Final[str] = (
+    "Speak this exact sentence to the user now, then stop. Do not call tools. Do not add extra explanation: {text}"
+)
+_FACE_ID_COMPETING_TOOLS: Final[frozenset[str]] = frozenset({"camera", "who_is_in_frame"})
 _COMPETING_REEF_TOOLS: Final[frozenset[str]] = frozenset({"apex", "reef_status"})
 _HERMES_SPEECH_REASONS: Final[frozenset[str]] = frozenset(
     {
@@ -229,6 +250,12 @@ def _reef_trend_keys(result: object) -> list[str]:
     if isinstance(trends, dict):
         return sorted(str(key) for key in trends)
     return []
+
+
+def _is_unsupported_image_input_error(message: str) -> bool:
+    """Return whether a realtime error means the model rejected image context."""
+    lowered = message.lower()
+    return "image input is not supported" in lowered or "mmproj" in lowered
 
 
 def _is_session_limit_error(exc: BaseException) -> bool:
@@ -370,7 +397,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         # Response-in-progress guard: the Realtime API only allows one active
         # response per conversation at a time.  A dedicated worker task
         # (_response_sender_loop) dequeues and sends one request at a time
-        self._pending_responses: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue()
+        self._pending_responses: asyncio.Queue[tuple[str, dict[str, Any], int, int]] = asyncio.Queue()
+        self._response_epoch = 0
+        self._response_turn: ContextVar[int | None] = ContextVar("response_turn", default=None)
+        self._response_requests: dict[str, tuple[int, str]] = {}
+        self._active_response_id: str | None = None
+        self._direct_speech_supported = False
         self._response_done_event: asyncio.Event = asyncio.Event()
         self._response_done_event.set()
         self._response_started_or_rejected_event: asyncio.Event = asyncio.Event()
@@ -404,7 +436,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._apex_spoke_turn: int | None = None
         self._hermes_spoke_turn: int | None = None
         self._time_spoke_turn: int | None = None
+        self._face_id_spoke_turn: int | None = None
         self._ha_fast_path_owns_turn: int | None = None
+        self._face_id_owns_turn: int | None = None
         self._reef_router_owns_turn: int | None = None
         self._reef_router_route: ReefRoute | None = None
         self._last_reef_response_source: str | None = None
@@ -423,6 +457,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._activation = ActivationSession()
         self._user_turn_authorized = False
         self._wake_reminder_task: asyncio.Task[None] | None = None
+        self._pending_camera_image_item_ids: list[str] = []
 
     @staticmethod
     def _sanitize_tool_result_for_model(tool_name: str, tool_result: dict[str, Any]) -> dict[str, Any]:
@@ -430,7 +465,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if tool_name == "camera" and "b64_im" in tool_result:
             sanitized = dict(tool_result)
             sanitized.pop("b64_im", None)
-            sanitized["image_attached"] = True
+            if hf_vision_input_enabled():
+                sanitized["image_attached"] = True
+            else:
+                sanitized["image_attached"] = False
+                sanitized.setdefault("status", "vision_unavailable")
+                sanitized.setdefault("reason", "active_model_does_not_support_images")
+                sanitized.setdefault("spoken", VISION_UNAVAILABLE_SPOKEN)
             return sanitized
         return tool_result
 
@@ -635,16 +676,154 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             return
         await self._speak_sleep_update("Goodnight.")
 
-    def _claim_deterministic_route(self) -> None:
-        """Own this turn as soon as a deterministic reef/bus/HA route is known."""
+    def _start_fast_face_memory_guard(self, transcript: str) -> None:
+        """Block paused photo enrolment and unverified enrolment success hallucinations."""
+        photo_request = match_photo_enrolment_request(transcript)
+        success_narration = match_face_memory_success_narration(transcript)
+        status_question = match_enrolment_status_question(transcript)
+        if not (photo_request or success_narration or status_question):
+            return
+        if photo_request and face_memory_photo_enrolment_enabled():
+            # When photo enrolment is intentionally re-enabled, leave routing to tools/LLM.
+            return
+        spoken = (
+            PHOTO_ENROLMENT_DISABLED_SPOKEN
+            if photo_request and not face_memory_photo_enrolment_enabled()
+            else honest_reply_for_unverified_enrolment()
+        )
+        self._claim_deterministic_route()
+        asyncio.create_task(
+            self._run_fast_face_memory_guard(spoken),
+            name="face-memory-guard",
+        )
+
+    def _start_fast_face_identity(self, transcript: str) -> None:
+        """Route explicit 'who is this?' questions to on-demand face recognition."""
+        if not match_person_identity_question(transcript):
+            return
+        logger.info("[FACE-ID] intent matched transcript=%r", transcript)
+        self._face_id_owns_turn = self._turn_generation
+        self._claim_deterministic_route()
+        asyncio.create_task(self._run_fast_face_identity(), name="face-identity-fast-path")
+
+    async def _speak_deterministic(
+        self,
+        text: str,
+        *,
+        reason: str,
+        skip_history: bool = False,
+    ) -> None:
+        """Send the authoritative sentence to the session's existing TTS pipeline."""
+        if not self._direct_speech_supported:
+            raise RuntimeError("The speech server does not support deterministic TTS")
+        metadata: dict[str, str] = {"reachy_direct_text": text}
+        if skip_history:
+            metadata["reachy_direct_skip_history"] = "true"
+        await self._safe_response_create(
+            reason=reason,
+            response={"tool_choice": "none", "metadata": metadata},
+        )
+
+    def _start_fast_vision_unavailable(self, transcript: str) -> None:
+        """When the local model cannot interpret images, answer look/camera asks directly."""
+        if hf_vision_input_enabled():
+            return
+        if not match_camera_look_request(transcript):
+            return
+        if match_person_identity_question(transcript):
+            return
+        logger.info("[VISION] look/camera intent with text-only model transcript=%r", transcript)
+        self._claim_deterministic_route()
+        asyncio.create_task(self._run_fast_vision_unavailable(), name="vision-unavailable-fast-path")
+
+    async def _run_fast_vision_unavailable(self) -> None:
+        """Speak the vision-unavailable line without letting the LLM invent a scene."""
+        turn = self._response_turn.get()
+        if turn is None:
+            turn = self._turn_generation
+        if turn != self._turn_generation:
+            return
+        await self._suppress_unsolicited_realtime()
         self._suppress_unsolicited_response_turn = self._turn_generation
-        if self._active_response_reason is None:
-            self._drop_active_response_output = True
+        try:
+            await self._speak_deterministic(VISION_UNAVAILABLE_SPOKEN, reason="vision_unavailable")
+        except Exception as exc:
+            logger.warning("[VISION] unavailable speech failed: %s", exc)
+
+    async def _run_fast_face_identity(self) -> None:
+        """Run YuNet/SFace recognition and speak the authoritative result."""
+        turn = self._response_turn.get()
+        if turn is None:
+            turn = self._turn_generation
+        if turn != self._turn_generation or self._face_id_spoke_turn == turn:
+            return
+        await self._suppress_unsolicited_realtime()
+        started = time.perf_counter()
+        vision_supported = hf_vision_input_enabled()
+        recognition_invoked = False
+        try:
+            if not face_memory_on_demand_recognition_enabled():
+                result: dict[str, Any] = {"error": "on_demand_recognition_disabled", "status": "disabled"}
+            else:
+                recognition_invoked = True
+                result = await WhoIsInFrame()(self.deps)
+        except Exception as exc:
+            logger.warning("[FACE-ID] recognition failed: %s", exc)
+            result = {"error": f"recognition_failed: {type(exc).__name__}", "status": "error"}
+        spoken = spoken_for_recognition_result(result if isinstance(result, dict) else None)
+        if turn != self._turn_generation:
+            logger.info("[FACE-ID] discarding stale recognition result turn=%s", turn)
+            return
+        status = result.get("status") if isinstance(result, dict) else None
+        logger.info(
+            "[FACE-ID] deterministic response status=%s direct_speech=true vision_supported=%s "
+            "recognition_invoked=%s camera_tool=false pending_vision_action=false spoken=%s",
+            status,
+            vision_supported,
+            recognition_invoked,
+            spoken,
+        )
+        logger.info(
+            "[FACE-ID] fast-path finished in %.0f ms status=%s spoken=%s",
+            (time.perf_counter() - started) * 1000,
+            status,
+            spoken,
+        )
+        self._suppress_unsolicited_response_turn = self._turn_generation
+        try:
+            await self._speak_deterministic(spoken, reason="face_identity")
+            self._face_id_spoke_turn = turn
+        except Exception as exc:
+            logger.warning("[FACE-ID] recognition speech failed: %s", exc)
+
+    async def _run_fast_face_memory_guard(self, spoken: str) -> None:
+        """Speak an honest face-memory reply and keep the LLM from inventing success."""
+        await self._suppress_unsolicited_realtime()
+        try:
+            await self._speak_deterministic(spoken, reason="face_memory_guard")
+        except Exception as exc:
+            logger.warning("[FACE_MEMORY] guard speech failed: %s", exc)
+
+    def _claim_deterministic_route(self) -> None:
+        """Claim exclusive output for the current deterministic route."""
+        turn = self._response_turn.get()
+        if turn is not None and turn != self._turn_generation:
+            return
+        self._response_epoch += 1
+        self._suppress_unsolicited_response_turn = self._turn_generation
+        self._drop_active_response_output = True
+        self._active_response_id = None
+        self._response_requests.clear()
+        if self._clear_queue:
+            self._clear_queue()
 
     async def _suppress_unsolicited_realtime(self) -> None:
         """Stop the realtime model from answering a turn a deterministic route owns."""
+        turn = self._response_turn.get()
+        if turn is not None and turn != self._turn_generation:
+            return
         self._claim_deterministic_route()
-        if not self._response_done_event.is_set() and self._active_response_reason is None:
+        if not self._response_done_event.is_set():
             logger.info("[ROUTER] suppressing unsolicited realtime response reason=deterministic_route")
             await self._cancel_active_realtime_response()
 
@@ -859,16 +1038,20 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 (self._turn_user_done_at - self._turn_speech_stopped_at) * 1000,
             )
         self._turn_generation += 1
+        self._response_turn.set(self._turn_generation)
         self._in_flight_tool_calls.clear()
         self._tool_batch_needs_response = False
         self._reset_device_success_turn_state()
         self._reset_active_response_audio_state()
         self._delivered_assistant_transcript_ids.clear()
         self._suppress_unsolicited_response_turn = None
-        self._drop_active_response_output = False
+        self._drop_active_response_output = True
+        self._active_response_id = None
+        self._response_requests.clear()
         self._reef_router_owns_turn = None
         self._reef_router_route = None
         self._ha_fast_path_owns_turn = None
+        self._face_id_owns_turn = None
         decision = self._activation.evaluate(transcript)
         self._user_turn_authorized = decision.authorized
         if not decision.authorized:
@@ -879,12 +1062,21 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._cancel_wake_reminder(start_new=False)
         logger.info("Reachy processing request")
         command = decision.command_text or transcript
-        self._start_fast_ha_command(command)
-        self._start_fast_bus_command(command)
-        self._start_fast_apex_command(command)
-        self._start_fast_time_command(command)
-        self._start_fast_dance_emotion(command)
-        self._start_fast_sleep_command(command)
+        for route in (
+            self._start_fast_ha_command,
+            self._start_fast_bus_command,
+            self._start_fast_apex_command,
+            self._start_fast_time_command,
+            self._start_fast_dance_emotion,
+            self._start_fast_sleep_command,
+            self._start_fast_face_identity,
+            self._start_fast_face_memory_guard,
+            self._start_fast_vision_unavailable,
+        ):
+            route(command)
+            if self._suppress_unsolicited_response_turn == self._turn_generation:
+                return
+        asyncio.create_task(self._safe_response_create(reason="general_chat"), name="general-chat-response")
 
     def _cancel_wake_reminder(self, *, start_new: bool) -> None:
         """Cancel a pending wake reminder; optionally start a fresh one for this turn."""
@@ -904,7 +1096,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     def _drop_queued_responses(self, *, reason: str) -> None:
         """Remove queued response.create payloads matching ``reason`` without losing others."""
-        kept: list[tuple[str, dict[str, Any]]] = []
+        kept: list[tuple[str, dict[str, Any], int, int]] = []
         while True:
             try:
                 item = self._pending_responses.get_nowait()
@@ -923,11 +1115,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             return
         reminder = wake_reminder_text()
         try:
-            await self.say(
-                _WAKE_REMINDER_PROMPT.format(text=reminder),
-                reason="wake_reminder",
-                **_TOOL_FOLLOWUP_CREATE_KWARGS,
-            )
+            await self._speak_deterministic(reminder, reason="wake_reminder", skip_history=True)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1316,7 +1504,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         model="gpt-4o-transcribe",
                         language=config.REALTIME_TRANSCRIPTION_LANGUAGE,
                     ),
-                    turn_detection=ServerVad(type="server_vad", interrupt_response=True),
+                    turn_detection=ServerVad(type="server_vad", interrupt_response=True, create_response=False),
                 ),
                 output=RealtimeAudioConfigOutputParam(
                     format=_native_rate_audio_pcm(),  # type: ignore[typeddict-item]
@@ -1507,7 +1695,13 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         This method never blocks the caller.
         """
         logger.info("Queued response.create reason=%s", reason)
-        await self._pending_responses.put((reason, kwargs))
+        turn = self._response_turn.get()
+        if turn is None:
+            turn = self._turn_generation
+        if turn != self._turn_generation:
+            logger.info("Discarding stale response request reason=%s turn=%s", reason, turn)
+            return
+        await self._pending_responses.put((reason, kwargs, turn, self._response_epoch))
 
     async def say(self, text: str, **create_kwargs: Any) -> None:
         """Inject ``text`` as a turn and have the model voice it now.
@@ -1521,6 +1715,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             raise ValueError("say: empty text")
         if not self.connection:
             raise RuntimeError("say: no active session")
+        turn = self._response_turn.get()
+        if turn is not None and turn != self._turn_generation:
+            logger.info("Discarding stale speech turn=%s", turn)
+            return
         reason_obj = create_kwargs.pop("reason", "say")
         reason = reason_obj if isinstance(reason_obj, str) and reason_obj else "say"
         await self.connection.conversation.item.create(
@@ -1539,8 +1737,25 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             return
         try:
             await self.connection.response.cancel()
+            self._response_done_event.set()
         except Exception as exc:
             logger.debug("Failed to cancel realtime response: %s", exc)
+
+    async def _clear_poisoned_camera_images(self) -> None:
+        """Remove failed camera image items so later text turns stay usable."""
+        if not self._pending_camera_image_item_ids:
+            return
+        item_ids = list(self._pending_camera_image_item_ids)
+        self._pending_camera_image_item_ids.clear()
+        if not self.connection:
+            logger.warning("Cannot clear poisoned camera images; realtime connection is closed")
+            return
+        for item_id in item_ids:
+            try:
+                await self.connection.conversation.item.delete(item_id=item_id)
+                logger.info("Removed poisoned camera image item_id=%s", item_id)
+            except Exception as exc:
+                logger.warning("Failed to delete poisoned camera image item_id=%s: %s", item_id, exc)
 
     async def _send_startup_greeting_prompt(self) -> None:
         """Prompt the model to open the conversation once the session is ready."""
@@ -1602,16 +1817,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         """
         while self.connection:
             try:
-                reason, kwargs = await self._pending_responses.get()
+                reason, kwargs, turn, epoch = await self._pending_responses.get()
             except asyncio.CancelledError:
                 return
-
-            # Parallel tool calls enqueue duplicate empty requests; coalesce to one.
-            while not kwargs and not self._pending_responses.empty():
-                try:
-                    reason, kwargs = self._pending_responses.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
 
             sent = False
             max_retries = 5
@@ -1626,7 +1834,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                     logger.debug("Timed out waiting for previous response to finish; forcing ahead")
                     self._response_done_event.set()
 
-                if not self.connection:
+                if (
+                    not self.connection
+                    or turn != self._turn_generation
+                    or epoch != self._response_epoch
+                    or self._user_speech_in_progress
+                ):
                     break
 
                 self._last_response_rejected = False
@@ -1635,11 +1848,19 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 self._active_response_reason = reason
                 self._active_response_started_at = time.perf_counter()
                 self._reset_active_response_audio_state()
+                request_id = uuid.uuid4().hex
+                response = dict(kwargs.get("response", {}))
+                metadata = dict(response.get("metadata", {}))
+                metadata["reachy_request_id"] = request_id
+                response["metadata"] = metadata
+                kwargs["response"] = response
+                self._response_requests[request_id] = (turn, reason)
                 try:
                     logger.info("Sending response.create reason=%s", reason)
                     await self.connection.response.create(**kwargs)
                 except Exception as e:
                     logger.debug("_response_sender_loop: send failed reason=%s: %s", reason, e)
+                    self._response_requests.pop(request_id, None)
                     self._active_response_reason = None
                     self._response_done_event.set()
                     break
@@ -1650,18 +1871,18 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         timeout=_RESPONSE_STARTED_TIMEOUT,
                     )
                 except asyncio.TimeoutError:
-                    attempts += 1
                     logger.warning(
-                        "No acknowledgement for response.create; retrying (%d/%d) reason=%s",
-                        attempts,
-                        max_retries,
+                        "No acknowledgement for response.create; cancelling without replay reason=%s",
                         reason,
                     )
+                    self._response_requests.pop(request_id, None)
+                    await self._cancel_active_realtime_response()
                     self._response_done_event.set()
-                    continue
+                    break
 
                 # Check if the receiver loop observed an asynchronous rejection.
                 if self._last_response_rejected:
+                    self._response_requests.pop(request_id, None)
                     attempts += 1
                     if attempts >= max_retries:
                         logger.debug("response.create rejected %d times; giving up reason=%s", attempts, reason)
@@ -1679,7 +1900,10 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                         timeout=_RESPONSE_DONE_TIMEOUT,
                     )
                 except asyncio.TimeoutError:
-                    logger.debug("Timed out waiting for response.done; assuming response completed reason=%s", reason)
+                    logger.warning("Timed out waiting for response.done; cancelling reason=%s", reason)
+                    self._active_response_id = None
+                    self._drop_active_response_output = True
+                    await self._cancel_active_realtime_response()
                     self._response_done_event.set()
                     break
 
@@ -1808,39 +2032,47 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             )
 
             if model_result_submitted and completed_tool.tool_name == "camera" and "b64_im" in tool_result:
-                # use raw base64, don't json.dumps (which adds quotes)
-                b64_im = tool_result["b64_im"]
-                if not isinstance(b64_im, str):
-                    logger.warning("Unexpected type for b64_im: %s", type(b64_im))
-                    b64_im = str(b64_im)
-                image_width = tool_result.get("image_width")
-                image_height = tool_result.get("image_height")
-                jpeg_bytes_value = tool_result.get("jpeg_bytes")
-                jpeg_bytes = jpeg_bytes_value if isinstance(jpeg_bytes_value, int) else (len(b64_im) * 3) // 4
-                await self.connection.conversation.item.create(
-                    item={
-                        "type": "message",
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "input_image",
-                                "image_url": f"data:image/jpeg;base64,{b64_im}",
-                            },
-                        ],
-                    },
-                )
-                if isinstance(image_width, int) and isinstance(image_height, int):
-                    logger.info(
-                        "Added camera image to conversation frame=%sx%s jpeg_bytes=%s",
-                        image_width,
-                        image_height,
-                        jpeg_bytes,
-                    )
+                if not hf_vision_input_enabled():
+                    logger.warning("Skipping camera image attach; active model does not support image input")
                 else:
-                    logger.info(
-                        "Added camera image to conversation jpeg_bytes=%s",
-                        jpeg_bytes,
+                    # use raw base64, don't json.dumps (which adds quotes)
+                    b64_im = tool_result["b64_im"]
+                    if not isinstance(b64_im, str):
+                        logger.warning("Unexpected type for b64_im: %s", type(b64_im))
+                        b64_im = str(b64_im)
+                    image_width = tool_result.get("image_width")
+                    image_height = tool_result.get("image_height")
+                    jpeg_bytes_value = tool_result.get("jpeg_bytes")
+                    jpeg_bytes = jpeg_bytes_value if isinstance(jpeg_bytes_value, int) else (len(b64_im) * 3) // 4
+                    image_item_id = f"camera_image_{uuid.uuid4().hex}"
+                    await self.connection.conversation.item.create(
+                        item={
+                            "type": "message",
+                            "id": image_item_id,
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_image",
+                                    "image_url": f"data:image/jpeg;base64,{b64_im}",
+                                },
+                            ],
+                        },
                     )
+                    self._pending_camera_image_item_ids.append(image_item_id)
+                    if isinstance(image_width, int) and isinstance(image_height, int):
+                        logger.info(
+                            "Added camera image to conversation frame=%sx%s jpeg_bytes=%s item_id=%s",
+                            image_width,
+                            image_height,
+                            jpeg_bytes,
+                            image_item_id,
+                        )
+                    else:
+                        logger.info(
+                            "Added camera image to conversation jpeg_bytes=%s item_id=%s",
+                            jpeg_bytes,
+                            image_item_id,
+                        )
 
             screen_up_call = completed_tool.id in self._turn_screen_up_call_ids
             if isinstance(completed_tool.id, str):
@@ -1871,14 +2103,60 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             time_already_spoken = (
                 self._time_spoke_turn == self._turn_generation and completed_tool.tool_name == "get_time"
             )
+            face_id_already_spoken = (
+                self._face_id_spoke_turn == self._turn_generation and completed_tool.tool_name == "who_is_in_frame"
+            )
+            vision_unavailable = (
+                isinstance(tool_result, dict)
+                and completed_tool.tool_name == "camera"
+                and (
+                    tool_result.get("status") == "vision_unavailable"
+                    or ("b64_im" in tool_result and not hf_vision_input_enabled())
+                )
+            )
+            face_id_spoken = (
+                isinstance(tool_result, dict)
+                and completed_tool.tool_name == "who_is_in_frame"
+                and isinstance(tool_result.get("spoken"), str)
+                and bool(str(tool_result.get("spoken") or "").strip())
+                and not face_id_already_spoken
+            )
 
             # Always surface errors, skip the spoken follow-up for tools that opt out.
-            if (
+            if vision_unavailable and model_result_submitted and not result_is_stale:
+                spoken = tool_result.get("spoken")
+                spoken_text = spoken if isinstance(spoken, str) and spoken.strip() else VISION_UNAVAILABLE_SPOKEN
+                try:
+                    await self.say(
+                        _CAMERA_VISION_ALERT_PROMPT.format(text=spoken_text),
+                        reason="tool_result:camera_vision_unavailable",
+                        **_TOOL_FOLLOWUP_CREATE_KWARGS,
+                    )
+                except Exception as exc:
+                    logger.warning("Camera vision-unavailable speech failed: %s", exc)
+            elif face_id_spoken and model_result_submitted and not result_is_stale:
+                spoken_text = spoken_for_recognition_result(tool_result)
+                self._face_id_spoke_turn = self._turn_generation
+                logger.info(
+                    "[FACE-ID] tool-result deterministic speech status=%s direct_speech=true "
+                    "vision_supported=%s pending_vision_action=false",
+                    tool_result.get("status"),
+                    hf_vision_input_enabled(),
+                )
+                try:
+                    await self._speak_deterministic(
+                        spoken_text,
+                        reason="tool_result:who_is_in_frame",
+                    )
+                except Exception as exc:
+                    logger.warning("[FACE-ID] tool-result speech failed: %s", exc)
+            elif (
                 model_result_submitted
                 and not bus_already_spoken
                 and not apex_already_spoken
                 and not hermes_already_spoken
                 and not time_already_spoken
+                and not face_id_already_spoken
                 and (tool is None or tool.wants_spoken_followup(completed_tool.result, completed_tool.error))
             ):
                 self._tool_batch_needs_response = True
@@ -1928,6 +2206,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
             # Reset the partial-transcript accumulator for each new session
             self.input_transcript_chunks_by_item = InputTranscriptChunksByItem()
+            self._pending_camera_image_item_ids.clear()
 
             # Manage events received from the realtime server.
             self.connection = conn
@@ -1948,7 +2227,21 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                 async for event in self.connection:
                     logger.debug("Realtime event: %s", event.type)
+                    if event.type in ("session.created", "session.updated"):
+                        session = event.session.model_dump()
+                        self._direct_speech_supported = session.get("reachy_direct_speech") is True
+                    if event.type.startswith("response.") and event.type != "response.created":
+                        response_id = _realtime_response_id(event)
+                        if response_id is None or response_id != self._active_response_id:
+                            logger.debug("Discarding unowned event type=%s response_id=%s", event.type, response_id)
+                            continue
                     if event.type == "input_audio_buffer.speech_started":
+                        self._turn_generation += 1
+                        self._response_epoch += 1
+                        self._response_requests.clear()
+                        self._active_response_id = None
+                        self._drop_active_response_output = True
+                        self._response_done_event.set()
                         self._mark_activity("user_speech_started")
                         self._user_speech_in_progress = True
                         self._user_turn_authorized = self._activation.is_active()
@@ -1994,11 +2287,35 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
                     if event.type == "response.created":
                         response_id = _realtime_response_id(event)
-                        self._reset_active_response_audio_state()
-                        self._drop_active_response_output = (
-                            self._active_response_reason is None
-                            and self._suppress_unsolicited_response_turn == self._turn_generation
+                        if response_id is not None and response_id == self._active_response_id:
+                            continue
+                        response_object = getattr(event, "response", None)
+                        response = (
+                            response_object
+                            if isinstance(response_object, dict)
+                            else response_object.model_dump()
+                            if response_object is not None
+                            else {}
                         )
+                        metadata = response.get("metadata") or {}
+                        request_id = metadata.get("reachy_request_id")
+                        ownership = (
+                            self._response_requests.pop(request_id, None) if isinstance(request_id, str) else None
+                        )
+                        if (
+                            response_id is None
+                            or ownership is None
+                            or ownership[0] != self._turn_generation
+                            or self._user_speech_in_progress
+                        ):
+                            logger.info("Suppressing unowned response response_id=%s", response_id)
+                            await self._cancel_active_realtime_response()
+                            self._response_done_event.set()
+                            continue
+                        self._active_response_id = response_id
+                        self._active_response_reason = ownership[1]
+                        self._reset_active_response_audio_state()
+                        self._drop_active_response_output = False
                         self._mark_activity("response_created")
                         self._response_done_event.clear()
                         self._response_started_or_rejected_event.set()
@@ -2011,14 +2328,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             self._active_response_reason,
                             response_id,
                         )
-                        if self._drop_active_response_output:
-                            logger.info(
-                                "[ROUTER] suppressing unsolicited realtime response reason=deterministic_route response_id=%s",
-                                response_id,
-                            )
-                            await self._cancel_active_realtime_response()
-                        else:
-                            self.deps.movement_manager.set_speaking(True)
+                        self.deps.movement_manager.set_speaking(True)
 
                     if event.type == "response.done":
                         # Doesn't mean the audio is done playing
@@ -2053,7 +2363,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             await self._set_tool_followup_choice("auto")
                         self._active_response_reason = None
                         self._active_response_started_at = None
-                        self._drop_active_response_output = False
+                        self._active_response_id = None
+                        self._drop_active_response_output = True
 
                     if event.type == "conversation.item.input_audio_transcription.delta":
                         self._mark_activity("user_transcription_delta")
@@ -2156,6 +2467,15 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             if tool_name == "home_assistant":
                                 logger.info("[HA] skipping competing home_assistant; response_owner=deterministic")
                                 skip_deterministic_tool = True
+                        if isinstance(tool_name, str) and self._face_id_owns_turn == self._turn_generation:
+                            if tool_name in _FACE_ID_COMPETING_TOOLS:
+                                logger.info(
+                                    "[FACE-ID] skipping competing %s; response_owner=deterministic "
+                                    "vision_supported=%s",
+                                    tool_name,
+                                    hf_vision_input_enabled(),
+                                )
+                                skip_deterministic_tool = True
                         if isinstance(tool_name, str) and self._reef_router_owns_turn == self._turn_generation:
                             if tool_name in _COMPETING_REEF_TOOLS:
                                 logger.info(
@@ -2179,9 +2499,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                     item={
                                         "type": "function_call_output",
                                         "call_id": call_id,
-                                        "output": json.dumps(
-                                            {"status": "skipped", "reason": "deterministic_reef_route"}
-                                        ),
+                                        "output": json.dumps({"status": "skipped", "reason": "deterministic_route"}),
                                     },
                                 )
                             continue
@@ -2340,6 +2658,9 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                             self._response_started_or_rejected_event.set()
                             logger.error("Realtime error [%s]: %s (raw=%s)", code, msg, err)
 
+                        if _is_unsupported_image_input_error(str(msg)):
+                            await self._clear_poisoned_camera_images()
+
                         if code == "input_audio_buffer_commit_empty":
                             self.deps.movement_manager.set_listening(False)
 
@@ -2352,6 +2673,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                                 AdditionalOutputs({"role": "assistant", "content": f"[error] {msg}"})
                             )
             finally:
+                self._turn_generation += 1
+                self._response_epoch += 1
+                self._response_requests.clear()
+                self._active_response_id = None
+                self._direct_speech_supported = False
+                self._drop_active_response_output = True
                 # Stop the response sender worker.
                 if response_sender_task is not None:
                     response_sender_task.cancel()

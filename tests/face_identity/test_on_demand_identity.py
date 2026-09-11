@@ -31,11 +31,15 @@ from reachy_mini_conversation_app.face_identity.speech_authority import (
     NO_CLEAR_FACE_SPOKEN,
     MULTIPLE_FACES_SPOKEN,
     UNKNOWN_PERSON_SPOKEN,
+    USER_IDENTITY_UNKNOWN_SPOKEN,
+    USER_IDENTITY_NO_USABLE_FACE_SPOKEN,
     is_confirmed_success,
     format_known_person_spoken,
     match_self_identity_question,
+    match_user_identity_question,
     spoken_for_recognition_result,
     match_person_identity_question,
+    spoken_for_user_identity_result,
 )
 
 
@@ -82,6 +86,37 @@ def test_wake_name_stripped_before_identity_classification() -> None:
     assert match_self_identity_question("Richie, who are you?") is True
 
 
+@pytest.mark.parametrize(
+    "transcript",
+    [
+        "who am I",
+        "who am I?",
+        "Reachy, who am I?",
+        "do you know who I am",
+        "do you recognize me",
+        "do you recognise me",
+        "can you recognize me",
+    ],
+)
+def test_user_identity_questions_route_to_face_memory(transcript: str) -> None:
+    """Explicit user-identity phrases match without broad recognition interception."""
+    assert match_user_identity_question(transcript) is True
+
+
+@pytest.mark.parametrize(
+    "transcript",
+    [
+        "Do you recognize this song?",
+        "Can you recognize handwriting?",
+        "Who am I supposed to call?",
+        "I wonder whether you recognize me today",
+    ],
+)
+def test_unrelated_recognition_phrases_do_not_route_to_face_memory(transcript: str) -> None:
+    """Broader recognition conversation remains with general chat."""
+    assert match_user_identity_question(transcript) is False
+
+
 def test_spoken_known_with_relationship() -> None:
     """Known results speak the stored name, optionally with relationship."""
     assert format_known_person_spoken(name="Carol") == "That's Carol."
@@ -105,6 +140,22 @@ def test_spoken_fail_safe_statuses() -> None:
     assert spoken_for_recognition_result({"status": "no_face"}) == NO_CLEAR_FACE_SPOKEN
     assert spoken_for_recognition_result({"status": "multiple_faces"}) == MULTIPLE_FACES_SPOKEN
     assert "Carol" not in spoken_for_recognition_result({"status": "unknown", "similarity": 0.39, "person_id": None})
+
+
+def test_user_identity_speech_is_deterministic_and_fail_safe() -> None:
+    """User-directed identity speech names only a verified known result."""
+    assert (
+        spoken_for_user_identity_result({"status": "known", "person_id": "person_0001", "name": "Carol"})
+        == "You're Carol."
+    )
+    assert spoken_for_user_identity_result({"status": "unknown"}) == USER_IDENTITY_UNKNOWN_SPOKEN
+    assert spoken_for_user_identity_result({"status": "unusable"}) == USER_IDENTITY_NO_USABLE_FACE_SPOKEN
+    assert spoken_for_user_identity_result({"status": "no_face"}) == USER_IDENTITY_NO_USABLE_FACE_SPOKEN
+    assert spoken_for_user_identity_result({"status": "multiple_faces"}) == USER_IDENTITY_NO_USABLE_FACE_SPOKEN
+    assert (
+        spoken_for_user_identity_result({"error": "camera_disabled", "status": "camera_unavailable"})
+        == "The camera is disabled, so I cannot look."
+    )
 
 
 def test_spoken_disabled_is_exact_without_vision_offer() -> None:
@@ -312,6 +363,55 @@ def test_model_error_does_not_hallucinate_name() -> None:
     spoken = spoken_for_recognition_result({"error": "capture_failed: RuntimeError", "status": "error"})
     assert "Carol" not in spoken
     assert spoken
+
+
+def test_recognition_runtime_failure_returns_structured_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing or broken local model fails closed without escaping the tool boundary."""
+    monkeypatch.setenv("FACE_MEMORY_ENABLED", "true")
+    monkeypatch.setenv("FACE_MEMORY_ON_DEMAND_RECOGNITION_ENABLED", "true")
+    service = FaceMemoryService(instance_path=tmp_path)
+    service.recognize_frame_window = MagicMock(side_effect=RuntimeError("missing model"))  # type: ignore[method-assign]
+    robot = MagicMock()
+    robot.media.get_frame.return_value = np.zeros((32, 32, 3), dtype=np.uint8)
+    movement_manager = MagicMock()
+    deps = ToolDependencies(
+        reachy_mini=robot,
+        movement_manager=movement_manager,
+        camera_enabled=True,
+        face_memory_service=service,
+    )
+
+    result = service.who_is_in_frame(deps)
+
+    assert result["status"] == "recognition_unavailable"
+    assert result["error"] == "recognition_unavailable"
+    assert result["reason"] == "RuntimeError"
+    assert "b64_im" not in result
+    assert spoken_for_recognition_result(result)
+    assert movement_manager.mock_calls == []
+
+
+def test_disabled_camera_returns_structured_camera_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Recognition distinguishes camera availability from no-face detection."""
+    monkeypatch.setenv("FACE_MEMORY_ENABLED", "true")
+    monkeypatch.setenv("FACE_MEMORY_ON_DEMAND_RECOGNITION_ENABLED", "true")
+    service = FaceMemoryService(instance_path=tmp_path)
+    deps = ToolDependencies(
+        reachy_mini=MagicMock(),
+        movement_manager=MagicMock(),
+        camera_enabled=False,
+        face_memory_service=service,
+    )
+
+    result = service.who_is_in_frame(deps)
+
+    assert result["status"] == "camera_unavailable"
+    assert result["error"] == "camera_disabled"
+    deps.reachy_mini.media.get_frame.assert_not_called()
 
 
 def test_identity_record_gallery_match_known(tmp_path: Path) -> None:

@@ -15,6 +15,8 @@ NO_CLEAR_FACE_SPOKEN = "I can't see a clear face right now."
 MULTIPLE_FACES_SPOKEN = "I can see more than one person. Could you show me who you mean?"
 RECOGNITION_ERROR_SPOKEN = "I had trouble identifying that person."
 KNOWN_WITHOUT_NAME_SPOKEN = "I recognise this person, but I don't have a name for them."
+USER_IDENTITY_UNKNOWN_SPOKEN = "I don't recognize you."
+USER_IDENTITY_NO_USABLE_FACE_SPOKEN = "I can't see a usable face right now."
 
 # Statuses that may authorize success speech when the tool result also verifies persistence.
 SUCCESS_STATUSES = frozenset(
@@ -146,6 +148,16 @@ _PERSON_IDENTITY_RE = re.compile(
     re.IGNORECASE,
 )
 
+_USER_IDENTITY_RE = re.compile(
+    r"^(?:"
+    r"who\s+am\s+i|"
+    r"do\s+you\s+know\s+who\s+i\s+am|"
+    r"do\s+you\s+recogni[sz]e\s+me|"
+    r"can\s+you\s+recogni[sz]e\s+me"
+    r")$",
+    re.IGNORECASE,
+)
+
 
 def _normalize_name(name: str) -> str:
     cleaned = re.sub(r"[.!?,;:]+", " ", name.strip().lower())
@@ -266,6 +278,12 @@ def match_person_identity_question(transcript: str) -> bool:
     return _PERSON_IDENTITY_RE.search(text) is not None
 
 
+def match_user_identity_question(transcript: str) -> bool:
+    """Return whether the user explicitly asked Reachy to identify them."""
+    text = identity_command_text(transcript)
+    return bool(text and _USER_IDENTITY_RE.fullmatch(text))
+
+
 def format_known_person_spoken(*, name: str, relationship: str | None = None) -> str:
     """Build the short spoken line for a verified known recognition."""
     cleaned_name = name.strip()
@@ -311,6 +329,25 @@ def spoken_for_recognition_result(result: Mapping[str, Any] | None) -> str:
     if status == "multiple_faces":
         return MULTIPLE_FACES_SPOKEN
     return RECOGNITION_ERROR_SPOKEN
+
+
+def spoken_for_user_identity_result(result: Mapping[str, Any] | None) -> str:
+    """Return deterministic second-person speech for an explicit user identity request."""
+    if not isinstance(result, Mapping):
+        return RECOGNITION_ERROR_SPOKEN
+    if result.get("error"):
+        return spoken_for_recognition_result(result)
+    status = str(result.get("status") or "").strip().lower()
+    if status == "known":
+        name = result.get("name")
+        if is_confirmed_success(result) and isinstance(name, str) and name.strip():
+            return f"You're {name.strip()}."
+        return spoken_for_recognition_result(result)
+    if status in {"unknown", "ambiguous"}:
+        return USER_IDENTITY_UNKNOWN_SPOKEN
+    if status in {"no_face", "unusable", "no_clear_face", "multiple_faces"}:
+        return USER_IDENTITY_NO_USABLE_FACE_SPOKEN
+    return spoken_for_recognition_result(result)
 
 
 def honest_reply_for_unverified_enrolment() -> str:

@@ -100,10 +100,12 @@ from reachy_mini_conversation_app.tools.background_tool_manager import (
 )
 from reachy_mini_conversation_app.face_identity.speech_authority import (
     PHOTO_ENROLMENT_DISABLED_SPOKEN,
+    match_user_identity_question,
     match_photo_enrolment_request,
     spoken_for_recognition_result,
     match_person_identity_question,
     match_enrolment_status_question,
+    spoken_for_user_identity_result,
     match_face_memory_success_narration,
     honest_reply_for_unverified_enrolment,
 )
@@ -699,12 +701,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
 
     def _start_fast_face_identity(self, transcript: str) -> None:
         """Route explicit 'who is this?' questions to on-demand face recognition."""
-        if not match_person_identity_question(transcript):
+        user_identity = match_user_identity_question(transcript)
+        if not user_identity and not match_person_identity_question(transcript):
             return
         logger.info("[FACE-ID] intent matched transcript=%r", transcript)
         self._face_id_owns_turn = self._turn_generation
         self._claim_deterministic_route()
-        asyncio.create_task(self._run_fast_face_identity(), name="face-identity-fast-path")
+        asyncio.create_task(
+            self._run_fast_face_identity(user_identity=user_identity),
+            name="face-identity-fast-path",
+        )
 
     async def _speak_deterministic(
         self,
@@ -750,7 +756,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         except Exception as exc:
             logger.warning("[VISION] unavailable speech failed: %s", exc)
 
-    async def _run_fast_face_identity(self) -> None:
+    async def _run_fast_face_identity(self, *, user_identity: bool = False) -> None:
         """Run YuNet/SFace recognition and speak the authoritative result."""
         turn = self._response_turn.get()
         if turn is None:
@@ -770,7 +776,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         except Exception as exc:
             logger.warning("[FACE-ID] recognition failed: %s", exc)
             result = {"error": f"recognition_failed: {type(exc).__name__}", "status": "error"}
-        spoken = spoken_for_recognition_result(result if isinstance(result, dict) else None)
+        speech_result = result if isinstance(result, dict) else None
+        spoken = (
+            spoken_for_user_identity_result(speech_result)
+            if user_identity
+            else spoken_for_recognition_result(speech_result)
+        )
         if turn != self._turn_generation:
             logger.info("[FACE-ID] discarding stale recognition result turn=%s", turn)
             return
@@ -791,7 +802,7 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         )
         self._suppress_unsolicited_response_turn = self._turn_generation
         try:
-            await self._speak_deterministic(spoken, reason="face_identity")
+            await self._speak_deterministic(spoken, reason="face_identity", skip_history=True)
             self._face_id_spoke_turn = turn
         except Exception as exc:
             logger.warning("[FACE-ID] recognition speech failed: %s", exc)

@@ -623,12 +623,14 @@ async def test_unactivated_transcript_does_not_start_fast_paths(monkeypatch: Any
     time_cmd = MagicMock()
     dance = MagicMock()
     sleep = MagicMock()
+    face_identity = MagicMock()
     monkeypatch.setattr(handler, "_start_fast_ha_command", ha)
     monkeypatch.setattr(handler, "_start_fast_bus_command", bus)
     monkeypatch.setattr(handler, "_start_fast_apex_command", apex)
     monkeypatch.setattr(handler, "_start_fast_time_command", time_cmd)
     monkeypatch.setattr(handler, "_start_fast_dance_emotion", dance)
     monkeypatch.setattr(handler, "_start_fast_sleep_command", sleep)
+    monkeypatch.setattr(handler, "_start_fast_face_identity", face_identity)
     monkeypatch.setattr(handler, "_reject_unactivated_speech", AsyncMock())
 
     handler._handle_completed_user_transcript("Turn on lamp three.")
@@ -641,6 +643,7 @@ async def test_unactivated_transcript_does_not_start_fast_paths(monkeypatch: Any
     time_cmd.assert_not_called()
     dance.assert_not_called()
     sleep.assert_not_called()
+    face_identity.assert_not_called()
     assert handler._user_turn_authorized is False
 
 
@@ -654,12 +657,14 @@ async def test_reachy_transcript_starts_fast_paths(monkeypatch: Any) -> None:
     time_cmd = MagicMock()
     dance = MagicMock()
     sleep = MagicMock()
+    face_identity = MagicMock()
     monkeypatch.setattr(handler, "_start_fast_ha_command", ha)
     monkeypatch.setattr(handler, "_start_fast_bus_command", bus)
     monkeypatch.setattr(handler, "_start_fast_apex_command", apex)
     monkeypatch.setattr(handler, "_start_fast_time_command", time_cmd)
     monkeypatch.setattr(handler, "_start_fast_dance_emotion", dance)
     monkeypatch.setattr(handler, "_start_fast_sleep_command", sleep)
+    monkeypatch.setattr(handler, "_start_fast_face_identity", face_identity)
 
     handler._handle_completed_user_transcript("Reachy, turn on lamp three.")
 
@@ -669,6 +674,7 @@ async def test_reachy_transcript_starts_fast_paths(monkeypatch: Any) -> None:
     time_cmd.assert_called_once()
     dance.assert_called_once()
     sleep.assert_called_once()
+    face_identity.assert_called_once()
     assert handler._user_turn_authorized is True
     assert ha.call_args.args[0].lower() == "turn on lamp three."
 
@@ -2894,7 +2900,13 @@ async def test_face_id_disabled_speaks_exact_without_camera(monkeypatch: Any) ->
     assert handler._face_id_spoke_turn == 7
     create.assert_awaited_once_with(
         reason="face_identity",
-        response={"tool_choice": "none", "metadata": {"reachy_direct_text": ON_DEMAND_DISABLED_SPOKEN}},
+        response={
+            "tool_choice": "none",
+            "metadata": {
+                "reachy_direct_text": ON_DEMAND_DISABLED_SPOKEN,
+                "reachy_direct_skip_history": "true",
+            },
+        },
     )
 
 
@@ -2976,6 +2988,71 @@ def test_start_fast_face_identity_ignores_self_identity(monkeypatch: Any) -> Non
     monkeypatch.setattr(hf_mod.asyncio, "create_task", MagicMock())
     handler._start_fast_face_identity("Reachy, who are you?")
     assert handler._face_id_owns_turn is None
+
+
+def test_start_fast_face_identity_claims_user_identity_turn(monkeypatch: Any) -> None:
+    """A wake-qualified user-identity question claims the deterministic route."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._turn_generation = 5
+    created: list[Any] = []
+
+    def capture_task(coro: Any, *, name: str | None = None) -> MagicMock:
+        created.append((coro, name))
+        coro.close()
+        return MagicMock()
+
+    monkeypatch.setattr(hf_mod.asyncio, "create_task", capture_task)
+    handler._start_fast_face_identity("who am I?")
+
+    assert handler._face_id_owns_turn == 5
+    assert handler._suppress_unsolicited_response_turn == 5
+    assert created and created[0][1] == "face-identity-fast-path"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("result", "expected_spoken"),
+    [
+        ({"status": "known", "person_id": "person_0001", "name": "Carol"}, "You're Carol."),
+        ({"status": "unknown"}, "I don't recognize you."),
+        ({"status": "unusable"}, "I can't see a usable face right now."),
+        ({"status": "no_face"}, "I can't see a usable face right now."),
+        ({"status": "multiple_faces"}, "I can't see a usable face right now."),
+        (
+            {"error": "camera_disabled", "status": "camera_unavailable"},
+            "The camera is disabled, so I cannot look.",
+        ),
+    ],
+)
+async def test_user_identity_fast_path_speaks_without_llm_history(
+    monkeypatch: Any,
+    result: dict[str, Any],
+    expected_spoken: str,
+) -> None:
+    """Identity decisions speak deterministically without image or chat-history payloads."""
+    monkeypatch.setattr(hf_mod, "face_memory_on_demand_recognition_enabled", lambda: True)
+    who_is = AsyncMock(return_value=result)
+    monkeypatch.setattr(hf_mod, "WhoIsInFrame", MagicMock(return_value=who_is))
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._turn_generation = 6
+    handler._direct_speech_supported = True
+    create = AsyncMock()
+    monkeypatch.setattr(handler, "_suppress_unsolicited_realtime", AsyncMock())
+    monkeypatch.setattr(handler, "_safe_response_create", create)
+
+    await handler._run_fast_face_identity(user_identity=True)
+
+    who_is.assert_awaited_once_with(handler.deps)
+    create.assert_awaited_once_with(
+        reason="face_identity",
+        response={
+            "tool_choice": "none",
+            "metadata": {
+                "reachy_direct_text": expected_spoken,
+                "reachy_direct_skip_history": "true",
+            },
+        },
+    )
 
 
 @pytest.mark.asyncio

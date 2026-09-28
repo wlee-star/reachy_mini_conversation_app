@@ -33,6 +33,10 @@ _CAMERA_LAST_ATTEMPT = 0.0
 _CAMERA_BACKOFF_S = 1.0
 _CAMERA_MIN_INTERVAL_S = 0.2
 _CAMERA_MAX_BACKOFF_S = 8.0
+_CAMERA_LAST_REQUEST_AT: float | None = None
+_CAMERA_LAST_SUCCESS_AT: float | None = None
+_CAMERA_LAST_FAILURE_AT: float | None = None
+_CAMERA_LAST_FAILURE_REASON: str | None = None
 
 
 class CommandBlocked(Exception):
@@ -300,11 +304,21 @@ def build_physical_status(config: DashboardConfig, health_fn: Any) -> dict[str, 
                 {
                     "id": "camera",
                     "name": "Camera",
-                    "status": "online"
-                    if camera_status in {"live", "ready", "connected"}
-                    else ("error" if camera_status == "error" else "offline"),
-                    "label": "CONNECTED" if camera_status in {"live", "ready", "connected"} else camera_status.upper(),
+                    "status": "online" if camera_status == "live" else ("error" if camera_status == "error" else "offline"),
+                    "label": "CONNECTED" if camera_status == "live" else camera_status.upper(),
                     "summary": media.get("camera_summary") or f"Camera is {camera_status}.",
+                },
+                {
+                    "id": "sdk_control",
+                    "name": "SDK Control",
+                    "status": (
+                        "online"
+                        if str((media.get("sdk_control_status") or {}).get("state") or "unknown") == "HEALTHY"
+                        else "offline"
+                    ),
+                    "label": str((media.get("sdk_control_status") or {}).get("state") or "unknown"),
+                    "summary": "Movement publications over /ws/sdk.",
+                    "details": media.get("sdk_control_status") or {},
                 },
                 {
                     "id": "microphone",
@@ -360,8 +374,10 @@ def build_physical_status(config: DashboardConfig, health_fn: Any) -> dict[str, 
     daemon = results.get("reachy_daemon")
     conversation = results.get("conversation")
     speech = results.get("speech")
+    sdk_control_state = str((media.get("sdk_control_status") or {}).get("state") or "UNKNOWN")
     physical_connected = (
         target.kind == TARGET_PHYSICAL and daemon is not None and daemon.status == checks.STATUS_ONLINE
+        and sdk_control_state == "HEALTHY"
     )
     ai_online = (
         conversation is not None
@@ -420,6 +436,15 @@ def build_physical_status(config: DashboardConfig, health_fn: Any) -> dict[str, 
             "latency_ms": llama.latency_ms if llama else None,
         },
         "media": media,
+        "health_domains": {
+            "daemon_http_status": {
+                "state": "HEALTHY" if daemon is not None and daemon.status == checks.STATUS_ONLINE else "OFFLINE",
+                "details": daemon.details if daemon is not None else {},
+            },
+            "sdk_control_status": media.get("sdk_control_status") or {"state": "UNKNOWN"},
+            "camera_frame_status": media.get("camera_frame_status") or {"state": camera_status.upper()},
+        },
+        "overall_control_status": "healthy" if physical_connected else "unhealthy",
         "media_api": {
             "status": media_health.status,
             "summary": media_health.summary,
@@ -428,7 +453,7 @@ def build_physical_status(config: DashboardConfig, health_fn: Any) -> dict[str, 
         "camera_preview_enabled": camera_preview_enabled(),
         "robot": {
             "connection": "CONNECTED" if physical_connected else "OFFLINE",
-            "sdk": "CONNECTED" if physical_connected else "OFFLINE",
+            "sdk": sdk_control_state,
             "motors": media.get("motors_status") or ("UNKNOWN" if media_payload else "OFFLINE"),
             "camera": camera_status.upper(),
             "microphone": mic_status.upper(),
@@ -478,28 +503,65 @@ def set_camera_preview_enabled(enabled: bool) -> bool:
 
 def fetch_camera_jpeg(config: DashboardConfig) -> tuple[bytes | None, dict[str, Any]]:
     """Fetch one JPEG from the conversation app with backoff; never opens a second camera."""
-    global _CAMERA_LAST_ATTEMPT, _CAMERA_BACKOFF_S
+    global _CAMERA_LAST_ATTEMPT, _CAMERA_BACKOFF_S, _CAMERA_LAST_REQUEST_AT, _CAMERA_LAST_SUCCESS_AT
+    global _CAMERA_LAST_FAILURE_AT, _CAMERA_LAST_FAILURE_REASON
     target = resolve_target(config)
-    meta: dict[str, Any] = {"target": target.kind, "preview_enabled": camera_preview_enabled()}
+    now = time.monotonic()
+    with _CAMERA_LOCK:
+        _CAMERA_LAST_REQUEST_AT = now
+        meta: dict[str, Any] = {
+            "target": target.kind,
+            "preview_enabled": camera_preview_enabled(),
+            "dashboard_camera_last_request_at": _CAMERA_LAST_REQUEST_AT,
+            "dashboard_camera_last_success_at": _CAMERA_LAST_SUCCESS_AT,
+            "dashboard_camera_last_failure_at": _CAMERA_LAST_FAILURE_AT,
+            "dashboard_camera_last_failure_reason": _CAMERA_LAST_FAILURE_REASON,
+            "camera_backoff_active": _CAMERA_BACKOFF_S > _CAMERA_MIN_INTERVAL_S,
+        }
     if not camera_preview_enabled():
+        with _CAMERA_LOCK:
+            _CAMERA_LAST_FAILURE_AT = now
+            _CAMERA_LAST_FAILURE_REASON = "preview_off"
         meta.update(
             {
                 "status": "preview_off",
                 "summary": "Camera preview OFF — dashboard stopped requesting frames (robot camera unchanged).",
+                "dashboard_camera_last_failure_at": _CAMERA_LAST_FAILURE_AT,
+                "dashboard_camera_last_failure_reason": _CAMERA_LAST_FAILURE_REASON,
             }
         )
         return None, meta
     try:
         assert_physical_command(target, require_connected=False)
     except CommandBlocked as exc:
-        meta.update({"status": "blocked", "summary": str(exc.reason)})
+        with _CAMERA_LOCK:
+            _CAMERA_LAST_FAILURE_AT = now
+            _CAMERA_LAST_FAILURE_REASON = str(exc.reason)
+        meta.update(
+            {
+                "status": "blocked",
+                "summary": str(exc.reason),
+                "dashboard_camera_last_failure_at": _CAMERA_LAST_FAILURE_AT,
+                "dashboard_camera_last_failure_reason": _CAMERA_LAST_FAILURE_REASON,
+            }
+        )
         return None, meta
 
-    now = time.monotonic()
     with _CAMERA_LOCK:
         wait = _CAMERA_BACKOFF_S if _CAMERA_BACKOFF_S > _CAMERA_MIN_INTERVAL_S else _CAMERA_MIN_INTERVAL_S
         if now - _CAMERA_LAST_ATTEMPT < wait and _CAMERA_BACKOFF_S > _CAMERA_MIN_INTERVAL_S:
-            meta.update({"status": "backoff", "summary": "Waiting before camera retry.", "backoff_s": round(wait, 1)})
+            _CAMERA_LAST_FAILURE_AT = now
+            _CAMERA_LAST_FAILURE_REASON = "backoff"
+            meta.update(
+                {
+                    "status": "backoff",
+                    "summary": "Waiting before camera retry.",
+                    "backoff_s": round(wait, 1),
+                    "dashboard_camera_last_failure_at": _CAMERA_LAST_FAILURE_AT,
+                    "dashboard_camera_last_failure_reason": _CAMERA_LAST_FAILURE_REASON,
+                    "camera_backoff_active": True,
+                }
+            )
             return None, meta
         _CAMERA_LAST_ATTEMPT = now
 
@@ -508,18 +570,34 @@ def fetch_camera_jpeg(config: DashboardConfig) -> tuple[bytes | None, dict[str, 
     if jpeg:
         with _CAMERA_LOCK:
             _CAMERA_BACKOFF_S = _CAMERA_MIN_INTERVAL_S
-        meta.update({"status": "live", "summary": "LIVE", "bytes": len(jpeg)})
+            _CAMERA_LAST_SUCCESS_AT = time.monotonic()
+            _CAMERA_LAST_FAILURE_REASON = None
+        meta.update(
+            {
+                "status": "live",
+                "summary": "LIVE",
+                "bytes": len(jpeg),
+                "dashboard_camera_last_success_at": _CAMERA_LAST_SUCCESS_AT,
+                "dashboard_camera_last_failure_reason": _CAMERA_LAST_FAILURE_REASON,
+                "camera_backoff_active": False,
+            }
+        )
         return jpeg, meta
 
     with _CAMERA_LOCK:
         _CAMERA_BACKOFF_S = min(_CAMERA_MAX_BACKOFF_S, max(_CAMERA_MIN_INTERVAL_S * 2, _CAMERA_BACKOFF_S * 2))
         backoff = _CAMERA_BACKOFF_S
+        _CAMERA_LAST_FAILURE_AT = time.monotonic()
+        _CAMERA_LAST_FAILURE_REASON = "no jpeg frame"
     meta.update(
         {
             "status": "offline",
             "summary": "CAMERA OFFLINE",
             "error": "no jpeg frame",
             "backoff_s": round(backoff, 1),
+            "dashboard_camera_last_failure_at": _CAMERA_LAST_FAILURE_AT,
+            "dashboard_camera_last_failure_reason": _CAMERA_LAST_FAILURE_REASON,
+            "camera_backoff_active": backoff > _CAMERA_MIN_INTERVAL_S,
         }
     )
     logger.info("Physical camera fetch failed (backoff %.1fs)", backoff)

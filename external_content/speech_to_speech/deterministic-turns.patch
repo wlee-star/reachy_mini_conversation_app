@@ -76,6 +76,15 @@
          original_chat = runtime_config.chat
          out_of_band = is_out_of_band(response)
          if out_of_band:
+--- a/api/openai_realtime/websocket_router.py
++++ b/api/openai_realtime/websocket_router.py
+@@ -776,6 +776,7 @@
+                                 if unit.response_playing.is_set():
+                                     unit.response_playing.clear()
++                                unit.should_listen.set()
+                                 logger.info(
+                                     "Pipeline %d: speech during %s: cancelled, queue flushed",
+                                     unit.index,
 --- a/api/openai_realtime/service.py
 +++ b/api/openai_realtime/service.py
 @@ -453,7 +453,12 @@

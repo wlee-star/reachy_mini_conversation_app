@@ -75,8 +75,18 @@ def test_enrol_uploads_verified_camera_independent(
     assert service.profiles.get(person_id).relationship == "Mum"
     assert result["embedding_count"] == count
     assert [row["status"] for row in result["photos"]] == ["accepted"] * count
-    assert {path.suffix for path in Path(service.instance_path).rglob("*") if path.is_file()} == {".json"}
-    assert "embeddings" not in json.dumps(service.execute("list", {}))
+    assert {path.suffix for path in Path(service.instance_path).rglob("*") if path.is_file()} == {".json", ".jpg"}
+    assert service.thumbnail_path(person_id).read_bytes().startswith(b"\xff\xd8")
+    listed = service.execute("list", {})
+    assert listed["people"][0]["thumbnail_url"] == f"/api/people/{person_id}/thumbnail"
+    assert "embeddings" not in json.dumps(listed)
+
+
+def test_missing_thumbnail_uses_existing_people_fallback(service: people.PeopleService, photo: dict[str, str]) -> None:
+    """People data omits the canonical thumbnail field when no crop exists."""
+    enrolled = service.execute("enrol", {"name": "Carol", "photos": [photo]})
+    service.thumbnail_path(enrolled["person_id"]).unlink()
+    assert "thumbnail_url" not in service.execute("list", {})["people"][0]
 
 
 @pytest.mark.parametrize("name", ["", " ", "Reachy", "Ricci", "Richie", "Ritchie", "Rishi"])
@@ -223,6 +233,7 @@ def test_failed_existing_mutation_restores_original(
     """Every failed mutation restores the original identity and profile bytes."""
     enrolled = service.execute("enrol", {"name": "Carol", "photos": [photo]})
     before = [store.path.read_bytes() for store in (service.identities, service.profiles)]
+    thumbnail_before = service.thumbnail_path(enrolled["person_id"]).read_bytes()
     if action == "forget":
         monkeypatch.setattr(service.profiles, "delete", MagicMock(side_effect=OSError("disk failure")))
     else:
@@ -232,6 +243,7 @@ def test_failed_existing_mutation_restores_original(
     )
     assert result["persisted"] is False
     assert [store.path.read_bytes() for store in (service.identities, service.profiles)] == before
+    assert service.thumbnail_path(enrolled["person_id"]).read_bytes() == thumbnail_before
 
 
 def test_forget_requires_confirmation_and_verifies_deletion(
@@ -245,6 +257,7 @@ def test_forget_requires_confirmation_and_verifies_deletion(
     assert service.execute("forget", {**body, "confirmed": True})["persisted"] is True
     assert service.identities.get(body["person_id"]) is None
     assert service.profiles.get(body["person_id"]) is None
+    assert not service.thumbnail_path(body["person_id"]).exists()
     assert service.execute("forget", {**body, "confirmed": True})["persisted"] is False
 
 
@@ -327,7 +340,17 @@ def test_http_routes_and_origin_guard(
         assert json.loads(response.read())["persisted"] is True
         connection.request("GET", "/api/people", headers={"Origin": f"http://127.0.0.1:{httpd.server_port}"})
         response = connection.getresponse()
-        assert len(json.loads(response.read())["people"]) == 1
+        listed_person = json.loads(response.read())["people"][0]
+        assert listed_person["thumbnail_url"].endswith("/thumbnail")
+        connection.request(
+            "GET",
+            listed_person["thumbnail_url"],
+            headers={"Origin": f"http://127.0.0.1:{httpd.server_port}"},
+        )
+        response = connection.getresponse()
+        assert response.status == 200
+        assert response.getheader("Content-Type") == "image/jpeg"
+        assert response.read().startswith(b"\xff\xd8")
         connection.request(
             "POST", "/api/people/forget", "{}", {"Content-Type": "application/json", "Origin": "https://evil.test"}
         )

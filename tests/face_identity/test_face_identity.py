@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from reachy_mini_conversation_app.moves import MovementManager
+from reachy_mini_conversation_app.face_identity import quality as face_quality
 from reachy_mini_conversation_app.face_identity.types import (
     MODEL_ID_SFACE,
     MODEL_VERSION_SFACE,
@@ -182,9 +183,25 @@ def test_quality_rejects_small_and_blurry() -> None:
     assert "blurred" in blurred.reasons
 
 
+def test_quality_uses_physical_camera_blur_threshold(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Physical-camera sharpness passes at 12.0 and fails below it."""
+    frame = np.full((240, 320, 3), 120, dtype=np.uint8)
+    face = _face(width=320, height=240, bbox=(40, 30, 160, 160), confidence=0.95)
+
+    monkeypatch.setattr(face_quality, "_laplacian_variance", lambda gray: 12.0)
+    assert assess_face_quality(frame, face).usable is True
+
+    monkeypatch.setattr(face_quality, "_laplacian_variance", lambda gray: 11.99)
+    rejected = assess_face_quality(frame, face)
+    assert rejected.usable is False
+    assert "blurred" in rejected.reasons
+
+
 def test_head_tracking_guard_restores_prior_on_state() -> None:
     """Prior tracking ON freezes then restores ON; prior OFF stays OFF."""
     robot = MagicMock()
+    robot.get_current_joint_positions.return_value = ([0.0] * 7, [0.0, 0.0])
+    robot.get_current_head_pose.return_value = np.eye(4)
     manager = MovementManager(current_robot=robot)
     manager._head_tracking = True
     with HeadTrackingGuard(manager) as guard:

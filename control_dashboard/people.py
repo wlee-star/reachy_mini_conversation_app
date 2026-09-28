@@ -31,6 +31,7 @@ MAX_TOTAL_BYTES = 32 * 1024 * 1024
 # Binary photo caps stay at 32 MiB; body limit includes base64 (~4/3) plus JSON wrappers.
 MAX_BODY_BYTES = 48 * 1024 * 1024
 MAX_PIXELS = 16_000_000
+THUMBNAIL_DIRECTORY = "thumbnails"
 _LOCK = threading.Lock()
 
 
@@ -97,6 +98,12 @@ class PeopleService:
         self.pipeline: FaceIdentityPipeline | None = None
         self.recovery_required = False
 
+    def thumbnail_path(self, person_id: str) -> Path:
+        """Return the representative face thumbnail path for one person."""
+        if not re.fullmatch(r"person_[a-zA-Z0-9_-]+", person_id):
+            raise ValueError("Invalid person ID")
+        return self.identities.path.parent / THUMBNAIL_DIRECTORY / f"{person_id}.jpg"
+
     def execute(self, action: str, body: dict[str, object]) -> dict[str, object]:
         """Run an on-demand operation; never access robot media or enable recognition."""
         if not _LOCK.acquire(blocking=False):
@@ -124,17 +131,18 @@ class PeopleService:
                     raise ValueError("Memory contains invalid records; recover it before editing")
             if action == "list":
                 identities = {record.person_id: record for record in self.identities.list_identities()}
-                return {
-                    "people": [
-                        {
-                            **asdict(profile),
-                            "embedding_count": len(identities[profile.person_id].embeddings)
-                            if profile.person_id in identities
-                            else 0,
-                        }
-                        for profile in self.profiles.list_profiles()
-                    ]
-                }
+                rows: list[dict[str, object]] = []
+                for profile in self.profiles.list_profiles():
+                    row: dict[str, object] = {
+                        **asdict(profile),
+                        "embedding_count": len(identities[profile.person_id].embeddings)
+                        if profile.person_id in identities
+                        else 0,
+                    }
+                    if self.thumbnail_path(profile.person_id).is_file():
+                        row["thumbnail_url"] = f"/api/people/{profile.person_id}/thumbnail"
+                    rows.append(row)
+                return {"people": rows}
             person_id = body.get("person_id")
             if action not in {"enrol", "edit", "add", "forget"}:
                 raise ValueError("Unknown operation")
@@ -148,6 +156,8 @@ class PeopleService:
             else:
                 person_id = "person_" + uuid.uuid4().hex
             assert isinstance(person_id, str)
+            thumbnail_path = self.thumbnail_path(person_id)
+            snapshots[thumbnail_path] = thumbnail_path.read_bytes() if thumbnail_path.exists() else None
             if action == "forget":
                 if body.get("confirmed") is not True:
                     raise ValueError("Confirm forgetting this person first")
@@ -155,7 +165,12 @@ class PeopleService:
                 mutated = True
                 self.identities.delete(person_id)
                 self.profiles.delete(person_id)
-                if self.identities.get(person_id) is not None or self.profiles.get(person_id) is not None:
+                thumbnail_path.unlink(missing_ok=True)
+                if (
+                    self.identities.get(person_id) is not None
+                    or self.profiles.get(person_id) is not None
+                    or thumbnail_path.exists()
+                ):
                     raise OSError("Deletion verification failed")
                 return {"status": "forgotten", "person_id": person_id, "persisted": True}
             fields: dict[str, str] = {}
@@ -170,6 +185,7 @@ class PeopleService:
                 if is_robot_name_variant(fields["name"]):
                     raise ValueError("That sounds like Reachy's name. Enter the person's name.")
             accepted: list[FaceEmbedding] = []
+            thumbnail_jpeg: bytes | None = None
             if action in {"enrol", "add"}:
                 uploads = body.get("photos")
                 if not isinstance(uploads, list) or not 1 <= len(uploads) <= MAX_PHOTOS:
@@ -201,6 +217,21 @@ class PeopleService:
                                 raise ValueError("Invalid face sample")
                             accepted.append(embedding)
                             status = "accepted"
+                            bbox = metadata.get("face_bbox")
+                            if thumbnail_jpeg is None and isinstance(bbox, list) and len(bbox) == 4:
+                                x, y, width, height = (float(value) for value in bbox)
+                                padding = 0.15 * max(width, height)
+                                left = max(0, int(x - padding))
+                                top = max(0, int(y - padding))
+                                right = min(frame.shape[1], int(x + width + padding))
+                                bottom = min(frame.shape[0], int(y + height + padding))
+                                face_crop = frame[top:bottom, left:right]
+                                if face_crop.size:
+                                    encoded_ok, encoded_crop = cv2.imencode(
+                                        ".jpg", face_crop, [cv2.IMWRITE_JPEG_QUALITY, 90]
+                                    )
+                                    if encoded_ok:
+                                        thumbnail_jpeg = encoded_crop.tobytes()
                         photos.append({"index": index, "status": status, "reasons": reasons})
                         del frame
                     except (ValueError, cv2.error) as exc:
@@ -220,6 +251,14 @@ class PeopleService:
             expected_count = (len(previous.embeddings) if previous else 0) + len(accepted)
             if accepted:
                 self.identities.enrol(accepted, person_id=person_id)
+                if thumbnail_jpeg is not None and (action == "enrol" or not thumbnail_path.is_file()):
+                    thumbnail_path.parent.mkdir(parents=True, exist_ok=True)
+                    temporary_thumbnail = thumbnail_path.with_suffix(".jpg.tmp")
+                    try:
+                        temporary_thumbnail.write_bytes(thumbnail_jpeg)
+                        temporary_thumbnail.replace(thumbnail_path)
+                    finally:
+                        temporary_thumbnail.unlink(missing_ok=True)
             if fields:
                 saved_profile = self.profiles.upsert(
                     person_id,
@@ -262,6 +301,7 @@ class PeopleService:
                 "name": profile.name if profile else "",
                 "embedding_count": expected_count,
                 "persisted": True,
+                "thumbnail_url": f"/api/people/{person_id}/thumbnail" if thumbnail_path.is_file() else None,
                 "photos": photos,
             }
         except Exception as exc:

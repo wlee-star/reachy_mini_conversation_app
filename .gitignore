@@ -72,3 +72,6 @@ external_content/user_personalities/
 external_content/installed_tool_spaces.json
 external_content/installed_local_mcp.json
 external_content/profile_toolsets.json
+
+# Sensitive local face identity data when an instance path points at the repository
+face_memory/

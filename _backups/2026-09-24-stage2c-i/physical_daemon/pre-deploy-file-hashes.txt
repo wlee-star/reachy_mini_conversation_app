@@ -1,0 +1,4 @@
+28dc85ddb51921358a94e12d4e1bf1c7f74ce8e3c4f5c958afbad0d7e8c05cb8  /venvs/mini_daemon/lib/python3.12/site-packages/reachy_mini/io/protocol.py
+6feaa7e3768d0a7db9a641987f7ab81497f47f43b3927718a377195dc3b55c9f  /venvs/mini_daemon/lib/python3.12/site-packages/reachy_mini/daemon/backend/abstract.py
+794fecf0dcbbe003cb09672fc821ca186a10ba07391a695ecb4c7fb28429b007  /venvs/mini_daemon/lib/python3.12/site-packages/reachy_mini/daemon/daemon.py
+e441e959ba52d8243b46f8cbb1fdb9a29d60976852ab5e168ebe9842c20854ee  /etc/systemd/system/reachy-mini-daemon.service

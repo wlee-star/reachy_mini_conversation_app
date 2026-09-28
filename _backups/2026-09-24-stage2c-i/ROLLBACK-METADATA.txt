@@ -1,0 +1,28 @@
+STAGE 2C-I PRE-DEPLOYMENT ROLLBACK METADATA
+
+Captured: 2026-09-24 Australia/Sydney
+Windows SDK version: 1.10.0rc5
+Windows environment: C:\Users\Walter Lee\Workspace\Reachy mini local\.venv
+Windows package path: C:\Users\Walter Lee\Workspace\Reachy mini local\.venv\Lib\site-packages\reachy_mini
+Windows installation mechanism: pip/uv-managed virtual environment
+Physical daemon version: 1.10.0
+Physical environment: /venvs/mini_daemon
+Physical package path: /venvs/mini_daemon/lib/python3.12/site-packages/reachy_mini
+Physical service: /etc/systemd/system/reachy-mini-daemon.service
+Official source: https://github.com/pollen-robotics/reachy_mini
+Official tags: v1.10.0rc5 and v1.10.0
+Validated patch SHA-256: F0563D3D3D06AC17A2E7CBD4AE76A6F5C1FE505EE356B8C336F0D14BEE3F8CFE
+
+Pre-deploy conversation listener PID: 29412
+Conversation launcher PID: 45068
+Pre-deploy speech listener PID: 45300
+Speech launcher PID: 36576
+Pre-deploy physical daemon PID: 906
+Pre-deploy application tracking: DISABLED
+Pre-deploy daemon status field: missing
+Pre-deploy camera: healthy and advancing
+Pre-deploy speech: HTTP 200
+
+Rollback: reinstall the official version-matched wheel with --no-deps --force-reinstall,
+then restart only the affected service. Verify daemon health, camera health, tracking
+disabled, and the old missing field interpreted as UNKNOWN.

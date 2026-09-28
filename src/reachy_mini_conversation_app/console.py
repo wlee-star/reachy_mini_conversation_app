@@ -8,6 +8,7 @@ import os
 import time
 import asyncio
 import logging
+import ipaddress
 import threading
 from typing import Any, List, Optional
 from pathlib import Path
@@ -47,6 +48,7 @@ from reachy_mini_conversation_app.personality_routes import (
     build_personality_ops,
     register_personality_methods,
 )
+from reachy_mini_conversation_app.head_tracking_admin import HeadTrackingAdmin
 from reachy_mini_conversation_app.profile_tool_routes import register_profile_tool_methods
 from reachy_mini_conversation_app.audio.startup_config import apply_audio_startup_config
 from reachy_mini_conversation_app.conversation_handler import ConversationHandler
@@ -115,6 +117,17 @@ class LocalStream:
         handler_factory: HandlerFactory | None = None,
         startup_voice: Optional[str] = None,
         safe_stop: Callable[[], dict[str, Any]] | None = None,
+        movement_status: Callable[[], dict[str, Any]] | None = None,
+        stage1_prepare: Callable[[float], dict[str, object]] | None = None,
+        stage1_execute: Callable[[str], dict[str, object]] | None = None,
+        stage1_cancel: Callable[[str], None] | None = None,
+        stage1_preview_start: Callable[[], dict[str, object]] | None = None,
+        stage1_preview_status: Callable[[str | None], dict[str, object]] | None = None,
+        stage1_preview_release: Callable[[str], dict[str, object]] | None = None,
+        daemon_http_status: Callable[[], dict[str, object]] | None = None,
+        sdk_control_status: Callable[[], dict[str, object]] | None = None,
+        head_tracking_admin: HeadTrackingAdmin | None = None,
+        dashboard_shutdown_requested: Callable[[], None] | None = None,
     ):
         """Initialize the stream with a realtime handler and pipelines.
 
@@ -136,11 +149,31 @@ class LocalStream:
         self._mic_muted = False  # mic starts live; the UI toggles it via the settings API
         self._speaker_muted = False
         self._safe_stop = safe_stop
+        self._movement_status = movement_status
+        self._stage1_prepare = stage1_prepare
+        self._stage1_execute = stage1_execute
+        self._stage1_cancel = stage1_cancel
+        self._stage1_preview_start = stage1_preview_start
+        self._stage1_preview_status = stage1_preview_status
+        self._stage1_preview_release = stage1_preview_release
+        self._daemon_http_status = daemon_http_status
+        self._sdk_control_status = sdk_control_status
+        self._head_tracking_admin = head_tracking_admin
+        self._dashboard_shutdown_requested = dashboard_shutdown_requested
         self._motors_disabled = False
         self._last_user_level = 0.0
         self._last_assistant_level = 0.0
         self._speaker_test_lock = threading.Lock()
+        self._shutdown_request_lock = threading.Lock()
+        self._shutdown_requested = False
         self._dashboard_camera_lock = threading.Lock()
+        self._dashboard_camera_health_lock = threading.Lock()
+        self._dashboard_camera_last_frame_at: float | None = None
+        self._dashboard_camera_last_request_at: float | None = None
+        self._dashboard_camera_last_success_at: float | None = None
+        self._dashboard_camera_last_failure_at: float | None = None
+        self._dashboard_camera_last_failure: str | None = None
+        self._dashboard_camera_single_flight_busy = False
         self._backend_connection_state = "not_started"
         self._backend_error: str | None = None
         self._backend_retry_delay = BACKEND_RETRY_DELAY_SECONDS
@@ -947,11 +980,43 @@ class LocalStream:
             speaker_level = 0.0
         mic_status = "muted" if self._mic_muted else ("listening" if microphone_level > 0.02 else "idle")
         speaker_status = "muted" if self._speaker_muted else ("playing" if speaker_level > 0.02 else "ready")
-        camera_status = "ready"
-        camera_summary = "Camera is served through the Reachy Mini media manager (no second pipeline)."
+        camera_status = "stale"
+        camera_summary = "Camera API is initialized, but no recent JPEG has been observed."
         if getattr(media, "get_frame_jpeg", None) is None:
             camera_status = "offline"
             camera_summary = "Camera API unavailable on this media backend."
+        with self._dashboard_camera_health_lock:
+            last_camera_frame_at = self._dashboard_camera_last_frame_at
+            last_camera_request_at = self._dashboard_camera_last_request_at
+            last_camera_success_at = self._dashboard_camera_last_success_at
+            last_camera_failure_at = self._dashboard_camera_last_failure_at
+            camera_last_failure = self._dashboard_camera_last_failure
+            camera_single_flight_busy = (
+                self._dashboard_camera_single_flight_busy and self._dashboard_camera_lock.locked()
+            )
+        camera_frame_age_s = None if last_camera_frame_at is None else max(0.0, now - last_camera_frame_at)
+        camera_request_age_s = None if last_camera_request_at is None else max(0.0, now - last_camera_request_at)
+        camera_success_age_s = None if last_camera_success_at is None else max(0.0, now - last_camera_success_at)
+        camera_failure_age_s = None if last_camera_failure_at is None else max(0.0, now - last_camera_failure_at)
+        if camera_status != "offline" and camera_frame_age_s is not None:
+            if camera_frame_age_s <= 2.0:
+                camera_status = "live"
+                camera_summary = "A current camera JPEG was received through the existing media pipeline."
+            else:
+                camera_summary = f"Last camera JPEG is stale ({camera_frame_age_s:.1f}s old)."
+
+        daemon_http: dict[str, object] = {"state": "UNKNOWN"}
+        if self._daemon_http_status is not None:
+            try:
+                daemon_http = self._daemon_http_status()
+            except Exception as exc:
+                logger.warning("Daemon HTTP health probe failed: %s", exc)
+                daemon_http = {"state": "OFFLINE", "last_failure_type": type(exc).__name__}
+        sdk_control = self._sdk_control_status() if self._sdk_control_status is not None else {"state": "UNKNOWN"}
+        movement_status = self._movement_status() if self._movement_status is not None else {}
+        sdk_state = str(sdk_control.get("state") or "UNKNOWN")
+        daemon_state = str(daemon_http.get("state") or "UNKNOWN")
+        overall_control_status = "healthy" if daemon_state == "HEALTHY" and sdk_state == "HEALTHY" else "unhealthy"
 
         return {
             "microphone_status": mic_status,
@@ -971,6 +1036,38 @@ class LocalStream:
             ),
             "camera_status": camera_status,
             "camera_summary": camera_summary,
+            "camera_frame_status": {
+                "state": camera_status.upper(),
+                "last_frame_age_s": round(camera_frame_age_s, 3) if camera_frame_age_s is not None else None,
+                "last_failure": camera_last_failure,
+            },
+            "camera_freshness": {
+                "camera_source_last_frame_at": "UNKNOWN",
+                "camera_source_age_s": "UNKNOWN",
+                "camera_app_last_frame_at": "UNKNOWN",
+                "camera_app_age_s": "UNKNOWN",
+                "camera_jpeg_last_generated_at": last_camera_success_at,
+                "camera_jpeg_age_s": round(camera_success_age_s, 3) if camera_success_age_s is not None else None,
+                "dashboard_camera_last_request_at": last_camera_request_at,
+                "dashboard_camera_request_age_s": (
+                    round(camera_request_age_s, 3) if camera_request_age_s is not None else None
+                ),
+                "dashboard_camera_last_success_at": last_camera_success_at,
+                "dashboard_camera_success_age_s": (
+                    round(camera_success_age_s, 3) if camera_success_age_s is not None else None
+                ),
+                "dashboard_camera_last_failure_at": last_camera_failure_at,
+                "dashboard_camera_failure_age_s": (
+                    round(camera_failure_age_s, 3) if camera_failure_age_s is not None else None
+                ),
+                "dashboard_camera_last_failure_reason": camera_last_failure,
+                "camera_single_flight_busy": camera_single_flight_busy,
+                "camera_backoff_active": "UNKNOWN",
+            },
+            "startup_observability": movement_status.get("startup_observability"),
+            "daemon_http_status": daemon_http,
+            "sdk_control_status": sdk_control,
+            "overall_control_status": overall_control_status,
             "safe_stop_available": self._safe_stop is not None,
             "safe_stop_summary": (
                 "SAFE STOP: disable_wobbling → stop moves → disable_motors. "
@@ -986,6 +1083,15 @@ class LocalStream:
 
     def _mount_dashboard_routes(self, settings_app: FastAPI) -> None:
         """HTTP control surface for the physical AI-stack dashboard (reuses this media pipeline)."""
+
+        def is_loopback_request(request: Request) -> bool:
+            client = request.client
+            if client is None:
+                return False
+            try:
+                return ipaddress.ip_address(client.host).is_loopback
+            except ValueError:
+                return False
 
         @settings_app.get("/api/dashboard/status")
         def _dashboard_status() -> dict[str, Any]:
@@ -1035,18 +1141,40 @@ class LocalStream:
 
         @settings_app.get("/api/dashboard/camera.jpg")
         def _dashboard_camera() -> Response:
+            request_at = time.monotonic()
+            with self._dashboard_camera_health_lock:
+                self._dashboard_camera_last_request_at = request_at
             if not self._dashboard_camera_lock.acquire(blocking=False):
+                with self._dashboard_camera_health_lock:
+                    self._dashboard_camera_single_flight_busy = True
+                    self._dashboard_camera_last_failure_at = request_at
+                    self._dashboard_camera_last_failure = "single-flight busy"
                 return JSONResponse({"error": "preview busy; request the latest frame again"}, status_code=503)
+            with self._dashboard_camera_health_lock:
+                self._dashboard_camera_single_flight_busy = True
             started = time.perf_counter()
             try:
                 jpeg = self._robot.media.get_frame_jpeg()
             except Exception as exc:
+                with self._dashboard_camera_health_lock:
+                    self._dashboard_camera_last_failure_at = time.monotonic()
+                    self._dashboard_camera_last_failure = f"{type(exc).__name__}: {exc}"
                 logger.warning("Dashboard camera frame failed: %s", exc)
                 return JSONResponse({"error": f"camera unavailable: {type(exc).__name__}"}, status_code=503)
             finally:
                 self._dashboard_camera_lock.release()
+                with self._dashboard_camera_health_lock:
+                    self._dashboard_camera_single_flight_busy = False
             if not jpeg:
+                with self._dashboard_camera_health_lock:
+                    self._dashboard_camera_last_failure_at = time.monotonic()
+                    self._dashboard_camera_last_failure = "no frame"
                 return JSONResponse({"error": "no frame"}, status_code=503)
+            with self._dashboard_camera_health_lock:
+                success_at = time.monotonic()
+                self._dashboard_camera_last_frame_at = success_at
+                self._dashboard_camera_last_success_at = success_at
+                self._dashboard_camera_last_failure = None
             elapsed_ms = (time.perf_counter() - started) * 1000
             return Response(
                 content=jpeg,
@@ -1071,6 +1199,144 @@ class LocalStream:
             if payload.get("status") == "motors_disabled":
                 self._motors_disabled = True
             return {"ok": True, **payload, **self._dashboard_status_payload()}
+
+        @settings_app.post("/api/dashboard/shutdown")
+        def _dashboard_shutdown(request: Request) -> Response:
+            if not is_loopback_request(request):
+                return JSONResponse({"ok": False, "error": "Loopback request required."}, status_code=403)
+            with self._shutdown_request_lock:
+                if self._shutdown_requested:
+                    return JSONResponse({"ok": True, "status": "already_requested"})
+                self._shutdown_requested = True
+            logger.info("Graceful shutdown requested via dashboard API")
+            if self._dashboard_shutdown_requested is not None:
+                try:
+                    self._dashboard_shutdown_requested()
+                except Exception as exc:
+                    logger.error("Dashboard shutdown notification failed: %s", exc)
+
+            def close_stream() -> None:
+                try:
+                    self.close()
+                except Exception as exc:
+                    logger.error("Graceful shutdown close failed: %s", exc)
+
+            threading.Thread(target=close_stream, daemon=True, name="dashboard-shutdown-close").start()
+            return JSONResponse({"ok": True, "status": "shutdown_requested"})
+
+        @settings_app.post("/api/internal/face-track-stage1/prepare")
+        async def _stage1_prepare(request: Request) -> Response:
+            if not is_loopback_request(request):
+                return JSONResponse({"ok": False, "error": "loopback access required"}, status_code=403)
+            if self._stage1_prepare is None:
+                return JSONResponse({"ok": False, "error": "Stage 1 calibration unavailable"}, status_code=503)
+            payload = await request.json()
+            try:
+                raw_delta = float(payload["raw_geometry_delta_yaw"])
+                preview = await asyncio.to_thread(self._stage1_prepare, raw_delta)
+            except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+                logger.warning("Stage 1 calibration preview rejected: %s", exc)
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+            return JSONResponse({"ok": True, **preview})
+
+        @settings_app.post("/api/internal/face-track-stage1/execute")
+        async def _stage1_execute(request: Request) -> Response:
+            if not is_loopback_request(request):
+                return JSONResponse({"ok": False, "error": "loopback access required"}, status_code=403)
+            if self._stage1_execute is None:
+                return JSONResponse({"ok": False, "error": "Stage 1 calibration unavailable"}, status_code=503)
+            payload = await request.json()
+            try:
+                session_id = str(payload["session_id"])
+                result = await asyncio.to_thread(self._stage1_execute, session_id)
+            except (KeyError, TypeError, ValueError, RuntimeError, TimeoutError) as exc:
+                logger.warning("Stage 1 calibration execution rejected: %s", exc)
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+            return JSONResponse({"ok": True, **result})
+
+        @settings_app.post("/api/internal/face-track-stage1/cancel")
+        async def _stage1_cancel(request: Request) -> Response:
+            if not is_loopback_request(request):
+                return JSONResponse({"ok": False, "error": "loopback access required"}, status_code=403)
+            if self._stage1_cancel is None:
+                return JSONResponse({"ok": False, "error": "Stage 1 calibration unavailable"}, status_code=503)
+            payload = await request.json()
+            try:
+                session_id = str(payload["session_id"])
+                await asyncio.to_thread(self._stage1_cancel, session_id)
+            except (KeyError, TypeError, ValueError, RuntimeError, TimeoutError) as exc:
+                logger.warning("Stage 1 calibration cancellation rejected: %s", exc)
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+            return JSONResponse({"ok": True, "status": "cancelled"})
+
+        @settings_app.post("/api/internal/face-track-stage1/preview/start")
+        async def _stage1_preview_start(request: Request) -> Response:
+            if not is_loopback_request(request):
+                return JSONResponse({"ok": False, "error": "loopback access required"}, status_code=403)
+            if self._stage1_preview_start is None:
+                return JSONResponse({"ok": False, "error": "Stage 1 preview unavailable"}, status_code=503)
+            try:
+                result = await asyncio.to_thread(self._stage1_preview_start)
+            except (RuntimeError, TimeoutError) as exc:
+                logger.warning("Stage 1 diagnostic preview start rejected: %s", exc)
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+            return JSONResponse({"ok": True, **result})
+
+        @settings_app.get("/api/internal/face-track-stage1/preview/status")
+        async def _stage1_preview_status(request: Request) -> Response:
+            if not is_loopback_request(request):
+                return JSONResponse({"ok": False, "error": "loopback access required"}, status_code=403)
+            if self._stage1_preview_status is None:
+                return JSONResponse({"ok": False, "error": "Stage 1 preview unavailable"}, status_code=503)
+            session_id = request.query_params.get("session_id")
+            try:
+                result = await asyncio.to_thread(self._stage1_preview_status, session_id)
+            except RuntimeError as exc:
+                logger.warning("Stage 1 diagnostic preview status rejected: %s", exc)
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+            return JSONResponse({"ok": True, **result})
+
+        @settings_app.post("/api/internal/face-track-stage1/preview/release")
+        async def _stage1_preview_release(request: Request) -> Response:
+            if not is_loopback_request(request):
+                return JSONResponse({"ok": False, "error": "loopback access required"}, status_code=403)
+            if self._stage1_preview_release is None:
+                return JSONResponse({"ok": False, "error": "Stage 1 preview unavailable"}, status_code=503)
+            payload = await request.json()
+            try:
+                session_id = str(payload["session_id"])
+                result = await asyncio.to_thread(self._stage1_preview_release, session_id)
+            except (KeyError, TypeError, RuntimeError, TimeoutError) as exc:
+                logger.warning("Stage 1 diagnostic preview release rejected: %s", exc)
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+            return JSONResponse({"ok": True, **result})
+
+        @settings_app.get("/api/internal/head-tracking/status")
+        async def _head_tracking_status(request: Request) -> Response:
+            if not is_loopback_request(request):
+                return JSONResponse({"ok": False, "error": "loopback access required"}, status_code=403)
+            if self._head_tracking_admin is None:
+                return JSONResponse({"ok": False, "error": "Head tracking control unavailable"}, status_code=503)
+            result = await asyncio.to_thread(self._head_tracking_admin.status)
+            status_code = 200 if result.get("available") is True else 503
+            return JSONResponse({"ok": status_code == 200, **result}, status_code=status_code)
+
+        @settings_app.post("/api/internal/head-tracking/enable")
+        async def _head_tracking_enable(request: Request) -> Response:
+            return await _set_head_tracking_from_admin(request, True)
+
+        @settings_app.post("/api/internal/head-tracking/disable")
+        async def _head_tracking_disable(request: Request) -> Response:
+            return await _set_head_tracking_from_admin(request, False)
+
+        async def _set_head_tracking_from_admin(request: Request, enabled: bool) -> Response:
+            if not is_loopback_request(request):
+                return JSONResponse({"ok": False, "error": "loopback access required"}, status_code=403)
+            if self._head_tracking_admin is None:
+                return JSONResponse({"ok": False, "error": "Head tracking control unavailable"}, status_code=503)
+            result = await asyncio.to_thread(self._head_tracking_admin.set_enabled, enabled)
+            confirmed = result.get("daemon_confirmed") is True
+            return JSONResponse({"ok": confirmed, **result}, status_code=200 if confirmed else 503)
 
     async def record_loop(self) -> None:
         """Read mic frames from the recorder and forward them to the handler."""

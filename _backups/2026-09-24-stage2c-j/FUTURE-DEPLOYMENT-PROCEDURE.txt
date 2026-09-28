@@ -1,0 +1,63 @@
+Stage 2C-J future deployment procedure
+
+Prerequisite
+------------
+Do not deploy until the exact daemon wheel below has passed an isolated Linux/POSIX
+pip installation and launcher execution test. Verify its SHA-256 before transfer.
+
+Daemon candidate:
+  reachy_mini-1.10.0-py3-none-any.whl
+  E7DF08785D9EB89B908F3D55DE42C2DB17AC7FA69F1E5B8100D27FD34FA04C34
+
+Windows candidate:
+  reachy_mini-1.10.0rc5-py3-none-any.whl
+  D0543BACD86CE1AFB701418D262E48D2635711237CEA58147179AC601A37B9CE
+
+Robot-side guarded sequence
+---------------------------
+1. Transfer the already validated wheel and daemon-content-mode-manifest.json.
+2. Verify the transferred wheel SHA-256 before changing the environment.
+3. Capture the current official package manifest and affected-file hashes.
+4. Stop the service intentionally. Do not use restart:
+     sudo systemctl stop reachy-mini-daemon.service
+5. Install a temporary runtime-only systemd drop-in with:
+     [Service]
+     Restart=no
+   Place it at:
+     /run/systemd/system/reachy-mini-daemon.service.d/stage2c-validation.conf
+   Then run:
+     sudo systemctl daemon-reload
+6. Install without dependencies:
+     /venvs/mini_daemon/bin/python -m pip install --no-cache-dir --no-deps \
+       --force-reinstall /home/pollen/reachy_mini-1.10.0-py3-none-any.whl
+7. BEFORE STARTING THE SERVICE, verify all manifest hashes and modes. At minimum:
+     launcher=/venvs/mini_daemon/lib/python3.12/site-packages/reachy_mini/daemon/app/services/wireless/launcher.sh
+     test -f "$launcher"
+     test -x "$launcher"
+     test "$(stat -c '%a' "$launcher")" = 755
+     test "$(head -n 1 "$launcher")" = '#!/bin/bash'
+     ! LC_ALL=C grep -n $'\r' "$launcher"
+     test "$(sha256sum "$launcher" | awk '{print $1}')" = \
+       1d1030da18a9a3aa66ed891a6903f7611b142696256dc457a5a9adbf6a5317ea
+     /venvs/mini_daemon/bin/python -c \
+       "from reachy_mini.io.protocol import DaemonStatus; assert 'head_tracking_enabled' in DaemonStatus.model_fields"
+8. If any pre-start check fails, reinstall the captured official 1.10.0 wheel while
+   the service remains stopped. Validate the official launcher before any start.
+9. If every check passes, clear the failed state and start exactly once:
+     sudo systemctl reset-failed reachy-mini-daemon.service
+     sudo systemctl start reachy-mini-daemon.service
+10. Observe service state, journal, HTTP health, camera/media health, and the
+    authoritative tracking field. Do not enable tracking.
+11. If candidate startup is unhealthy, Restart=no prevents a loop. Stop the unit,
+    reinstall the official wheel, repeat the pre-start checks, and start the official
+    daemon once.
+12. After either candidate or rollback health is proven, remove only the runtime
+    stage2c-validation.conf drop-in, run systemctl daemon-reload, and verify the
+    effective Restart=on-failure and RestartSec=3s policy is restored.
+
+Windows sequence
+----------------
+Only after the daemon candidate passes Linux/POSIX validation, install the exact
+Windows candidate with --no-deps --force-reinstall. Verify version, import path,
+protocol field, and missing-field-to-None behavior before starting the conversation
+application.

@@ -1,7 +1,7 @@
 """Behavior tests for the local control dashboard."""
 
 import os
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 
@@ -26,6 +26,16 @@ from control_dashboard.redact import (
     public_env_map,
 )
 from control_dashboard.registry import load_config
+
+
+@pytest.fixture(autouse=True)
+def _isolated_dashboard_runtime(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep dashboard tests independent from live ownership and local overrides."""
+    from control_dashboard import paths as dashboard_paths
+
+    monkeypatch.setattr(dashboard_paths, "OWNED_PATH", tmp_path / "owned.json")
+    monkeypatch.setattr(dashboard_paths, "STOPPED_PATH", tmp_path / "stopped.json")
+    monkeypatch.setattr(dashboard_paths, "LOCAL_SERVICES_PATH", tmp_path / "services.local.json")
 
 
 def test_secrets_are_masked_and_never_echoed() -> None:
@@ -129,6 +139,212 @@ def test_stop_refuses_unrelated_process(monkeypatch: pytest.MonkeyPatch) -> None
     result = controller.stop(llama)
     assert result["ok"] is False
     killed.assert_not_called()
+
+
+def test_conversation_stop_requests_graceful_exit_before_process_termination(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An intentional stop must suppress restart and let worker and launcher exit naturally."""
+    config = load_config()
+    conversation = config.service("conversation")
+    assert conversation is not None
+    controller = StackController(config)
+    worker_pid = 29996
+    launcher_pid = 3628
+    controller._owned = {
+        "conversation": {
+            "pid": worker_pid,
+            "wrapper_pid": launcher_pid,
+            "started_by_dashboard": True,
+        }
+    }
+    monkeypatch.setattr(controller, "_save_owned", lambda: None)
+    monkeypatch.setattr(controller, "_save_stopped", lambda: None)
+    monkeypatch.setattr(controller, "_pid_belongs_to_service", lambda _spec, pid: pid in {worker_pid, launcher_pid})
+    request_sent = False
+
+    def listeners(_port: int) -> list[int]:
+        return [] if request_sent else [worker_pid]
+
+    def request(url: str, **kwargs: object) -> HttpResult:
+        nonlocal request_sent
+        assert url.endswith("/api/dashboard/shutdown")
+        assert kwargs["method"] == "POST"
+        assert "conversation" in controller._user_stopped
+        request_sent = True
+        return HttpResult(True, 200, '{"ok":true,"status":"shutdown_requested"}', 1.0, None)
+
+    live_checks = {worker_pid: 0, launcher_pid: 0}
+
+    def pid_is_running(pid: int) -> bool:
+        live_checks[pid] += 1
+        return live_checks[pid] == 1
+
+    monkeypatch.setattr("control_dashboard.stack.proc.listening_pids", listeners)
+    monkeypatch.setattr("control_dashboard.stack.proc.pids_matching", lambda _pattern: [])
+    monkeypatch.setattr("control_dashboard.stack.proc.invalidate_listen_cache", lambda: None)
+    monkeypatch.setattr("control_dashboard.stack.proc.pid_is_running", pid_is_running)
+    monkeypatch.setattr("control_dashboard.stack.net.http_request", request)
+    sleep = MagicMock()
+    monkeypatch.setattr("control_dashboard.stack.time.sleep", sleep)
+    force_kill = MagicMock()
+    monkeypatch.setattr("control_dashboard.stack.proc.stop_pid", force_kill)
+
+    result = controller.stop(conversation)
+    duplicate = controller.stop(conversation)
+
+    assert result["ok"] is True
+    assert result["shutdown_type"] == "graceful"
+    assert result["forced"] is False
+    assert result["orderly_park_verified"] is None
+    assert result["stopped_pids"] == [worker_pid, launcher_pid]
+    assert duplicate["already_stopped"] is True
+    assert "conversation" in controller._user_stopped
+    assert "conversation" not in controller._owned
+    sleep.assert_called_once()
+    force_kill.assert_not_called()
+
+
+def test_conversation_graceful_stop_allows_bounded_orderly_park_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A verified park path may legitimately outlive the old 15s dashboard window."""
+    config = load_config()
+    conversation = config.service("conversation")
+    assert conversation is not None
+    controller = StackController(config)
+    worker_pid = 29996
+    controller._owned = {
+        "conversation": {
+            "pid": worker_pid,
+            "started_by_dashboard": True,
+        }
+    }
+    monotonic = 0.0
+
+    def sleep(seconds: float) -> None:
+        nonlocal monotonic
+        monotonic += seconds
+
+    def pid_is_running(_pid: int) -> bool:
+        return monotonic < 18.0
+
+    monkeypatch.setattr(controller, "_save_owned", lambda: None)
+    monkeypatch.setattr(controller, "_save_stopped", lambda: None)
+    monkeypatch.setattr(controller, "_pid_belongs_to_service", lambda _spec, pid: pid == worker_pid)
+    monkeypatch.setattr(
+        "control_dashboard.stack.proc.listening_pids", lambda _port: [worker_pid] if monotonic < 18.0 else []
+    )
+    monkeypatch.setattr("control_dashboard.stack.proc.pids_matching", lambda _pattern: [])
+    monkeypatch.setattr("control_dashboard.stack.proc.invalidate_listen_cache", lambda: None)
+    monkeypatch.setattr("control_dashboard.stack.proc.pid_is_running", pid_is_running)
+    monkeypatch.setattr(
+        "control_dashboard.stack.net.http_request",
+        lambda *_args, **_kwargs: HttpResult(True, 200, '{"ok":true,"status":"shutdown_requested"}', 1.0, None),
+    )
+    monkeypatch.setattr("control_dashboard.stack.time.monotonic", lambda: monotonic)
+    monkeypatch.setattr("control_dashboard.stack.time.sleep", sleep)
+    force_kill = MagicMock()
+    monkeypatch.setattr("control_dashboard.stack.proc.stop_pid", force_kill)
+
+    result = controller.stop(conversation)
+
+    assert result["ok"] is True
+    assert result["shutdown_type"] == "graceful"
+    assert result["forced"] is False
+    assert 18.0 <= monotonic < 20.0
+    force_kill.assert_not_called()
+
+
+def test_conversation_stop_does_not_post_to_missing_control_plane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A startup-blocked launcher without port 7860 cannot service graceful shutdown."""
+    config = load_config()
+    conversation = config.service("conversation")
+    assert conversation is not None
+    controller = StackController(config)
+    worker_pid = 29996
+    controller._owned = {
+        "conversation": {
+            "pid": worker_pid,
+            "started_by_dashboard": True,
+        }
+    }
+    monkeypatch.setattr(controller, "_save_owned", lambda: None)
+    monkeypatch.setattr(controller, "_save_stopped", lambda: None)
+    monkeypatch.setattr(controller, "_wait_for_port_free", lambda _spec: None)
+    monkeypatch.setattr(controller, "_pid_belongs_to_service", lambda _spec, pid: pid == worker_pid)
+    monkeypatch.setattr("control_dashboard.stack.proc.listening_pids", lambda _port: [])
+    monkeypatch.setattr("control_dashboard.stack.proc.pids_matching", lambda _pattern: [worker_pid])
+    monkeypatch.setattr("control_dashboard.stack.proc.invalidate_listen_cache", lambda: None)
+    monkeypatch.setattr("control_dashboard.stack.proc.pid_is_running", lambda _pid: True)
+    monkeypatch.setattr("control_dashboard.stack.proc.wait_until_gone", lambda _pid: True)
+    request = MagicMock()
+    monkeypatch.setattr("control_dashboard.stack.net.http_request", request)
+    force_kill = MagicMock()
+    monkeypatch.setattr("control_dashboard.stack.proc.stop_pid", force_kill)
+
+    result = controller.stop(conversation)
+
+    assert result["ok"] is False
+    assert result["shutdown_type"] == "forced"
+    assert result["orderly_park_verified"] is False
+    assert result["technical"] == "conversation control-plane port is not listening"
+    request.assert_not_called()
+    force_kill.assert_called_once_with(worker_pid)
+
+
+def test_conversation_graceful_timeout_is_forced_and_reported_as_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Force kill is a degraded fallback and can never claim an orderly park."""
+    config = load_config()
+    conversation = config.service("conversation")
+    assert conversation is not None
+    controller = StackController(config)
+    worker_pid = 29996
+    launcher_pid = 3628
+    controller._owned = {
+        "conversation": {
+            "pid": worker_pid,
+            "wrapper_pid": launcher_pid,
+            "started_by_dashboard": True,
+        }
+    }
+    monkeypatch.setattr(controller, "_save_owned", lambda: None)
+    monkeypatch.setattr(controller, "_save_stopped", lambda: None)
+    monkeypatch.setattr(controller, "_wait_for_port_free", lambda _spec: None)
+    monkeypatch.setattr(controller, "_pid_belongs_to_service", lambda _spec, pid: pid in {worker_pid, launcher_pid})
+    monkeypatch.setattr("control_dashboard.stack.proc.listening_pids", lambda _port: [worker_pid])
+    monkeypatch.setattr("control_dashboard.stack.proc.pids_matching", lambda _pattern: [])
+    monkeypatch.setattr("control_dashboard.stack.proc.invalidate_listen_cache", lambda: None)
+    monkeypatch.setattr("control_dashboard.stack.proc.pid_is_running", lambda _pid: True)
+    monkeypatch.setattr("control_dashboard.stack.proc.wait_until_gone", lambda _pid: True)
+    monkeypatch.setattr(
+        "control_dashboard.stack.net.http_request",
+        lambda *_args, **_kwargs: HttpResult(
+            True,
+            200,
+            '{"ok":true,"status":"shutdown_requested"}',
+            1.0,
+            None,
+        ),
+    )
+    monkeypatch.setattr("control_dashboard.stack._CONVERSATION_GRACEFUL_SHUTDOWN_TIMEOUT_S", 0.0)
+    force_kill = MagicMock()
+    monkeypatch.setattr("control_dashboard.stack.proc.stop_pid", force_kill)
+
+    result = controller.stop(conversation)
+
+    assert result["ok"] is False
+    assert result["shutdown_type"] == "forced"
+    assert result["forced"] is True
+    assert result["orderly_park_verified"] is False
+    assert result["error"] == "ABNORMAL / FORCED SHUTDOWN - ORDERLY PARK NOT VERIFIED"
+    assert "timed out" in result["technical"]
+    assert "conversation" in controller._user_stopped
+    assert force_kill.call_args_list == [call(worker_pid), call(launcher_pid)]
 
 
 def test_start_all_is_dependency_ordered() -> None:
@@ -300,6 +516,74 @@ def test_recover_restarts_conversation_inside_ready_window(monkeypatch: pytest.M
     started.assert_called_once()
 
 
+def test_recover_ignores_non_listening_stale_conversation_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stale fail-closed process cannot mask a crashed conversation worker."""
+    config = load_config()
+    controller = StackController(config)
+    controller._owned = {
+        "conversation": {
+            "pid": 1,
+            "started_by_dashboard": True,
+            "started_at": "2026-09-25T21:07:32+10:00",
+        }
+    }
+    monkeypatch.setattr("control_dashboard.stack.proc.pid_is_running", lambda pid: pid == 99)
+    monkeypatch.setattr("control_dashboard.stack.proc.listening_pids", lambda _port: [])
+    monkeypatch.setattr("control_dashboard.stack.proc.pids_matching", lambda _pattern: [99])
+    monkeypatch.setattr(
+        "control_dashboard.stack.proc.process_command_line",
+        lambda _pid: "python -m reachy_mini_conversation_app.main --no-sim --ui",
+    )
+    monkeypatch.setattr(
+        controller,
+        "health",
+        lambda spec, probe=False: HealthResult(STATUS_OFFLINE, "down"),
+    )
+    monkeypatch.setattr(controller, "_blocked_by", lambda _spec, **_k: [])
+    monkeypatch.setattr(controller, "_save_owned", lambda: None)
+    started = MagicMock(return_value={"ok": True, "status": STATUS_ONLINE})
+    monkeypatch.setattr(controller, "start", started)
+
+    controller.recover_once()
+
+    started.assert_called_once()
+    assert controller._owned["conversation"]["pid"] == 1
+
+
+def test_recover_restarts_owned_non_listening_conversation_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An alive launcher without a UI listener is stale for a port-backed conversation worker."""
+    config = load_config()
+    controller = StackController(config)
+    controller._owned = {
+        "conversation": {
+            "pid": 99,
+            "wrapper_pid": 99,
+            "started_by_dashboard": True,
+            "started_at": "2026-09-25T21:07:32+10:00",
+        }
+    }
+    monkeypatch.setattr("control_dashboard.stack.proc.pid_is_running", lambda pid: pid == 99)
+    monkeypatch.setattr("control_dashboard.stack.proc.listening_pids", lambda _port: [])
+    monkeypatch.setattr("control_dashboard.stack.proc.pids_matching", lambda _pattern: [99])
+    monkeypatch.setattr(
+        "control_dashboard.stack.proc.process_command_line",
+        lambda _pid: "python -m reachy_mini_conversation_app.main --no-sim --ui",
+    )
+    monkeypatch.setattr(
+        controller,
+        "health",
+        lambda spec, probe=False: HealthResult(STATUS_OFFLINE, "down"),
+    )
+    monkeypatch.setattr(controller, "_blocked_by", lambda _spec, **_k: [])
+    monkeypatch.setattr(controller, "_save_owned", lambda: None)
+    started = MagicMock(return_value={"ok": True, "status": STATUS_ONLINE})
+    monkeypatch.setattr(controller, "start", started)
+
+    controller.recover_once()
+
+    started.assert_called_once()
+
+
 def test_recover_adopts_listening_pid_when_wrapper_exits(monkeypatch: pytest.MonkeyPatch) -> None:
     """Once the daemon is healthy, replace the dead cmd.exe PID with the listener."""
     from control_dashboard.stack import StackController
@@ -434,6 +718,60 @@ def test_start_stops_leftover_matching_processes(monkeypatch: pytest.MonkeyPatch
         ),
     )
     result = controller.start(conversation)
+    assert result["ok"] is True
+    stopped.assert_called_once_with(99)
+    started.assert_called_once()
+
+
+def test_start_stops_owned_non_listening_conversation_process_before_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An owned stale conversation launcher must not be protected during a clean start."""
+    config = load_config()
+    conversation = config.service("conversation")
+    assert conversation is not None
+    controller = StackController(config)
+    controller._owned = {
+        "conversation": {
+            "pid": 99,
+            "wrapper_pid": 99,
+            "started_by_dashboard": True,
+            "started_at": "2026-09-25T21:07:32+10:00",
+        }
+    }
+    states = iter(
+        [
+            HealthResult(STATUS_OFFLINE, "down"),
+            HealthResult(STATUS_ONLINE, "up"),
+        ]
+    )
+    monkeypatch.setattr(
+        controller,
+        "health",
+        lambda spec, probe=False: next(states, HealthResult(STATUS_ONLINE, "up")),
+    )
+    monkeypatch.setattr(controller, "_blocked_by", lambda _spec, **_k: [])
+    monkeypatch.setattr(controller, "_save_owned", lambda: None)
+    monkeypatch.setattr("control_dashboard.stack.shutil_which", lambda exe: exe)
+    monkeypatch.setattr("control_dashboard.stack.proc.pids_matching", lambda _pattern: [99])
+    monkeypatch.setattr("control_dashboard.stack.proc.listening_pids", lambda _port: [])
+    monkeypatch.setattr("control_dashboard.stack.proc.pid_is_running", lambda _pid: True)
+    monkeypatch.setattr("control_dashboard.stack.proc.wait_until_gone", lambda _pid, timeout_s=8.0: True)
+    monkeypatch.setattr(
+        "control_dashboard.stack.proc.process_command_line",
+        lambda _pid: "python -m reachy_mini_conversation_app.main --ui",
+    )
+    stopped = MagicMock()
+    monkeypatch.setattr("control_dashboard.stack.proc.stop_pid", stopped)
+    started = MagicMock(return_value=123)
+    monkeypatch.setattr("control_dashboard.stack.proc.start_process", started)
+    monkeypatch.setattr(
+        "control_dashboard.stack.net.http_request",
+        lambda *_a, **_k: HttpResult(
+            True, 200, '{"size":1,"in_use":0,"units":[{"index":0,"state":"idle"}]}', 1.0, None
+        ),
+    )
+
+    result = controller.start(conversation)
+
     assert result["ok"] is True
     stopped.assert_called_once_with(99)
     started.assert_called_once()

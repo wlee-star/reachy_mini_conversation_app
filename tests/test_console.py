@@ -132,6 +132,62 @@ def test_rest_api_is_removed_in_favor_of_rpc() -> None:
     assert _rpc_call(app, "conversation.status")["result"]["backend"]
 
 
+def test_dashboard_shutdown_is_loopback_only_and_idempotent() -> None:
+    """The control-plane request must close the stream exactly once."""
+    app = FastAPI()
+    robot = MagicMock()
+    robot.media.audio = None
+    robot.media.backend = None
+    dashboard_shutdown_requested = MagicMock()
+    stream = LocalStream(
+        MagicMock(), robot, settings_app=app, dashboard_shutdown_requested=dashboard_shutdown_requested
+    )
+    stream._init_settings_ui_if_needed()
+    close_called = threading.Event()
+    stream.close = MagicMock(side_effect=close_called.set)
+
+    with TestClient(app, client=("192.0.2.1", 50000)) as remote_client:
+        denied = remote_client.post("/api/dashboard/shutdown")
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
+        first = client.post("/api/dashboard/shutdown")
+        duplicate = client.post("/api/dashboard/shutdown")
+
+    assert denied.status_code == 403
+    assert first.json() == {"ok": True, "status": "shutdown_requested"}
+    assert duplicate.json() == {"ok": True, "status": "already_requested"}
+    assert close_called.wait(timeout=1.0)
+    stream.close.assert_called_once_with()
+    dashboard_shutdown_requested.assert_called_once_with()
+    robot.goto_target.assert_not_called()
+    robot.set_target.assert_not_called()
+
+
+def test_dashboard_shutdown_ack_does_not_wait_for_stream_close() -> None:
+    """The dashboard ACK must not be held hostage by media teardown latency."""
+    app = FastAPI()
+    robot = MagicMock()
+    robot.media.audio = None
+    robot.media.backend = None
+    stream = LocalStream(MagicMock(), robot, settings_app=app)
+    stream._init_settings_ui_if_needed()
+    close_started = threading.Event()
+    release_close = threading.Event()
+
+    def close_stream() -> None:
+        close_started.set()
+        assert release_close.wait(timeout=1.0)
+
+    stream.close = MagicMock(side_effect=close_stream)
+
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
+        first = client.post("/api/dashboard/shutdown")
+
+    assert first.json() == {"ok": True, "status": "shutdown_requested"}
+    assert close_started.wait(timeout=1.0)
+    release_close.set()
+    stream.close.assert_called_once_with()
+
+
 def test_settings_ui_detaches_framework_catch_all_before_own_routes() -> None:
     """Framework fallback routes should not shadow the UI or the /rpc endpoint."""
     app = FastAPI()

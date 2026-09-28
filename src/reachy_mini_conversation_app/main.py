@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Optional
 from pathlib import Path
 from collections.abc import Callable, Awaitable
 
+import httpx
 from fastapi import FastAPI, Request, Response
 
 from reachy_mini import ReachyMini, ReachyMiniApp
@@ -21,10 +22,30 @@ from reachy_mini_conversation_app.utils import (
     log_connection_troubleshooting,
 )
 from reachy_mini_conversation_app.simulator import ensure_simulator_running, configured_remote_daemon_host
+from reachy_mini_conversation_app.wake_trace import WakeTrace
+from reachy_mini_conversation_app.face_tracking import Stage1Instrumentation
 
 
 if TYPE_CHECKING:
     from reachy_mini_conversation_app.console import LocalStream
+
+
+def _probe_daemon_http(base_url: str) -> dict[str, object]:
+    """Probe daemon HTTP independently from the SDK WebSocket."""
+    started = time.perf_counter()
+    try:
+        response = httpx.get(f"{base_url}/api/state/full", timeout=1.2)
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        return {
+            "state": "OFFLINE",
+            "latency_ms": round((time.perf_counter() - started) * 1000, 1),
+            "last_failure_type": type(exc).__name__,
+        }
+    return {
+        "state": "HEALTHY",
+        "latency_ms": round((time.perf_counter() - started) * 1000, 1),
+    }
 
 
 def _start_inactivity_timeout_thread(
@@ -160,13 +181,56 @@ def run(
             sys.exit(1)
 
     no_motion = bool(getattr(args, "no_motion", False))
+    dashboard_shutdown_event = threading.Event() if bool(getattr(args, "ui", False)) else None
+    startup_hold_stop_event = app_stop_event if app_stop_event is not None else dashboard_shutdown_event
+    try:
+        app_lifecycle.ensure_daemon_head_tracking_disabled(
+            robot,
+            logger,
+            reason="startup_pre_movement_owner",
+        )
+    except app_lifecycle.DaemonTrackingRecoveryError as exc:
+        logger.error("Conversation startup blocked by tracking fail-safe: %s", exc)
+        app_lifecycle.hold_post_wake_convergence_failure(logger, startup_hold_stop_event)
+        return
+
+    wake_trace = WakeTrace(robot, logger)
+    stage1_instrumentation = Stage1Instrumentation(robot)
+    startup_freshness_recorder = app_lifecycle.StartupFreshnessRecorder()
+    authorized_startup_snapshot = None
     if no_motion:
         logger.info("No-motion mode: leaving motors disabled and skipping startup wake movement.")
     else:
-        app_lifecycle.prepare_robot_for_conversation(robot, logger)
+        try:
+            startup_result = app_lifecycle.prepare_robot_for_conversation(
+                robot,
+                logger,
+                wake_trace=wake_trace,
+                stage1_instrumentation=stage1_instrumentation,
+                freshness_recorder=startup_freshness_recorder,
+            )
+            if isinstance(startup_result, app_lifecycle.AuthorizedStartupSnapshot):
+                authorized_startup_snapshot = startup_result
+                app_lifecycle.require_fresh_authorized_startup_snapshot(authorized_startup_snapshot)
+        except (app_lifecycle.PostWakeConvergenceError, app_lifecycle.NonSleepStartupValidationError) as exc:
+            logger.error("Conversation startup blocked: %s", exc)
+            startup_freshness_recorder.log_summary(logger)
+            app_lifecycle.hold_post_wake_convergence_failure(logger, startup_hold_stop_event)
+            stage1_instrumentation.close()
+            wake_trace.close()
+            return
 
-    movement_manager = MovementManager(current_robot=robot)
+    movement_manager = MovementManager(
+        current_robot=robot,
+        stage1_instrumentation=None if args.no_camera else stage1_instrumentation,
+        wake_trace=wake_trace,
+        sdk_connection_probe=robot.client.is_connected,
+        authorized_startup_snapshot=authorized_startup_snapshot,
+        startup_freshness_recorder=startup_freshness_recorder,
+    )
+    daemon_http_base_url = f"http://{robot.client.host}:{robot.client.port}"
 
+    from reachy_mini_conversation_app.head_tracking_admin import HeadTrackingAdmin
     from reachy_mini_conversation_app.face_identity.service import FaceMemoryService
     from reachy_mini_conversation_app.face_identity.settings import (
         face_memory_enabled,
@@ -176,6 +240,11 @@ def run(
     )
 
     face_memory_service = FaceMemoryService(instance_path=instance_path) if face_memory_enabled() else None
+    head_tracking_admin = HeadTrackingAdmin(
+        movement_manager,
+        lambda: robot.get_tracked_face(wait=False),
+        daemon_tracking_status=lambda: robot.client.get_status(wait=False).model_dump().get("head_tracking_enabled"),
+    )
     logger.info(
         "Face memory enabled=%s photo_enrolment=%s live_recognition=%s on_demand=%s",
         face_memory_service is not None,
@@ -232,6 +301,17 @@ def run(
         instance_path=instance_path,
         handler_factory=build_handler,
         startup_voice=startup_settings.voice,
+        stage1_prepare=lambda raw_delta: movement_manager.prepare_stage1_horizontal_calibration(raw_delta).to_dict(),
+        stage1_execute=lambda session_id: movement_manager.execute_stage1_horizontal_calibration(session_id).to_dict(),
+        stage1_cancel=movement_manager.cancel_stage1_horizontal_calibration,
+        stage1_preview_start=movement_manager.start_stage1_preview_diagnostic,
+        stage1_preview_status=movement_manager.get_stage1_preview_diagnostic_status,
+        stage1_preview_release=movement_manager.release_stage1_preview_diagnostic,
+        daemon_http_status=lambda: _probe_daemon_http(daemon_http_base_url),
+        sdk_control_status=movement_manager.get_sdk_control_status,
+        movement_status=movement_manager.get_status,
+        head_tracking_admin=head_tracking_admin,
+        dashboard_shutdown_requested=dashboard_shutdown_event.set if dashboard_shutdown_event is not None else None,
     )
 
     # The page is served immediately, so the API must be live before the slow startup work below.
@@ -240,9 +320,24 @@ def run(
 
     go_to_sleep_lock = threading.Lock()
     go_to_sleep_requested = threading.Event()
+    abnormal_shutdown_requested = threading.Event()
+    safe_stop_requested = threading.Event()
+
+    def request_conversation_process_recovery() -> bool:
+        if go_to_sleep_requested.is_set():
+            logger.info("SDK recovery cancelled because an intentional sleep stop is active")
+            return False
+        logger.warning("SDK recovery is stopping the conversation process for dashboard-managed restart")
+        abnormal_shutdown_requested.set()
+        stream_manager.close()
+        return True
+
+    if app_stop_event is None:
+        movement_manager.set_sdk_recovery_callback(request_conversation_process_recovery)
 
     def safe_stop_motors() -> dict[str, Any]:
         """Stop moves and disable motors; does not goto_sleep or shut down the app."""
+        safe_stop_requested.set()
         logger.info("Safe stop: disabling wobble, stopping moves, disabling motors.")
         errors: list[str] = []
         try:
@@ -341,13 +436,39 @@ def run(
 
     # Each async service → its own thread/loop
     if not no_motion:
-        movement_manager.start()
+        try:
+            if authorized_startup_snapshot is not None:
+                confirmed_at = app_lifecycle.confirm_authorized_startup_snapshot(
+                    stage1_instrumentation,
+                    authorized_startup_snapshot,
+                    logger,
+                )
+                app_lifecycle.require_fresh_startup_confirmation(confirmed_at)
+                movement_manager.set_startup_confirmation(confirmed_at)
+            movement_manager.start()
+            if authorized_startup_snapshot is not None and not movement_manager.wait_for_startup_publication(0.25):
+                raise app_lifecycle.NonSleepStartupValidationError(
+                    app_lifecycle.NonSleepStartupValidation(
+                        False,
+                        app_lifecycle.NonSleepStartupFailureReason.AUTHORIZATION_EXPIRED,
+                        0,
+                    )
+                )
+            startup_freshness_recorder.log_summary(logger)
+        except app_lifecycle.NonSleepStartupValidationError as exc:
+            logger.error("Conversation startup blocked before movement worker start: %s", exc)
+            startup_freshness_recorder.log_summary(logger)
+            app_lifecycle.hold_post_wake_convergence_failure(logger, startup_hold_stop_event)
+            stage1_instrumentation.close()
+            wake_trace.close()
+            return
     # Audio-reactive head motion is driven by the daemon's wobbler, which
     # taps the media pipeline at push_audio_sample. The console stream pushes
     # assistant audio through that pipeline directly.
     if not no_motion:
         try:
             robot.enable_wobbling()
+            wake_trace.record_transition("wobble_enabled", active_task=None)
         except Exception as e:
             logger.warning("Could not enable wobbling at startup: %s", e)
 
@@ -385,15 +506,48 @@ def run(
         if own_ui_server is not None:
             own_ui_server.should_exit = True
 
-        # Stop the motion writes without changing the robot's posture. If
-        # the shutdown came from the voice go_to_sleep tool the robot is
-        # already in the sleep pose; on a plain stop it stays awake and
-        # the daemon returns it to neutral once the process exits.
-        movement_manager.stop(reset_to_neutral=False)
         try:
-            robot.disable_wobbling()
+            sdk_control_healthy = movement_manager.get_sdk_control_status().get("state") == "HEALTHY"
         except Exception as e:
-            logger.debug(f"Error disabling wobbling during shutdown: {e}")
+            sdk_control_healthy = False
+            logger.error("Could not verify SDK health for orderly shutdown park: %s", e)
+        try:
+            movement_manager.stop(reset_to_neutral=False)
+        except Exception as e:
+            sdk_control_healthy = False
+            logger.error("Failed to stop movement publications before shutdown park: %s", e)
+        orderly_park_allowed = (
+            not no_motion
+            and not go_to_sleep_requested.is_set()
+            and not abnormal_shutdown_requested.is_set()
+            and not safe_stop_requested.is_set()
+            and sdk_control_healthy
+        )
+        if orderly_park_allowed:
+            try:
+                app_lifecycle.park_robot_for_orderly_shutdown(robot, stage1_instrumentation, logger)
+            except app_lifecycle.OrderlyShutdownParkError as exc:
+                logger.error(
+                    "Orderly shutdown neutral park failed; releasing the app slot for daemon fallback: %s",
+                    exc,
+                )
+        else:
+            logger.info(
+                "Orderly shutdown neutral park skipped no_motion=%s sleep_requested=%s abnormal=%s "
+                "safe_stop=%s sdk_healthy=%s",
+                no_motion,
+                go_to_sleep_requested.is_set(),
+                abnormal_shutdown_requested.is_set(),
+                safe_stop_requested.is_set(),
+                sdk_control_healthy,
+            )
+            try:
+                robot.disable_wobbling()
+            except Exception as e:
+                logger.debug("Error disabling wobbling during shutdown: %s", e)
+
+        stage1_instrumentation.close()
+        wake_trace.close()
 
         # Ensure media is explicitly closed before disconnecting
         try:

@@ -1,0 +1,202 @@
+diff --git a/src/reachy_mini/daemon/backend/abstract.py b/src/reachy_mini/daemon/backend/abstract.py
+index 54bd1acec74ac2d6770418114a84fe5dea5769e8..93e0cfbe3d4d9c52f3351e54b37c01c913a82574 100644
+--- a/src/reachy_mini/daemon/backend/abstract.py
++++ b/src/reachy_mini/daemon/backend/abstract.py
+@@ -704,6 +704,11 @@ class Backend:
+         if tracker is not None:
+             tracker.stop()
+ 
++    def is_head_tracking_enabled(self) -> bool:
++        """Return whether daemon-side visual head tracking is enabled."""
++        with self._tracking_lock:
++            return self._tracking_enabled
++
+     def clear_tracking_aim(self) -> None:
+         """Clear the tracking aim, latched target, and latest detected face."""
+         self._tracking_aim = None
+diff --git a/src/reachy_mini/daemon/daemon.py b/src/reachy_mini/daemon/daemon.py
+index e4a31044ee191090833083269545f0e3327205f4..ce5ec205db432dc52e7e6fe911431069d5a38eea 100644
+--- a/src/reachy_mini/daemon/daemon.py
++++ b/src/reachy_mini/daemon/daemon.py
+@@ -813,6 +813,7 @@ class Daemon:
+         if self.backend is not None:
+             self._status.backend_status = self.backend.get_status()
+             self._status.face_target = self.backend.get_tracked_face()
++            self._status.head_tracking_enabled = self.backend.is_head_tracking_enabled()
+ 
+             assert self._status.backend_status is not None, (
+                 "Backend status should not be None after backend initialization."
+@@ -823,6 +824,7 @@ class Daemon:
+             self._status.error = self._status.backend_status.error
+         else:
+             self._status.backend_status = None
++            self._status.head_tracking_enabled = None
+ 
+         return self._status
+ 
+diff --git a/src/reachy_mini/io/protocol.py b/src/reachy_mini/io/protocol.py
+index 2e265188b9949e2fdab626b2f06faae3c957ab7c..043b9f0023436614b7f3105f6339f126a719b4fa 100644
+--- a/src/reachy_mini/io/protocol.py
++++ b/src/reachy_mini/io/protocol.py
+@@ -165,6 +165,7 @@ class DaemonStatus(BaseModel):
+     version: Optional[str] = None
+     hardware_id: Optional[str] = None
+     face_target: FaceTarget = Field(default_factory=FaceTarget)
++    head_tracking_enabled: Optional[bool] = None
+ 
+ 
+ # ------------------------------------------------------------------
+diff --git a/tests/unit_tests/test_head_tracking_backend.py b/tests/unit_tests/test_head_tracking_backend.py
+index 6624e5951c7c8d87eef4f6b2e1c8b655887a470a..45ba132a7048c5e276b7ec31ffd85ae1f95cc2a4 100644
+--- a/tests/unit_tests/test_head_tracking_backend.py
++++ b/tests/unit_tests/test_head_tracking_backend.py
+@@ -7,7 +7,10 @@ import numpy as np
+ from scipy.spatial.transform import Rotation as R
+ 
+ from reachy_mini.daemon.backend.mockup_sim.backend import MockupSimBackend
++from reachy_mini.daemon.daemon import Daemon
+ from reachy_mini.io.protocol import (
++    DaemonState,
++    DaemonStatus,
+     GetTrackedFaceCmd,
+     SetHeadTrackingCmd,
+     command_adapter,
+@@ -96,6 +99,91 @@ def test_set_head_tracking_command_toggles_tracking() -> None:
+     }
+ 
+ 
++def test_daemon_status_reports_authoritative_head_tracking_state() -> None:
++    """Daemon status should report tracking state independently of face detection."""
++    backend = _make_backend()
++    daemon = Daemon(no_media=True)
++    daemon.backend = backend
++    daemon._status = DaemonStatus(
++        robot_name="reachy_mini",
++        state=DaemonState.RUNNING,
++        wireless_version=False,
++        desktop_app_daemon=False,
++        simulation_enabled=True,
++        mockup_sim_enabled=True,
++        backend_status=None,
++    )
++
++    status = daemon.status()
++    assert status.head_tracking_enabled is False
++    assert status.face_target.detected is False
++    assert status.face_target.ts is None
++
++    backend._media_server = SimpleNamespace(camera_specs=object())
++    backend._tracker = DummyTracker()
++    assert backend.enable_head_tracking() is True
++
++    status = daemon.status()
++    assert status.head_tracking_enabled is True
++    assert status.face_target.detected is False
++    assert status.face_target.ts is None
++
++    backend.set_tracking_face(
++        center=None,
++        roll=None,
++        width=640,
++        height=480,
++        camera_matrix=np.eye(3, dtype=np.float64),
++        distortion=np.zeros(5, dtype=np.float64),
++        timestamp=10.0,
++    )
++    status = daemon.status()
++    assert status.head_tracking_enabled is True
++    assert status.face_target.detected is False
++    assert status.face_target.ts == 10.0
++
++    backend.set_tracking_face(
++        center=(0.0, 0.0),
++        roll=0.0,
++        width=640,
++        height=480,
++        camera_matrix=np.array(
++            [[640.0, 0.0, 320.0], [0.0, 640.0, 240.0], [0.0, 0.0, 1.0]],
++            dtype=np.float64,
++        ),
++        distortion=np.zeros(5, dtype=np.float64),
++        timestamp=11.0,
++    )
++    status = daemon.status()
++    assert status.head_tracking_enabled is True
++    assert status.face_target.detected is True
++    assert status.face_target.ts == 11.0
++
++    backend.disable_head_tracking()
++    status = daemon.status()
++    assert status.head_tracking_enabled is False
++    assert status.face_target.detected is False
++    assert status.face_target.ts is None
++
++
++def test_daemon_status_defaults_tracking_state_for_older_daemon_payload() -> None:
++    """A status payload from an older daemon should report unknown tracking state."""
++    status = DaemonStatus.model_validate(
++        {
++            "type": "daemon_status",
++            "robot_name": "reachy_mini",
++            "state": "running",
++            "wireless_version": False,
++            "desktop_app_daemon": False,
++            "simulation_enabled": False,
++            "mockup_sim_enabled": False,
++            "backend_status": None,
++        }
++    )
++
++    assert status.head_tracking_enabled is None
++
++
+ def test_get_tracked_face_command_returns_latest_face() -> None:
+     """The query command returns the latest normalized face target."""
+     backend = _make_backend()
+diff --git a/tests/unit_tests/test_ws_client.py b/tests/unit_tests/test_ws_client.py
+index 8dee6b0bb81d170d92e952e85476ea120cef01c1..f79fb57a481c183c7a790040ca62af4cb3be2f82 100644
+--- a/tests/unit_tests/test_ws_client.py
++++ b/tests/unit_tests/test_ws_client.py
+@@ -7,10 +7,12 @@ connecting to a loopback host and leaves the library default (deflate)
+ untouched for any other host.
+ """
+ 
++import threading
+ from unittest.mock import MagicMock, patch
+ 
+ import pytest
+ 
++from reachy_mini.io.protocol import DaemonStatus, server_msg_adapter
+ from reachy_mini.io.ws_client import WSClient, _is_loopback_host
+ 
+ 
+@@ -48,6 +50,29 @@ def _make_fake_ws() -> MagicMock:
+     return fake_ws
+ 
+ 
++def test_daemon_status_caches_authoritative_tracking_state() -> None:
++    """A published tracking-state field should survive parsing and SDK caching."""
++    status = DaemonStatus(
++        robot_name="reachy_mini",
++        state="running",
++        wireless_version=False,
++        desktop_app_daemon=False,
++        simulation_enabled=False,
++        mockup_sim_enabled=False,
++        backend_status=None,
++        head_tracking_enabled=True,
++    )
++    message = server_msg_adapter.validate_json(status.model_dump_json())
++    assert isinstance(message, DaemonStatus)
++
++    client = object.__new__(WSClient)
++    client._last_status = None
++    client.status_received = threading.Event()
++    client._dispatch(message)
++
++    assert client.get_status(wait=False).head_tracking_enabled is True
++
++
+ @patch("reachy_mini.io.ws_client.ws_sync.connect")
+ def test_connect_disables_compression_for_localhost(mock_connect: MagicMock) -> None:
+     """Connecting to localhost passes compression=None to the sync client."""

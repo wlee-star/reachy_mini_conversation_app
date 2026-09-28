@@ -680,6 +680,25 @@ async def test_reachy_transcript_starts_fast_paths(monkeypatch: Any) -> None:
 
 
 @pytest.mark.asyncio
+async def test_rachie_transcript_routes_as_addressed_speech(monkeypatch: Any) -> None:
+    """The observed Rachie STT spelling must reach deterministic routing."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    time_cmd = MagicMock()
+    monkeypatch.setattr(handler, "_start_fast_ha_command", MagicMock())
+    monkeypatch.setattr(handler, "_start_fast_bus_command", MagicMock())
+    monkeypatch.setattr(handler, "_start_fast_apex_command", MagicMock())
+    monkeypatch.setattr(handler, "_start_fast_time_command", time_cmd)
+    monkeypatch.setattr(handler, "_start_fast_dance_emotion", MagicMock())
+    monkeypatch.setattr(handler, "_start_fast_sleep_command", MagicMock())
+    monkeypatch.setattr(handler, "_start_fast_face_identity", MagicMock())
+
+    handler._handle_completed_user_transcript("Rachie, what time is it?")
+
+    time_cmd.assert_called_once_with("what time is it?")
+    assert handler._user_turn_authorized is True
+
+
+@pytest.mark.asyncio
 async def test_follow_up_transcript_stays_authorized_until_timeout(monkeypatch: Any) -> None:
     """Follow-ups after Reachy stay authorized until the session timeout."""
     now = {"t": 0.0}
@@ -2911,8 +2930,26 @@ async def test_face_id_disabled_speaks_exact_without_camera(monkeypatch: Any) ->
 
 
 @pytest.mark.asyncio
-async def test_wake_reminder_skips_chat_history(monkeypatch: Any) -> None:
-    """Wake reminders must not be written into LLM chat history."""
+async def test_unactivated_speech_is_silent_and_skips_tts(monkeypatch: Any) -> None:
+    """Ordinary rejection must suppress the model without speaking a wake reminder."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    handler._turn_generation = 4
+    handler._direct_speech_supported = True
+    handler._user_turn_authorized = False
+    create = AsyncMock()
+    suppress = AsyncMock()
+    monkeypatch.setattr(handler, "_suppress_unsolicited_realtime", suppress)
+    monkeypatch.setattr(handler, "_safe_response_create", create)
+
+    await handler._reject_unactivated_speech(4)
+
+    suppress.assert_awaited_once()
+    create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mention_prompt_skips_chat_history(monkeypatch: Any) -> None:
+    """Mention prompts must not be written into LLM chat history."""
     handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
     handler._turn_generation = 4
     handler._direct_speech_supported = True
@@ -2921,14 +2958,95 @@ async def test_wake_reminder_skips_chat_history(monkeypatch: Any) -> None:
     monkeypatch.setattr(handler, "_suppress_unsolicited_realtime", AsyncMock())
     monkeypatch.setattr(handler, "_safe_response_create", create)
 
-    await handler._reject_unactivated_speech(4)
+    await handler._speak_mention_prompt(4, "Did you ask for me?")
 
     create.assert_awaited_once()
     kwargs = create.await_args.kwargs
-    assert kwargs["reason"] == "wake_reminder"
+    assert kwargs["reason"] == "mention_prompt"
     metadata = kwargs["response"]["metadata"]
-    assert metadata["reachy_direct_text"] == "Please say Reachy first."
+    assert metadata["reachy_direct_text"] == "Did you ask for me?"
     assert metadata["reachy_direct_skip_history"] == "true"
+
+
+@pytest.mark.asyncio
+async def test_background_transcript_does_not_speak_please_say_reachy(monkeypatch: Any) -> None:
+    """Background speech must not TTS 'Please say Reachy first' or call tools/LLM."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    ha = MagicMock()
+    bus = MagicMock()
+    apex = MagicMock()
+    speak = AsyncMock()
+    general = AsyncMock()
+    monkeypatch.setattr(handler, "_start_fast_ha_command", ha)
+    monkeypatch.setattr(handler, "_start_fast_bus_command", bus)
+    monkeypatch.setattr(handler, "_start_fast_apex_command", apex)
+    monkeypatch.setattr(handler, "_start_fast_time_command", MagicMock())
+    monkeypatch.setattr(handler, "_start_fast_dance_emotion", MagicMock())
+    monkeypatch.setattr(handler, "_start_fast_sleep_command", MagicMock())
+    monkeypatch.setattr(handler, "_start_fast_face_identity", MagicMock())
+    monkeypatch.setattr(handler, "_speak_deterministic", speak)
+    monkeypatch.setattr(handler, "_safe_response_create", general)
+    monkeypatch.setattr(handler, "_suppress_unsolicited_realtime", AsyncMock())
+
+    handler._handle_completed_user_transcript("Welcome back to my YouTube channel.")
+    if handler._wake_reminder_task is not None:
+        await handler._wake_reminder_task
+
+    ha.assert_not_called()
+    bus.assert_not_called()
+    apex.assert_not_called()
+    speak.assert_not_awaited()
+    general.assert_not_awaited()
+    assert handler._user_turn_authorized is False
+
+
+@pytest.mark.asyncio
+async def test_third_person_mention_does_not_start_tools(monkeypatch: Any) -> None:
+    """Third-person Reachy mentions must not execute deterministic tools."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    ha = MagicMock()
+    speak = AsyncMock()
+    monkeypatch.setattr(handler, "_start_fast_ha_command", ha)
+    monkeypatch.setattr(handler, "_start_fast_bus_command", MagicMock())
+    monkeypatch.setattr(handler, "_start_fast_apex_command", MagicMock())
+    monkeypatch.setattr(handler, "_start_fast_time_command", MagicMock())
+    monkeypatch.setattr(handler, "_start_fast_dance_emotion", MagicMock())
+    monkeypatch.setattr(handler, "_start_fast_sleep_command", MagicMock())
+    monkeypatch.setattr(handler, "_start_fast_face_identity", MagicMock())
+    monkeypatch.setattr(handler, "_speak_deterministic", speak)
+    monkeypatch.setattr(handler, "_suppress_unsolicited_realtime", AsyncMock())
+    monkeypatch.setattr(handler, "_safe_response_create", AsyncMock())
+
+    handler._handle_completed_user_transcript("I was showing Mum what Reachy can do.")
+    if handler._wake_reminder_task is not None:
+        await handler._wake_reminder_task
+
+    ha.assert_not_called()
+    speak.assert_awaited_once()
+    assert speak.await_args.args[0] == "Did you ask for me?"
+    assert handler._user_turn_authorized is False
+
+
+@pytest.mark.asyncio
+async def test_sleep_outside_followup_is_silently_ignored(monkeypatch: Any) -> None:
+    """Background 'go to sleep' without Reachy must not start the sleep fast path."""
+    handler = HuggingFaceRealtimeHandler(ToolDependencies(reachy_mini=MagicMock(), movement_manager=MagicMock()))
+    sleep = MagicMock()
+    monkeypatch.setattr(handler, "_start_fast_ha_command", MagicMock())
+    monkeypatch.setattr(handler, "_start_fast_bus_command", MagicMock())
+    monkeypatch.setattr(handler, "_start_fast_apex_command", MagicMock())
+    monkeypatch.setattr(handler, "_start_fast_time_command", MagicMock())
+    monkeypatch.setattr(handler, "_start_fast_dance_emotion", MagicMock())
+    monkeypatch.setattr(handler, "_start_fast_sleep_command", sleep)
+    monkeypatch.setattr(handler, "_start_fast_face_identity", MagicMock())
+    monkeypatch.setattr(handler, "_reject_unactivated_speech", AsyncMock())
+
+    handler._handle_completed_user_transcript("go to sleep")
+    if handler._wake_reminder_task is not None:
+        await handler._wake_reminder_task
+
+    sleep.assert_not_called()
+    assert handler._user_turn_authorized is False
 
 
 @pytest.mark.asyncio

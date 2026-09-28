@@ -336,12 +336,12 @@ class FaceMemoryService:
                 "spoken": ON_DEMAND_DISABLED_SPOKEN,
             }
         if not getattr(deps, "camera_enabled", False):
-            camera_off: dict[str, Any] = {"error": "camera_disabled", "status": "error"}
+            camera_off: dict[str, Any] = {"error": "camera_disabled", "status": "camera_unavailable"}
             camera_off["spoken"] = spoken_for_recognition_result(camera_off)
             return camera_off
         media = getattr(deps.reachy_mini, "media", None)
         if media is None or getattr(media, "get_frame", None) is None:
-            unavailable: dict[str, Any] = {"error": "camera_unavailable", "status": "error"}
+            unavailable: dict[str, Any] = {"error": "camera_unavailable", "status": "camera_unavailable"}
             unavailable["spoken"] = spoken_for_recognition_result(unavailable)
             return unavailable
 
@@ -354,7 +354,11 @@ class FaceMemoryService:
             )
         except Exception as exc:
             logger.warning("[FACE-ID] frame capture failed: %s", exc)
-            failed: dict[str, Any] = {"error": f"capture_failed: {type(exc).__name__}", "status": "error"}
+            failed: dict[str, Any] = {
+                "error": "camera_unavailable",
+                "status": "camera_unavailable",
+                "reason": type(exc).__name__,
+            }
             failed["spoken"] = spoken_for_recognition_result(failed)
             return failed
         capture_ms = (time.perf_counter() - capture_started) * 1000
@@ -367,7 +371,15 @@ class FaceMemoryService:
             return empty
 
         recognize_started = time.perf_counter()
-        result = self.recognize_frame_window(frames)
+        try:
+            result = self.recognize_frame_window(frames)
+        except Exception as exc:
+            logger.warning("[FACE-ID] recognition unavailable: %s", exc)
+            result = {
+                "status": "recognition_unavailable",
+                "error": "recognition_unavailable",
+                "reason": type(exc).__name__,
+            }
         recognize_ms = (time.perf_counter() - recognize_started) * 1000
         result["spoken"] = spoken_for_recognition_result(result)
         result["latency_ms"] = {

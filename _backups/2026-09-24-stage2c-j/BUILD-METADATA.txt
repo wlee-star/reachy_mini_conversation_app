@@ -1,0 +1,66 @@
+PHASE 2C-J OFFLINE BUILD METADATA
+
+Upstream source revision:
+7f54717586369155900eeeb43fd4bbbb62064f22 (v1.10.0)
+
+Tracking patch:
+patches/reachy-mini-v1.10.0-head-tracking-status.patch
+SHA-256 F0563D3D3D06AC17A2E7CBD4AE76A6F5C1FE505EE356B8C336F0D14BEE3F8CFE
+
+Build host tools:
+Python 3.12.13
+stdlib zipfile 3.12.13
+pip 26.1.2
+setuptools 82.0.1
+
+Previous failed repack tool:
+wheel 0.48.0 (`wheel unpack` followed by `wheel pack` on Windows/NTFS)
+
+Upstream packaging backend:
+setuptools.build_meta
+
+Corrected artifact method:
+Start from the official version-matched wheel, replace only the three validated
+Python modules, regenerate RECORD, and copy every ZipInfo metadata field from the
+official wheel. This retains executable modes and all other archive metadata.
+
+Builder:
+build_preserving_wheel.py
+SHA-256 095E0A3DD155D21729E86551377C5F3686A7596D9C690A05FD64E10CA2C5B1CB
+
+Validator:
+validate_wheel.py
+SHA-256 A4FA545600F63AEBC9FBB95BD15A0CAD2469C63DEEAB653F026E0A2076C8F1BC
+
+Official daemon base wheel:
+reachy_mini-1.10.0-py3-none-any.whl
+SHA-256 82384A6310B89872839AD3544357451D43F81C52A65D7C8D24E439BACAD502C3
+
+Official Windows base wheel:
+reachy_mini-1.10.0rc5-py3-none-any.whl
+SHA-256 9769CA13B6A0FC151729097B75EDC4DD66B95435078416824CF7FEC60DF27B6A
+
+Daemon candidate:
+builds/daemon/reachy_mini-1.10.0-py3-none-any.whl
+SHA-256 E7DF08785D9EB89B908F3D55DE42C2DB17AC7FA69F1E5B8100D27FD34FA04C34
+
+Windows candidate:
+builds/windows/reachy_mini-1.10.0rc5-py3-none-any.whl
+SHA-256 D0543BACD86CE1AFB701418D262E48D2635711237CEA58147179AC601A37B9CE
+
+Build command shape:
+python build_preserving_wheel.py --base-wheel <official-wheel> \
+  --source-root <patched-v1.10.0-source> --output <candidate-wheel>
+
+Validation command shape:
+python validate_wheel.py --base-wheel <official-wheel> \
+  --candidate-wheel <candidate-wheel> --source-root <patched-v1.10.0-source> \
+  --manifest <manifest.json>
+
+Reproducibility result:
+Two independent invocations on this host produced byte-identical daemon and
+Windows candidates with the hashes recorded above.
+
+Known validation limitation:
+No Linux, WSL, Docker, or Podman environment is available on this host. The daemon
+candidate has not passed the mandatory isolated POSIX pip-install and execution test.

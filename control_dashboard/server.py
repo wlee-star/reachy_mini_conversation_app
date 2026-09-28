@@ -1,6 +1,7 @@
 """Local HTTP API and static UI for the control dashboard."""
 
 from __future__ import annotations
+import re
 import json
 import socket
 import logging
@@ -161,6 +162,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if not self._people_same_origin():
                 return _json(self, {"error": "Use the local dashboard address."}, 403)
             return _json(self, _people.execute("list", {}))
+        people_thumbnail = re.fullmatch(r"/api/people/(person_[a-zA-Z0-9_-]+)/thumbnail", path)
+        if people_thumbnail:
+            if not self._people_same_origin():
+                return _json(self, {"error": "Use the local dashboard address."}, 403)
+            return self._send_file(_people.thumbnail_path(people_thumbnail.group(1)), "image/jpeg")
         if path == "/api/physical/audio":
             config, _controller = _require()
             response = physical.net.http_request(

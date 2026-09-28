@@ -45,7 +45,13 @@ from reachy_mini_conversation_app.prompts import (
     get_session_greeting_prompt,
 )
 from reachy_mini_conversation_app.streaming import AdditionalOutputs, audio_to_int16
-from reachy_mini_conversation_app.activation import ActivationSession, wake_reminder_text
+from reachy_mini_conversation_app.activation import (
+    WAKE_GATE_MENTION,
+    WAKE_GATE_DUPLICATE,
+    WAKE_GATE_MENTION_DECLINED,
+    WAKE_GATE_MENTION_CONFIRMATION,
+    ActivationSession,
+)
 from reachy_mini_conversation_app.local_time import match_time_intent, current_local_time
 from reachy_mini_conversation_app.tools.apex import (
     Apex,
@@ -676,6 +682,8 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
                 return
             await self._speak_sleep_update("I couldn't go to sleep.")
             return
+        self._activation.clear(reason="sleep")
+        self._user_turn_authorized = False
         await self._speak_sleep_update("Goodnight.")
 
     def _start_fast_face_memory_guard(self, transcript: str) -> None:
@@ -1065,11 +1073,34 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         self._face_id_owns_turn = None
         decision = self._activation.evaluate(transcript)
         self._user_turn_authorized = decision.authorized
+        if decision.kind == WAKE_GATE_DUPLICATE:
+            self._claim_deterministic_route()
+            self._cancel_wake_reminder(start_new=False)
+            return
+        if decision.kind == WAKE_GATE_MENTION:
+            self._claim_deterministic_route()
+            self._cancel_wake_reminder(start_new=False)
+            prompt = decision.speak_text or "Did you ask for me?"
+            turn = self._turn_generation
+            self._wake_reminder_task = asyncio.create_task(
+                self._speak_mention_prompt(turn, prompt),
+                name="reachy-mention-prompt",
+            )
+            return
+        if decision.kind == WAKE_GATE_MENTION_DECLINED:
+            self._claim_deterministic_route()
+            self._cancel_wake_reminder(start_new=True)
+            return
+        if decision.kind == WAKE_GATE_MENTION_CONFIRMATION and not (decision.command_text or "").strip():
+            # Affirmation alone opens listening context; wait for the next request.
+            self._claim_deterministic_route()
+            self._cancel_wake_reminder(start_new=False)
+            return
         if not decision.authorized:
             self._claim_deterministic_route()
             self._cancel_wake_reminder(start_new=True)
             return
-        # A successful wake must kill any in-flight "Please say Reachy first" speech.
+        # A successful wake must kill any in-flight wake/mention speech.
         self._cancel_wake_reminder(start_new=False)
         logger.info("Reachy processing request")
         command = decision.command_text or transcript
@@ -1090,12 +1121,16 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         asyncio.create_task(self._safe_response_create(reason="general_chat"), name="general-chat-response")
 
     def _cancel_wake_reminder(self, *, start_new: bool) -> None:
-        """Cancel a pending wake reminder; optionally start a fresh one for this turn."""
+        """Cancel a pending wake-gate task; optionally start silent rejection for this turn."""
         if self._wake_reminder_task is not None and not self._wake_reminder_task.done():
             self._wake_reminder_task.cancel()
         self._wake_reminder_task = None
         self._drop_queued_responses(reason="wake_reminder")
-        if self._active_response_reason == "wake_reminder" and not self._response_done_event.is_set():
+        self._drop_queued_responses(reason="mention_prompt")
+        if (
+            self._active_response_reason in {"wake_reminder", "mention_prompt"}
+            and not self._response_done_event.is_set()
+        ):
             self._drop_active_response_output = True
             asyncio.create_task(self._cancel_active_realtime_response(), name="cancel-wake-reminder")
         if start_new:
@@ -1120,17 +1155,24 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
             self._pending_responses.put_nowait(item)
 
     async def _reject_unactivated_speech(self, turn: int) -> None:
-        """Block model/tool side effects and remind the user to say Reachy."""
+        """Block model/tool side effects for unaddressed speech without speaking a rejection."""
         await self._suppress_unsolicited_realtime()
         if turn != self._turn_generation or self._user_turn_authorized:
             return
-        reminder = wake_reminder_text()
+        # Intentionally silent: do not speak wake_reminder_text() for ordinary rejection.
+        logger.info("wake_gate: rejected_unaddressed_speech (silent)")
+
+    async def _speak_mention_prompt(self, turn: int, prompt: str) -> None:
+        """Ask whether a conversational Reachy mention was directed at the robot."""
+        await self._suppress_unsolicited_realtime()
+        if turn != self._turn_generation or self._user_turn_authorized:
+            return
         try:
-            await self._speak_deterministic(reminder, reason="wake_reminder", skip_history=True)
+            await self._speak_deterministic(prompt, reason="mention_prompt", skip_history=True)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.warning("Reachy wake reminder failed: %s", exc)
+            logger.warning("Reachy mention prompt failed: %s", exc)
 
     def _value_from_tool_args(self, args_json: str, key: str) -> object:
         try:
@@ -2798,6 +2840,12 @@ class HuggingFaceRealtimeHandler(ConversationHandler):
         if self._bus_monitor_start_task is not None:
             self._bus_monitor_start_task.cancel()
             self._bus_monitor_start_task = None
+
+        self._activation.clear(reason="app_stop")
+        self._user_turn_authorized = False
+        if self._wake_reminder_task is not None and not self._wake_reminder_task.done():
+            self._wake_reminder_task.cancel()
+        self._wake_reminder_task = None
 
         await self._cancel_partial_transcript_task()
 

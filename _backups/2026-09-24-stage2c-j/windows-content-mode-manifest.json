@@ -1,0 +1,141 @@
+{
+  "base_wheel": "C:\\Users\\Walter Lee\\Workspace\\Reachy mini local\\_backups\\2026-09-24-stage2c-i\\windows_sdk\\official_wheels\\reachy_mini-1.10.0rc5-py3-none-any.whl",
+  "candidate_wheel": "C:\\Users\\Walter Lee\\Workspace\\Reachy mini local\\_backups\\2026-09-24-stage2c-j\\builds\\windows\\reachy_mini-1.10.0rc5-py3-none-any.whl",
+  "candidate_sha256": "d0543bacd86ce1afb701418d262e48d2635711237cea58147179ac601a37b9ce",
+  "content_differences": [
+    "reachy_mini/daemon/daemon.py",
+    "reachy_mini/daemon/backend/abstract.py",
+    "reachy_mini/io/protocol.py",
+    "reachy_mini-1.10.0rc5.dist-info/RECORD"
+  ],
+  "metadata_differences": [],
+  "symlinks": [],
+  "executable_files": [
+    {
+      "file": "reachy_mini/assets/firmware/update.sh",
+      "sha256": "31fba9c292c72fb53207d85db8192c2cf807da00487d1fba20b831cd658be591",
+      "mode": "0755",
+      "shebang": "#!/bin/bash",
+      "lf_only": true
+    },
+    {
+      "file": "reachy_mini/daemon/app/services/bluetooth/install_service_bluetooth.sh",
+      "sha256": "d0f35eabc0ddfe1cbd46399379c855cdb2683c8c58ff03f908dd85f4706e11d3",
+      "mode": "0755",
+      "shebang": "#!/bin/bash",
+      "lf_only": true
+    },
+    {
+      "file": "reachy_mini/daemon/app/services/bluetooth/commands/HOTSPOT.sh",
+      "sha256": "04f45af84b57fa380e12ff309ae654dabd1b7b79e4382674115e0f7b99994814",
+      "mode": "0755",
+      "shebang": "#!/usr/bin/env bash",
+      "lf_only": true
+    },
+    {
+      "file": "reachy_mini/daemon/app/services/bluetooth/commands/RESTART_DAEMON.sh",
+      "sha256": "8826c7146b094bff10493a5857ef6186523b39b357a6f36262d2558342fa3046",
+      "mode": "0755",
+      "shebang": "#!/usr/bin/env bash",
+      "lf_only": true
+    },
+    {
+      "file": "reachy_mini/daemon/app/services/bluetooth/commands/SOFTWARE_RESET.sh",
+      "sha256": "a5ab3f15bb92320fccdb8349f293a8295caf280ef9f23793c51b3c20b1b02d4c",
+      "mode": "0755",
+      "shebang": "#!/usr/bin/env bash",
+      "lf_only": true
+    },
+    {
+      "file": "reachy_mini/daemon/app/services/bluetooth/commands/WIFI_RESET.sh",
+      "sha256": "a22343a4698fd219570774ed8fbcf53d33f4b37539f6be5aa97b7bccb705e94a",
+      "mode": "0755",
+      "shebang": "#!/usr/bin/env bash",
+      "lf_only": true
+    },
+    {
+      "file": "reachy_mini/daemon/app/services/gpio_shutdown/launcher.sh",
+      "sha256": "7980db39717313df04d3d24c7dfc8d28ebc5541994e2eef31d74cb6f1351616a",
+      "mode": "0755",
+      "shebang": "#!/bin/bash",
+      "lf_only": true
+    },
+    {
+      "file": "reachy_mini/daemon/app/services/wireless/install_service.sh",
+      "sha256": "ae56c52bb173cfe736e1c917937096640e1efef71082202311f9eefd53f76d16",
+      "mode": "0755",
+      "shebang": "#!/bin/bash",
+      "lf_only": true
+    },
+    {
+      "file": "reachy_mini/daemon/app/services/wireless/launcher.sh",
+      "sha256": "1d1030da18a9a3aa66ed891a6903f7611b142696256dc457a5a9adbf6a5317ea",
+      "mode": "0755",
+      "shebang": "#!/bin/bash",
+      "lf_only": true
+    }
+  ],
+  "production_files": [
+    {
+      "file": "reachy_mini/assets/firmware/update.sh",
+      "sha256": "31fba9c292c72fb53207d85db8192c2cf807da00487d1fba20b831cd658be591",
+      "expected_mode": "0755"
+    },
+    {
+      "file": "reachy_mini/daemon/app/services/bluetooth/commands/HOTSPOT.sh",
+      "sha256": "04f45af84b57fa380e12ff309ae654dabd1b7b79e4382674115e0f7b99994814",
+      "expected_mode": "0755"
+    },
+    {
+      "file": "reachy_mini/daemon/app/services/bluetooth/commands/RESTART_DAEMON.sh",
+      "sha256": "8826c7146b094bff10493a5857ef6186523b39b357a6f36262d2558342fa3046",
+      "expected_mode": "0755"
+    },
+    {
+      "file": "reachy_mini/daemon/app/services/bluetooth/commands/SOFTWARE_RESET.sh",
+      "sha256": "a5ab3f15bb92320fccdb8349f293a8295caf280ef9f23793c51b3c20b1b02d4c",
+      "expected_mode": "0755"
+    },
+    {
+      "file": "reachy_mini/daemon/app/services/bluetooth/commands/WIFI_RESET.sh",
+      "sha256": "a22343a4698fd219570774ed8fbcf53d33f4b37539f6be5aa97b7bccb705e94a",
+      "expected_mode": "0755"
+    },
+    {
+      "file": "reachy_mini/daemon/app/services/bluetooth/install_service_bluetooth.sh",
+      "sha256": "d0f35eabc0ddfe1cbd46399379c855cdb2683c8c58ff03f908dd85f4706e11d3",
+      "expected_mode": "0755"
+    },
+    {
+      "file": "reachy_mini/daemon/app/services/gpio_shutdown/launcher.sh",
+      "sha256": "7980db39717313df04d3d24c7dfc8d28ebc5541994e2eef31d74cb6f1351616a",
+      "expected_mode": "0755"
+    },
+    {
+      "file": "reachy_mini/daemon/app/services/wireless/install_service.sh",
+      "sha256": "ae56c52bb173cfe736e1c917937096640e1efef71082202311f9eefd53f76d16",
+      "expected_mode": "0755"
+    },
+    {
+      "file": "reachy_mini/daemon/app/services/wireless/launcher.sh",
+      "sha256": "1d1030da18a9a3aa66ed891a6903f7611b142696256dc457a5a9adbf6a5317ea",
+      "expected_mode": "0755"
+    },
+    {
+      "file": "reachy_mini/daemon/backend/abstract.py",
+      "sha256": "9a2df9a5e9d1aef695455f966cdfbbc68e77f3d87fa97c2f5533b843be11c731",
+      "expected_mode": "0644"
+    },
+    {
+      "file": "reachy_mini/daemon/daemon.py",
+      "sha256": "47c39e840ee932224830b3177c1701b83896c3743d3611147dddb50373e69aa4",
+      "expected_mode": "0644"
+    },
+    {
+      "file": "reachy_mini/io/protocol.py",
+      "sha256": "87757a9a55810f060c4f00551c4c587c730415c71015aa0d07ef5dbb5b9ec164",
+      "expected_mode": "0644"
+    }
+  ],
+  "record_valid": true
+}

@@ -29,6 +29,9 @@ logger = logging.getLogger(__name__)
 ProgressFn = Callable[[str], None]
 _SPEECH_SLOT_WAIT_S = 20.0
 _SPEECH_SLOT_POLL_S = 0.5
+_CONVERSATION_GRACEFUL_SHUTDOWN_TIMEOUT_S = 20.0
+_CONVERSATION_SHUTDOWN_REQUEST_TIMEOUT_S = 2.0
+_CONVERSATION_SHUTDOWN_POLL_S = 0.2
 
 
 class StackController:
@@ -223,9 +226,21 @@ class StackController:
         owned = self._owned.get(spec.id) or {}
         for key in ("pid", "wrapper_pid"):
             candidate = owned.get(key)
-            if isinstance(candidate, int) and self._pid_belongs_to_service(spec, candidate):
+            if (
+                isinstance(candidate, int)
+                and self._pid_belongs_to_service(spec, candidate)
+                and self._pid_has_live_port_backing(spec, candidate)
+            ):
                 protected.add(candidate)
         return protected
+
+    def _pid_has_live_port_backing(self, spec: ServiceSpec, pid: int) -> bool:
+        if spec.port is None:
+            return True
+        return any(
+            self._pid_belongs_to_service(spec, listener) and proc.pid_in_same_tree(pid, listener)
+            for listener in proc.listening_pids(spec.port)
+        )
 
     def _is_protected_pid(self, spec: ServiceSpec, pid: int, protected: set[int]) -> bool:
         if pid in protected:
@@ -501,6 +516,28 @@ class StackController:
             if pid not in unique:
                 unique.append(pid)
 
+        graceful_failure: str | None = None
+        if spec.id == "conversation" and dashboard_owned and unique:
+            self._mark_user_stopped(spec)
+            graceful_pids = [pid for pid in unique if self._pid_belongs_to_service(spec, pid)]
+            if graceful_pids:
+                graceful, graceful_failure = self._request_graceful_conversation_stop(
+                    spec,
+                    graceful_pids,
+                    report,
+                )
+                if graceful:
+                    self._owned.pop(spec.id, None)
+                    self._save_owned()
+                    return {
+                        "ok": True,
+                        "stopped_pids": graceful_pids,
+                        "shutdown_type": "graceful",
+                        "forced": False,
+                        "orderly_park_verified": None,
+                    }
+                report("Graceful conversation shutdown failed; using abnormal forced fallback")
+
         stopped: list[int] = []
         refused: list[int] = []
         for pid in unique:
@@ -527,7 +564,58 @@ class StackController:
                 "ok": False,
                 "error": f"Found a process on the {spec.name} port, but it did not match the whitelist so it was left running.",
             }
+        if graceful_failure is not None:
+            return {
+                "ok": False,
+                "error": "ABNORMAL / FORCED SHUTDOWN - ORDERLY PARK NOT VERIFIED",
+                "technical": graceful_failure,
+                "stopped_pids": stopped,
+                "shutdown_type": "forced",
+                "forced": True,
+                "orderly_park_verified": False,
+            }
         return {"ok": True, "stopped_pids": stopped}
+
+    def _request_graceful_conversation_stop(
+        self,
+        spec: ServiceSpec,
+        pids: list[int],
+        report: ProgressFn,
+    ) -> tuple[bool, str | None]:
+        """Request app-owned shutdown and wait for the worker tree and port to close."""
+        if spec.port is None:
+            return False, "conversation service has no control-plane port"
+        host = spec.host or "127.0.0.1"
+        endpoint = f"http://{host}:{spec.port}/api/dashboard/shutdown"
+        proc.invalidate_listen_cache()
+        if not proc.listening_pids(spec.port):
+            return False, "conversation control-plane port is not listening"
+        report("Requesting graceful Conversation app shutdown")
+        result = net.http_request(endpoint, method="POST", timeout_s=_CONVERSATION_SHUTDOWN_REQUEST_TIMEOUT_S)
+        payload = net.json_payload(result)
+        if not result.ok or payload is None or payload.get("ok") is not True:
+            detail = result.error or f"invalid shutdown response: HTTP {result.status_code}"
+            return False, f"graceful shutdown request failed: {detail}"
+
+        deadline = time.monotonic() + _CONVERSATION_GRACEFUL_SHUTDOWN_TIMEOUT_S
+        while time.monotonic() < deadline:
+            live_pids = [pid for pid in pids if proc.pid_is_running(pid)]
+            proc.invalidate_listen_cache()
+            port_pids = proc.listening_pids(spec.port)
+            if not live_pids and not port_pids:
+                report("Conversation app exited naturally after graceful shutdown request")
+                return True, None
+            time.sleep(_CONVERSATION_SHUTDOWN_POLL_S)
+
+        live_pids = [pid for pid in pids if proc.pid_is_running(pid)]
+        proc.invalidate_listen_cache()
+        port_pids = proc.listening_pids(spec.port)
+        return (
+            False,
+            "graceful shutdown timed out after "
+            f"{_CONVERSATION_GRACEFUL_SHUTDOWN_TIMEOUT_S:.1f}s "
+            f"(live_pids={live_pids}, port_pids={port_pids})",
+        )
 
     def _run_stop_command(self, spec: ServiceSpec) -> None:
         """Run a service stop CLI synchronously so it cannot race a later start."""
@@ -837,11 +925,9 @@ class StackController:
                     continue
                 owned_pid = self._owned[spec.id].get("pid")
                 wrapper_pid = self._owned[spec.id].get("wrapper_pid")
-            owned_alive = isinstance(owned_pid, int) and proc.pid_is_running(owned_pid)
             wrapper_alive = isinstance(wrapper_pid, int) and proc.pid_is_running(wrapper_pid)
-            if owned_alive:
-                continue
-            live = self._live_service_pid(spec)
+            # A non-listening, fail-closed process is not a live replacement for a port-backed service.
+            live = self._existing_instance_pid(spec)
             if live is not None:
                 if spec.id == "hermes" and isinstance(owned_pid, int):
                     self._hermes_trace(
@@ -853,6 +939,9 @@ class StackController:
                         "Health=healthy",
                     )
                 self._set_owned_pid(spec, live)
+                continue
+            owned_alive = isinstance(owned_pid, int) and proc.pid_is_running(owned_pid)
+            if owned_alive and spec.port is None:
                 continue
             result = self.health(spec)
             with self._lock:

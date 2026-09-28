@@ -49,7 +49,7 @@ class WhoIsInFrame(Tool):
             return payload
         service = deps.face_memory_service
         if service is None:
-            payload = {"error": "face_memory_unavailable", "status": "error"}
+            payload = {"error": "recognition_unavailable", "status": "recognition_unavailable"}
             payload["spoken"] = spoken_for_recognition_result(payload)
             return payload
         logger.info("Tool call: who_is_in_frame")

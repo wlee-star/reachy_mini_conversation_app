@@ -65,6 +65,7 @@ class FaceIdentityPipeline:
         if len(faces) > 1:
             return "multiple_faces", None, meta
         face = faces[0]
+        meta["face_bbox"] = list(face.bbox)
         quality = self.quality_for(frame_bgr, face)
         meta["quality"] = quality.to_dict()
         if not quality.usable:
